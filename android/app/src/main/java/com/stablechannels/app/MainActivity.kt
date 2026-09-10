@@ -12,12 +12,13 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import com.stablechannels.app.services.AppAccessPreferencesManager
 import com.stablechannels.app.services.BiometricService
 import com.stablechannels.app.ui.ContentView
+import com.stablechannels.app.ui.components.SCPillButton
+import com.stablechannels.app.ui.theme.Sp
 import com.stablechannels.app.ui.theme.StableChannelsTheme
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Job
@@ -161,7 +162,7 @@ class MainActivity : FragmentActivity() {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(32.dp),
+                .padding(Sp.xxl),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
@@ -169,31 +170,27 @@ class MainActivity : FragmentActivity() {
                 "Stable Channels",
                 style = MaterialTheme.typography.headlineMedium
             )
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(Sp.lg))
             Text(
                 "Authentication required",
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             authError?.let {
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(Sp.sm))
                 Text(
                     it,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error
                 )
             }
-            Spacer(Modifier.height(24.dp))
-            Button(
+            Spacer(Modifier.height(Sp.xl))
+            SCPillButton(
+                text = "Unlock",
                 onClick = { performAuth() },
-                enabled = !isAuthenticating
-            ) {
-                if (isAuthenticating) {
-                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                } else {
-                    Text("Unlock")
-                }
-            }
+                enabled = !isAuthenticating,
+                busy = isAuthenticating
+            )
         }
     }
 

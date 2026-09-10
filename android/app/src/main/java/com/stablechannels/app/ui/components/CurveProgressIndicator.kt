@@ -8,6 +8,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.size
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
@@ -35,11 +36,17 @@ fun CurveProgressIndicator(
     modifier: Modifier = Modifier,
     size: Dp = 48.dp,
     pattern: CurvePattern = CurvePattern.SIX_PETAL_SPIRAL,
-    primaryColor: Color = Color(0xFF38BDF8),
-    glowColor: Color = Color(0xFF818CF8),
-    trackColor: Color = Color(0xFF38BDF8).copy(alpha = 0.12f),
+    primaryColor: Color = Color.Unspecified,
+    glowColor: Color = Color.Unspecified,
+    trackColor: Color = Color.Unspecified,
     durationMillis: Int = 4600
 ) {
+    // Unspecified params resolve to primary-derived scheme defaults; MaterialTheme is unavailable in default expressions
+    val primary = if (primaryColor == Color.Unspecified) MaterialTheme.colorScheme.primary else primaryColor
+    val glow = if (glowColor == Color.Unspecified) primary else glowColor
+    val track = if (trackColor == Color.Unspecified) primary.copy(alpha = 0.12f) else trackColor
+    val core = MaterialTheme.colorScheme.onPrimary
+
     val infiniteTransition = rememberInfiniteTransition(label = "CurveProgressIndicatorTransition")
     val progress by infiniteTransition.animateFloat(
         initialValue = 0f,
@@ -82,7 +89,7 @@ fun CurveProgressIndicator(
 
         drawPath(
             path = trackPath,
-            color = trackColor,
+            color = track,
             style = Stroke(
                 width = 1.2f * scale,
                 pathEffect = PathEffect.dashPathEffect(floatArrayOf(3f * scale, 3f * scale), 0f)
@@ -100,7 +107,7 @@ fun CurveProgressIndicator(
             val pt = calculateCurvePoint(pattern, u, detailScale, center, scale)
             val intensity = (1f - offsetFrac).pow(0.56f)
             val particleRadius = maxOf(1.2f, (1.0f + (1f - offsetFrac) * 2.8f) * scale)
-            val particleColor = lerp(glowColor, primaryColor, 1f - offsetFrac)
+            val particleColor = lerp(glow, primary, 1f - offsetFrac)
 
             drawCircle(
                 color = particleColor.copy(alpha = intensity * 0.85f),
@@ -112,17 +119,17 @@ fun CurveProgressIndicator(
         val headPt = calculateCurvePoint(pattern, progress, detailScale, center, scale)
 
         drawCircle(
-            color = primaryColor.copy(alpha = 0.22f),
+            color = primary.copy(alpha = 0.22f),
             radius = 6.5f * scale,
             center = headPt
         )
         drawCircle(
-            color = glowColor.copy(alpha = 0.55f),
+            color = glow.copy(alpha = 0.55f),
             radius = 4.0f * scale,
             center = headPt
         )
         drawCircle(
-            color = Color.White,
+            color = core,
             radius = 2.2f * scale,
             center = headPt
         )
@@ -134,9 +141,9 @@ fun MathCurveLoader(
     modifier: Modifier = Modifier,
     size: Dp = 48.dp,
     pattern: CurvePattern = CurvePattern.SIX_PETAL_SPIRAL,
-    primaryColor: Color = Color(0xFF38BDF8),
-    glowColor: Color = Color(0xFF818CF8),
-    trackColor: Color = Color(0xFF38BDF8).copy(alpha = 0.12f),
+    primaryColor: Color = Color.Unspecified,
+    glowColor: Color = Color.Unspecified,
+    trackColor: Color = Color.Unspecified,
     durationMillis: Int = 4600
 ) {
     CurveProgressIndicator(

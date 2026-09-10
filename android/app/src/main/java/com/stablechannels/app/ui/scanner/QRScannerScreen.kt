@@ -28,7 +28,6 @@ import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.ClipOp
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -45,6 +44,8 @@ import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.common.InputImage
+import com.stablechannels.app.ui.components.SCPillButton
+import com.stablechannels.app.ui.theme.Sp
 import com.stablechannels.app.util.QRCodeUtils
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -95,10 +96,14 @@ fun QRScannerScreen(
         }
     }
 
+    // Reticle colors captured outside the draw lambda so tokens recompose, not redraw-resolve
+    val overlayScrim = MaterialTheme.colorScheme.surface.copy(alpha = 0.5f)
+    val bracketColor = MaterialTheme.colorScheme.onSurface
+
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black)
+            .background(MaterialTheme.colorScheme.background)
     ) {
         when {
             permissionGranted -> {
@@ -133,11 +138,10 @@ fun QRScannerScreen(
                         ))
                     }
                     clipPath(cutoutPath, clipOp = ClipOp.Difference) {
-                        drawRect(Color.Black.copy(alpha = 0.5f))
+                        drawRect(overlayScrim)
                     }
 
-                    // Corner brackets (white)
-                    val bracketColor = Color.White
+                    // Corner brackets
                     // Top-left
                     drawLine(bracketColor, Offset(left, top + cornerRadius), Offset(left, top + cornerLength), strokeWidth)
                     drawLine(bracketColor, Offset(left + cornerRadius, top), Offset(left + cornerLength, top), strokeWidth)
@@ -155,13 +159,13 @@ fun QRScannerScreen(
                 // Hint text at bottom
                 Text(
                     text = "Scan invoice, offer, or Bitcoin address",
-                    color = Color.White,
+                    color = MaterialTheme.colorScheme.onSurface,
                     style = MaterialTheme.typography.bodyMedium,
                     textAlign = TextAlign.Center,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(bottom = 100.dp)
-                        .padding(horizontal = 32.dp)
+                        .padding(horizontal = Sp.xxl)
                 )
             }
 
@@ -170,34 +174,33 @@ fun QRScannerScreen(
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(32.dp),
+                        .padding(Sp.xxl),
                     verticalArrangement = Arrangement.Center,
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Text(
                         text = "Camera access needed",
                         style = MaterialTheme.typography.headlineSmall,
-                        color = Color.White,
+                        color = MaterialTheme.colorScheme.onSurface,
                         textAlign = TextAlign.Center
                     )
-                    Spacer(Modifier.height(12.dp))
+                    Spacer(Modifier.height(Sp.md))
                     Text(
                         text = "Camera access is needed to scan QR codes. Please enable it in Settings.",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = Color.White.copy(alpha = 0.7f),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         textAlign = TextAlign.Center
                     )
-                    Spacer(Modifier.height(24.dp))
-                    Button(
+                    Spacer(Modifier.height(Sp.xl))
+                    SCPillButton(
+                        text = "Open Settings",
                         onClick = {
                             val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
                                 data = Uri.fromParts("package", context.packageName, null)
                             }
                             context.startActivity(intent)
                         }
-                    ) {
-                        Text("Open Settings")
-                    }
+                    )
                 }
             }
 
@@ -207,7 +210,7 @@ fun QRScannerScreen(
                     modifier = Modifier.fillMaxSize(),
                     contentAlignment = Alignment.Center
                 ) {
-                    CircularProgressIndicator(color = Color.White)
+                    CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
                 }
             }
         }
@@ -217,13 +220,13 @@ fun QRScannerScreen(
             onClick = onCancel,
             modifier = Modifier
                 .align(Alignment.TopStart)
-                .padding(16.dp)
+                .padding(Sp.lg)
                 .statusBarsPadding()
         ) {
             Icon(
                 imageVector = Icons.Default.Close,
                 contentDescription = "Cancel",
-                tint = Color.White,
+                tint = MaterialTheme.colorScheme.onSurface,
                 modifier = Modifier.size(28.dp)
             )
         }

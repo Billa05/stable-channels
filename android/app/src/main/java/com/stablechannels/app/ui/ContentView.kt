@@ -11,11 +11,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.stablechannels.app.AppState
 import com.stablechannels.app.Phase
 import com.stablechannels.app.R
+import com.stablechannels.app.ui.components.SCPillButton
+import com.stablechannels.app.ui.theme.LocalSemanticColors
+import com.stablechannels.app.ui.theme.Sp
 
 @Composable
 fun ContentView(appState: AppState) {
@@ -60,12 +62,12 @@ private fun LoadingView() {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(24.dp)
+            verticalArrangement = Arrangement.spacedBy(Sp.xl)
         ) {
             PulsatingLogo()
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("Stable Channels", fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(4.dp))
+                Text("Stable Channels", style = MaterialTheme.typography.titleLarge)
+                Spacer(Modifier.height(Sp.xs))
                 Text(
                     "Self-custodial bitcoin trading",
                     style = MaterialTheme.typography.bodySmall,
@@ -81,12 +83,12 @@ private fun SyncingView() {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(24.dp)
+            verticalArrangement = Arrangement.spacedBy(Sp.xl)
         ) {
             PulsatingLogo()
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 CircularProgressIndicator()
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(Sp.md))
                 Text("Syncing wallet...")
                 Text(
                     "This may take a moment",
@@ -100,16 +102,17 @@ private fun SyncingView() {
 
 @Composable
 private fun ErrorView(message: String, onRetry: () -> Unit) {
+    val semantic = LocalSemanticColors.current
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.padding(32.dp)
+            modifier = Modifier.padding(Sp.xxl)
         ) {
-            Text("Error", style = MaterialTheme.typography.headlineMedium)
-            Spacer(Modifier.height(8.dp))
+            Text("Error", style = MaterialTheme.typography.headlineMedium, color = semantic.error)
+            Spacer(Modifier.height(Sp.sm))
             Text(message, style = MaterialTheme.typography.bodyMedium)
-            Spacer(Modifier.height(16.dp))
-            Button(onClick = onRetry) { Text("Retry") }
+            Spacer(Modifier.height(Sp.lg))
+            SCPillButton("Retry", onClick = onRetry)
         }
     }
 }
