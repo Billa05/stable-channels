@@ -2,7 +2,6 @@ package com.stablechannels.app.ui.transfer
 
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -14,19 +13,22 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.stablechannels.app.AppState
+import com.stablechannels.app.ui.components.AmountStyle
+import com.stablechannels.app.ui.components.AmountText
+import com.stablechannels.app.ui.components.SCCard
+import com.stablechannels.app.ui.components.SCPillButton
 import com.stablechannels.app.ui.home.FundWalletScreen
 import com.stablechannels.app.ui.home.generateQRCode
+import com.stablechannels.app.ui.theme.LocalSemanticColors
+import com.stablechannels.app.ui.theme.ScTextStyles
+import com.stablechannels.app.ui.theme.Sp
 import com.stablechannels.app.util.Constants
 import com.stablechannels.app.util.btcSpacedFormatted
 import com.stablechannels.app.util.usdFormatted
@@ -44,6 +46,7 @@ fun ReceiveScreen(appState: AppState, onDismiss: () -> Unit) {
     var error by remember { mutableStateOf<String?>(null) }
     var showOnChain by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    val semantic = LocalSemanticColors.current
     val clipboardManager = LocalClipboardManager.current
     val btcPrice by appState.priceService.currentPrice.collectAsState()
 
@@ -65,7 +68,7 @@ fun ReceiveScreen(appState: AppState, onDismiss: () -> Unit) {
             .navigationBarsPadding()
             .imePadding()
             .verticalScroll(rememberScrollState())
-            .padding(24.dp),
+            .padding(Sp.xl),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         // Toolbar (Done button, centered title, top-right Onchain button)
@@ -78,11 +81,7 @@ fun ReceiveScreen(appState: AppState, onDismiss: () -> Unit) {
                 onClick = onDismiss,
                 modifier = Modifier.align(Alignment.CenterStart),
                 colors = ButtonDefaults.textButtonColors(
-                    containerColor = if (isSystemInDarkTheme()) {
-                        MaterialTheme.colorScheme.surfaceVariant
-                    } else {
-                        Color(0xFFE5E5EA)
-                    },
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
                     contentColor = MaterialTheme.colorScheme.primary
                 ),
                 shape = RoundedCornerShape(20.dp),
@@ -93,18 +92,13 @@ fun ReceiveScreen(appState: AppState, onDismiss: () -> Unit) {
             Text(
                 text = "Receive",
                 style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
                 modifier = Modifier.align(Alignment.Center)
             )
             TextButton(
                 onClick = { showOnChain = true },
                 modifier = Modifier.align(Alignment.CenterEnd),
                 colors = ButtonDefaults.textButtonColors(
-                    containerColor = if (isSystemInDarkTheme()) {
-                        MaterialTheme.colorScheme.surfaceVariant
-                    } else {
-                        Color(0xFFE5E5EA)
-                    },
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
                     contentColor = MaterialTheme.colorScheme.primary
                 ),
                 shape = RoundedCornerShape(20.dp),
@@ -113,7 +107,7 @@ fun ReceiveScreen(appState: AppState, onDismiss: () -> Unit) {
                 Text("Onchain", style = MaterialTheme.typography.bodyMedium)
             }
         }
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(Sp.lg))
 
         if (invoice != null) {
             val inv = invoice!!
@@ -122,14 +116,14 @@ fun ReceiveScreen(appState: AppState, onDismiss: () -> Unit) {
             if (invoiceAmountSats != null && invoiceAmountSats!! > 0) {
                 if (btcPrice > 0) {
                     val usd = invoiceAmountSats!!.toDouble() / Constants.SATS_IN_BTC * btcPrice
-                    Text(usd.usdFormatted(), style = MaterialTheme.typography.headlineMedium, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
+                    AmountText(text = usd.usdFormatted())
                 }
-                Text(
-                    invoiceAmountSats!!.btcSpacedFormatted(),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                AmountText(
+                    text = invoiceAmountSats!!.btcSpacedFormatted(),
+                    style = AmountStyle.Small,
+                    color = semantic.btcText
                 )
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(Sp.md))
             }
 
             val qrBitmap = remember(inv) { generateQRCode(inv.uppercase()) }
@@ -140,14 +134,14 @@ fun ReceiveScreen(appState: AppState, onDismiss: () -> Unit) {
                     modifier = Modifier.size(200.dp)
                 )
             }
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(Sp.md))
             Text(
                 text = inv.take(30) + "..." + inv.takeLast(10),
                 fontFamily = FontFamily.Monospace,
                 style = MaterialTheme.typography.bodySmall,
                 textAlign = TextAlign.Center
             )
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(Sp.md))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = {
                     clipboardManager.setText(AnnotatedString(inv))
@@ -161,42 +155,36 @@ fun ReceiveScreen(appState: AppState, onDismiss: () -> Unit) {
             }
         } else {
             if (!hasChannel) {
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
+                SCCard(modifier = Modifier.fillMaxWidth()) {
                     Text(
                         "Receive a payment over Lightning to activate your account.",
-                        modifier = Modifier.padding(12.dp),
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
-                Spacer(Modifier.height(12.dp))
-                Text(
-                    "$${Constants.MAX_CHANNEL_USD.toInt()} Maximum",
-                    style = MaterialTheme.typography.labelSmall,
+                Spacer(Modifier.height(Sp.md))
+                AmountText(
+                    text = "$${Constants.MAX_CHANNEL_USD.toInt()} Maximum",
+                    style = AmountStyle.Small,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Spacer(Modifier.height(16.dp))
+                Spacer(Modifier.height(Sp.lg))
             }
 
             Text("Amount (USD)", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Spacer(Modifier.height(12.dp))
- 
+            Spacer(Modifier.height(Sp.md))
+
             Row(
                 horizontalArrangement = Arrangement.Center,
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text("$", fontSize = 44.sp, fontWeight = FontWeight.Bold)
+                Text("$", style = ScTextStyles.Amount)
                 Spacer(Modifier.width(2.dp))
                 BasicTextField(
                     value = amountUSD,
                     onValueChange = { amountUSD = it.filter { c -> c.isDigit() || c == '.' } },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    textStyle = TextStyle(
-                        fontSize = 44.sp,
-                        fontWeight = FontWeight.Bold,
+                    textStyle = ScTextStyles.Amount.copy(
                         color = MaterialTheme.colorScheme.onSurface,
                         textAlign = TextAlign.Start
                     ),
@@ -208,9 +196,7 @@ fun ReceiveScreen(appState: AppState, onDismiss: () -> Unit) {
                             if (amountUSD.isEmpty()) {
                                 Text(
                                     text = "0.00",
-                                    style = TextStyle(
-                                        fontSize = 44.sp,
-                                        fontWeight = FontWeight.Bold,
+                                    style = ScTextStyles.Amount.copy(
                                         color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
                                         textAlign = TextAlign.Start
                                     )
@@ -223,16 +209,16 @@ fun ReceiveScreen(appState: AppState, onDismiss: () -> Unit) {
             }
 
             if (enteredSats > 0) {
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    "${enteredSats.btcSpacedFormatted()}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                Spacer(Modifier.height(Sp.xs))
+                AmountText(
+                    text = "${enteredSats.btcSpacedFormatted()}",
+                    style = AmountStyle.Small,
+                    color = semantic.btcText
                 )
             }
 
             if (!hasChannel && enteredUSD > Constants.MAX_CHANNEL_USD) {
-                Spacer(Modifier.height(4.dp))
+                Spacer(Modifier.height(Sp.xs))
                 Text(
                     "Amount exceeds $${Constants.MAX_CHANNEL_USD.toInt()} channel limit",
                     color = MaterialTheme.colorScheme.error,
@@ -241,12 +227,13 @@ fun ReceiveScreen(appState: AppState, onDismiss: () -> Unit) {
             }
 
             error?.let {
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(Sp.sm))
                 Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
             }
 
-            Spacer(Modifier.height(16.dp))
-            Button(
+            Spacer(Modifier.height(Sp.lg))
+            SCPillButton(
+                text = "Generate Invoice",
                 onClick = {
                     isGenerating = true
                     error = null
@@ -270,14 +257,12 @@ fun ReceiveScreen(appState: AppState, onDismiss: () -> Unit) {
                     }
                 },
                 enabled = !isGenerating && enteredSats > 0 && (hasChannel || enteredUSD <= Constants.MAX_CHANNEL_USD),
+                busy = isGenerating,
                 modifier = Modifier.fillMaxWidth()
-            ) {
-                if (isGenerating) CircularProgressIndicator(Modifier.size(20.dp))
-                else Text("Generate Invoice")
-            }
+            )
 
             if (hasChannel) {
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(Sp.sm))
                 OutlinedButton(
                     onClick = {
                         isGenerating = true

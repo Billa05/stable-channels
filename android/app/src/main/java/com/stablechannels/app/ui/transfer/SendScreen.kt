@@ -14,7 +14,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardCapitalization
@@ -27,15 +26,12 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material3.*
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.fragment.app.FragmentActivity
@@ -46,7 +42,14 @@ import com.google.mlkit.vision.common.InputImage
 import com.stablechannels.app.AppState
 import com.stablechannels.app.services.AppAccessPreferencesManager
 import com.stablechannels.app.services.BiometricService
+import com.stablechannels.app.ui.components.AmountStyle
+import com.stablechannels.app.ui.components.AmountText
+import com.stablechannels.app.ui.components.SCCard
+import com.stablechannels.app.ui.components.SCPillButton
 import com.stablechannels.app.ui.scanner.QRScannerScreen
+import com.stablechannels.app.ui.theme.LocalSemanticColors
+import com.stablechannels.app.ui.theme.ScTextStyles
+import com.stablechannels.app.ui.theme.Sp
 import com.stablechannels.app.util.Constants
 import com.stablechannels.app.util.QRCodeUtils
 import com.stablechannels.app.util.btcSpacedFormatted
@@ -131,6 +134,7 @@ fun SendScreen(appState: AppState, onDismiss: () -> Unit) {
     var isExtractingQR by remember { mutableStateOf(false) }
     var feeRateSatVb by remember { mutableStateOf<Long?>(null) }
     val scope = rememberCoroutineScope()
+    val semantic = LocalSemanticColors.current
     val context = LocalContext.current
     val activity = context.findActivity()
     val btcPrice by appState.priceService.currentPrice.collectAsState()
@@ -322,14 +326,13 @@ fun SendScreen(appState: AppState, onDismiss: () -> Unit) {
         return
     }
 
-    val isDark = MaterialTheme.colorScheme.background == Color.Black
     Column(
         modifier = Modifier
             .fillMaxSize()
             .navigationBarsPadding()
             .imePadding()
             .verticalScroll(rememberScrollState())
-            .padding(24.dp),
+            .padding(Sp.xl),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         // Header row
@@ -343,11 +346,7 @@ fun SendScreen(appState: AppState, onDismiss: () -> Unit) {
                     onClick = onDismiss,
                     modifier = Modifier.align(Alignment.CenterStart),
                     colors = ButtonDefaults.textButtonColors(
-                        containerColor = if (isDark) {
-                            MaterialTheme.colorScheme.surfaceVariant
-                        } else {
-                            Color(0xFFE5E5EA)
-                        },
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
                         contentColor = MaterialTheme.colorScheme.primary
                     ),
                     shape = RoundedCornerShape(20.dp),
@@ -359,7 +358,6 @@ fun SendScreen(appState: AppState, onDismiss: () -> Unit) {
             Text(
                 text = "Send",
                 style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
                 modifier = Modifier.align(Alignment.Center)
             )
             if (result == null) {
@@ -367,11 +365,7 @@ fun SendScreen(appState: AppState, onDismiss: () -> Unit) {
                     modifier = Modifier
                         .align(Alignment.CenterEnd)
                         .background(
-                            color = if (isDark) {
-                                MaterialTheme.colorScheme.surfaceVariant
-                            } else {
-                                Color(0xFFE5E5EA)
-                            },
+                            color = MaterialTheme.colorScheme.surfaceVariant,
                             shape = RoundedCornerShape(20.dp)
                         )
                         .padding(horizontal = 4.dp, vertical = 2.dp),
@@ -402,13 +396,7 @@ fun SendScreen(appState: AppState, onDismiss: () -> Unit) {
                         modifier = Modifier
                             .width(0.5.dp)
                             .height(20.dp)
-                            .background(
-                                color = if (isDark) {
-                                    Color(0xFF38383A)
-                                } else {
-                                    Color(0xFFC7C7CC)
-                                }
-                            )
+                            .background(color = MaterialTheme.colorScheme.outlineVariant)
                     )
 
                     // QR Scanner button
@@ -427,7 +415,7 @@ fun SendScreen(appState: AppState, onDismiss: () -> Unit) {
             }
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(Sp.lg))
 
         if (result != null) {
             Spacer(Modifier.height(40.dp))
@@ -435,65 +423,54 @@ fun SendScreen(appState: AppState, onDismiss: () -> Unit) {
             if (isSending) {
                 CircularProgressIndicator(
                     modifier = Modifier.size(64.dp),
-                    color = Color(0xFFF59E0B),
+                    color = semantic.btcNative,
                     strokeWidth = 4.dp
                 )
             } else {
                 Icon(
                     imageVector = Icons.Filled.CheckCircle,
                     contentDescription = "Success",
-                    tint = Color(0xFF10B981),
+                    tint = semantic.success,
                     modifier = Modifier.size(64.dp)
                 )
             }
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(Sp.lg))
             Text(
                 text = if (isSending) "Sending..." else "Sent!",
-                style = MaterialTheme.typography.headlineMedium,
-                fontWeight = FontWeight.Bold
+                style = MaterialTheme.typography.headlineMedium
             )
-            Spacer(Modifier.height(12.dp))
-            Card(
-                colors = CardDefaults.cardColors(
-                    containerColor = if (isSystemInDarkTheme()) {
-                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
-                    } else {
-                        Color(0xFFF2F2F7)
-                    }
-                ),
-                shape = RoundedCornerShape(12.dp),
+            Spacer(Modifier.height(Sp.md))
+            SCCard(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)
             ) {
                 Text(
                     text = result!!,
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.Medium,
-                    modifier = Modifier.padding(16.dp),
                     textAlign = TextAlign.Center
                 )
             }
             Spacer(Modifier.weight(1f))
             if (!isSending) {
-                Button(
+                SCPillButton(
+                    text = "Done",
                     onClick = onDismiss
-                ) {
-                    Text("Done")
-                }
+                )
             }
         } else {
             // Loading indicator during photo QR extraction
             if (isExtractingQR) {
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(Sp.sm))
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.Center,
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
-                    Spacer(Modifier.width(8.dp))
+                    Spacer(Modifier.width(Sp.sm))
                     Text("Extracting QR code...", style = MaterialTheme.typography.bodySmall)
                 }
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(Sp.sm))
             }
 
             OutlinedTextField(
@@ -511,22 +488,22 @@ fun SendScreen(appState: AppState, onDismiss: () -> Unit) {
 
             // Color-coded input type indicator (Task 7.5)
             if (inputType != InputType.UNKNOWN) {
-                Spacer(Modifier.height(4.dp))
+                Spacer(Modifier.height(Sp.xs))
                 InputTypeIndicator(inputType)
             }
 
             // Bolt11 with amount — show USD and BTC
             if (inputType == InputType.BOLT11 && (parsedBolt11Msat ?: 0) > 0) {
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(Sp.sm))
                 displayUSD?.let {
-                    Text(it.usdFormatted(), style = MaterialTheme.typography.titleMedium, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
+                    AmountText(text = it.usdFormatted())
                 }
-                Text(
-                    displaySats.btcSpacedFormatted(),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                AmountText(
+                    text = displaySats.btcSpacedFormatted(),
+                    style = AmountStyle.Small,
+                    color = semantic.btcText
                 )
-                Spacer(Modifier.height(4.dp))
+                Spacer(Modifier.height(Sp.xs))
                 Text(
                     lightningFeeText,
                     style = MaterialTheme.typography.bodySmall,
@@ -536,7 +513,7 @@ fun SendScreen(appState: AppState, onDismiss: () -> Unit) {
 
             // Amount input (USD) — for amountless bolt11, bolt12, onchain
             if (isAmountlessBolt11 || inputType == InputType.BOLT12 || inputType == InputType.ONCHAIN) {
-                Spacer(Modifier.height(16.dp))
+                Spacer(Modifier.height(Sp.lg))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -566,25 +543,23 @@ fun SendScreen(appState: AppState, onDismiss: () -> Unit) {
                         Text("Send Max", style = MaterialTheme.typography.labelMedium)
                     }
                 }
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(Sp.md))
 
                 Row(
                     horizontalArrangement = Arrangement.Center,
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("$", fontSize = 44.sp, fontWeight = FontWeight.Bold)
+                    Text("$", style = ScTextStyles.Amount)
                     Spacer(Modifier.width(2.dp))
                     BasicTextField(
                         value = amountUSDStr,
-                        onValueChange = { 
+                        onValueChange = {
                             amountUSDStr = it.filter { c -> c.isDigit() || c == '.' }
                             isSendMax = false
                         },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                        textStyle = TextStyle(
-                            fontSize = 44.sp,
-                            fontWeight = FontWeight.Bold,
+                        textStyle = ScTextStyles.Amount.copy(
                             color = MaterialTheme.colorScheme.onSurface,
                             textAlign = TextAlign.Start
                         ),
@@ -596,9 +571,7 @@ fun SendScreen(appState: AppState, onDismiss: () -> Unit) {
                                 if (amountUSDStr.isEmpty()) {
                                     Text(
                                         text = "0.00",
-                                        style = TextStyle(
-                                            fontSize = 44.sp,
-                                            fontWeight = FontWeight.Bold,
+                                        style = ScTextStyles.Amount.copy(
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
                                             textAlign = TextAlign.Start
                                         )
@@ -611,13 +584,13 @@ fun SendScreen(appState: AppState, onDismiss: () -> Unit) {
                 }
 
                 if (manualAmountSats > 0) {
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        manualAmountSats.btcSpacedFormatted(),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    Spacer(Modifier.height(Sp.xs))
+                    AmountText(
+                        text = manualAmountSats.btcSpacedFormatted(),
+                        style = AmountStyle.Small,
+                        color = semantic.btcText
                     )
-                    Spacer(Modifier.height(4.dp))
+                    Spacer(Modifier.height(Sp.xs))
                     Text(
                         if (inputType == InputType.ONCHAIN) onchainFeeText else lightningFeeText,
                         style = MaterialTheme.typography.bodySmall,
@@ -627,13 +600,14 @@ fun SendScreen(appState: AppState, onDismiss: () -> Unit) {
             }
 
             error?.let {
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(Sp.sm))
                 Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
             }
 
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(Sp.lg))
             Spacer(Modifier.weight(1f))
-            Button(
+            SCPillButton(
+                text = "Send",
                 onClick = {
                     isSending = true
                     error = null
@@ -757,11 +731,9 @@ fun SendScreen(appState: AppState, onDismiss: () -> Unit) {
                     }
                 },
                 enabled = !isSending && input.isNotBlank() && !needsAmount,
+                busy = isSending,
                 modifier = Modifier.fillMaxWidth()
-            ) {
-                if (isSending) CircularProgressIndicator(Modifier.size(20.dp))
-                else Text("Send")
-            }
+            )
         }
     }
 }
@@ -769,32 +741,33 @@ fun SendScreen(appState: AppState, onDismiss: () -> Unit) {
 /**
  * Displays a color-coded icon + label for the detected input type.
  * - Blue ⚡ + "Lightning Invoice" for Bolt11
- * - Purple ⚡ + "Lightning Offer" for Bolt12
+ * - Ink ⚡ + "Lightning Offer" for Bolt12
  * - Orange 🔗 + "Bitcoin Address" for on-chain
  * - Gray ? + "Unrecognized format" for unknown
  */
 @Composable
 private fun InputTypeIndicator(inputType: InputType) {
+    val semantic = LocalSemanticColors.current
     val (icon, label, tint) = when (inputType) {
         InputType.BOLT11 -> Triple(
             Icons.Default.Link,
             "Lightning Invoice",
-            Color(0xFF2196F3) // Blue
+            semantic.info // Blue
         )
         InputType.BOLT12 -> Triple(
             Icons.Default.Link,
             "Lightning Offer",
-            Color(0xFF9C27B0) // Purple
+            MaterialTheme.colorScheme.onSurface // Ink
         )
         InputType.ONCHAIN -> Triple(
             Icons.Default.Link,
             "Bitcoin Address",
-            Color(0xFFFF9800) // Orange
+            semantic.btcText // Orange
         )
         InputType.UNKNOWN -> Triple(
             Icons.Default.QuestionMark,
             "Unrecognized format",
-            Color.Gray
+            MaterialTheme.colorScheme.onSurfaceVariant
         )
     }
 
