@@ -1,6 +1,7 @@
 package com.stablechannels.app.ui.settings
 
 import android.content.Context
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -8,7 +9,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -17,6 +17,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.google.firebase.messaging.FirebaseMessaging
 import com.stablechannels.app.push.FCMService
+import com.stablechannels.app.ui.components.SCCard
+import com.stablechannels.app.ui.components.SCPillButton
+import com.stablechannels.app.ui.theme.LocalSemanticColors
+import com.stablechannels.app.ui.theme.Sp
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withTimeoutOrNull
@@ -28,6 +32,7 @@ fun PushConnectivityView() {
     val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
     val scope = rememberCoroutineScope()
+    val semantic = LocalSemanticColors.current
 
     val prefs = FCMService.getPrefs(context)
     var fcmToken by remember { mutableStateOf(prefs.getString("fcm_token", null)) }
@@ -44,21 +49,20 @@ fun PushConnectivityView() {
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(16.dp)
+            .padding(Sp.lg)
     ) {
         // FCM Token card
-        Surface(
-            onClick = {
-                if (fcmToken != null) {
-                    clipboardManager.setText(AnnotatedString(fcmToken!!))
-                    copiedToken = true
+        SCCard(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable {
+                    if (fcmToken != null) {
+                        clipboardManager.setText(AnnotatedString(fcmToken!!))
+                        copiedToken = true
+                    }
                 }
-            },
-            shape = MaterialTheme.shapes.medium,
-            tonalElevation = 1.dp,
-            modifier = Modifier.fillMaxWidth()
         ) {
-            Column(modifier = Modifier.padding(16.dp)) {
+            Column {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -69,11 +73,11 @@ fun PushConnectivityView() {
                         Text(
                             text = if (copiedToken) "Copied ✓" else "Tap to copy",
                             style = MaterialTheme.typography.labelSmall,
-                            color = if (copiedToken) Color(0xFF10B981) else MaterialTheme.colorScheme.onSurfaceVariant
+                            color = if (copiedToken) semantic.success else MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(Sp.sm))
                 if (fcmToken != null) {
                     val truncated = if (fcmToken!!.length > 24) {
                         "${fcmToken!!.take(16)}...${fcmToken!!.takeLast(8)}"
@@ -96,7 +100,7 @@ fun PushConnectivityView() {
             }
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(Sp.lg))
 
         // Registration status
         Row(
@@ -108,19 +112,19 @@ fun PushConnectivityView() {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Surface(
                     shape = MaterialTheme.shapes.small,
-                    color = if (isRegistered) Color(0xFF10B981) else Color(0xFFEF4444),
+                    color = if (isRegistered) semantic.usdStable else semantic.error,
                     modifier = Modifier.size(8.dp)
                 ) {}
                 Text(
                     text = if (isRegistered) "Registered" else "Unregistered",
                     style = MaterialTheme.typography.bodyLarge,
                     fontWeight = FontWeight.Medium,
-                    color = if (isRegistered) Color(0xFF10B981) else Color(0xFFEF4444)
+                    color = if (isRegistered) semantic.usdText else semantic.error
                 )
             }
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(Sp.lg))
 
         // Last heartbeat
         Row(
@@ -140,10 +144,11 @@ fun PushConnectivityView() {
             )
         }
 
-        Spacer(Modifier.height(24.dp))
+        Spacer(Modifier.height(Sp.xl))
 
-        // Retry button — green to match app branding
-        Button(
+        // Retry token retrieval
+        SCPillButton(
+            text = "Retry Token Retrieval",
             onClick = {
                 isRetrying = true
                 retryError = null
@@ -169,24 +174,11 @@ fun PushConnectivityView() {
             },
             modifier = Modifier.fillMaxWidth(),
             enabled = !isRetrying,
-            colors = ButtonDefaults.buttonColors(
-                containerColor = Color(0xFF10B981),
-                contentColor = Color.White
-            )
-        ) {
-            if (isRetrying) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(16.dp),
-                    strokeWidth = 2.dp,
-                    color = Color.White
-                )
-                Spacer(Modifier.width(8.dp))
-            }
-            Text("Retry Token Retrieval")
-        }
+            busy = isRetrying
+        )
 
         if (retryError != null) {
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(Sp.sm))
             Text(
                 text = retryError!!,
                 style = MaterialTheme.typography.bodySmall,

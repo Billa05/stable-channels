@@ -13,6 +13,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import com.stablechannels.app.ui.components.SCCard
+import com.stablechannels.app.ui.theme.Sp
 
 @Composable
 fun LogsView() {
@@ -22,48 +24,44 @@ fun LogsView() {
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(16.dp)
+            .padding(Sp.lg)
     ) {
         Text("Logs & Diagnostics", style = MaterialTheme.typography.titleMedium)
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(Sp.sm))
         Text(
             "Save app logs to a file for debugging and support.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
-        Spacer(Modifier.height(16.dp))
-        
-        Card(
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)),
-            shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp)
-        ) {
-            Column(Modifier.padding(vertical = 8.dp)) {
+        Spacer(Modifier.height(Sp.lg))
+
+        SCCard(modifier = Modifier.fillMaxWidth()) {
+            Column {
                 Row(
                     Modifier
                         .fillMaxWidth()
                         .clickable { com.stablechannels.app.services.LogExporter.shareLogs(context) }
-                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                        .padding(vertical = Sp.md),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(Icons.Outlined.Share, contentDescription = null, tint = androidx.compose.ui.graphics.Color(0xFF4CAF50))
-                    Spacer(Modifier.width(16.dp))
-                    Text("Share the logs", color = androidx.compose.ui.graphics.Color(0xFF4CAF50))
+                    Icon(Icons.Outlined.Share, contentDescription = null, tint = MaterialTheme.colorScheme.onSurface)
+                    Spacer(Modifier.width(Sp.lg))
+                    Text("Share the logs", color = MaterialTheme.colorScheme.onSurface)
                 }
                 HorizontalDivider(
-                    Modifier.padding(horizontal = 16.dp),
                     thickness = 0.5.dp,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f)
+                    color = MaterialTheme.colorScheme.outlineVariant
                 )
                 Row(
                     Modifier
                         .fillMaxWidth()
                         .clickable { com.stablechannels.app.services.LogExporter.downloadLogs(context) }
-                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                        .padding(vertical = Sp.md),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(Icons.Outlined.Info, contentDescription = null, tint = androidx.compose.ui.graphics.Color(0xFF4CAF50))
-                    Spacer(Modifier.width(16.dp))
-                    Text("Download logs", color = androidx.compose.ui.graphics.Color(0xFF4CAF50))
+                    Icon(Icons.Outlined.Info, contentDescription = null, tint = MaterialTheme.colorScheme.onSurface)
+                    Spacer(Modifier.width(Sp.lg))
+                    Text("Download logs", color = MaterialTheme.colorScheme.onSurface)
                 }
             }
         }

@@ -1,7 +1,6 @@
 package com.stablechannels.app.ui.settings
 
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -11,7 +10,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -23,6 +21,9 @@ import com.stablechannels.app.AppState
 import com.stablechannels.app.services.AuditService
 import com.stablechannels.app.services.BiometricService
 import com.stablechannels.app.services.NodeService
+import com.stablechannels.app.ui.components.SCPillButton
+import com.stablechannels.app.ui.theme.LocalSemanticColors
+import com.stablechannels.app.ui.theme.Sp
 import com.stablechannels.app.util.ClipboardUtils
 import com.stablechannels.app.util.Constants
 import kotlinx.coroutines.Dispatchers
@@ -36,6 +37,7 @@ fun BackupView(appState: AppState) {
     val context = LocalContext.current
     val activity = LocalContext.current as? FragmentActivity
     val scope = rememberCoroutineScope()
+    val semantic = LocalSemanticColors.current
 
     var showSeedWords by remember { mutableStateOf(false) }
     var seedAuthError by remember { mutableStateOf<String?>(null) }
@@ -74,10 +76,11 @@ fun BackupView(appState: AppState) {
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(16.dp)
+            .padding(Sp.lg)
     ) {
         // Show/hide seed words
-        Button(
+        SCPillButton(
+            text = if (showSeedWords) "Hide Seed Words" else "Backup Seed Words",
             onClick = {
                 if (showSeedWords) {
                     // Hiding seed words — no auth needed
@@ -106,30 +109,24 @@ fun BackupView(appState: AppState) {
                     }
                 }
             },
-            modifier = Modifier.fillMaxWidth(),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = Color(0xFF10B981),
-                contentColor = Color.White
-            )
-        ) {
-            Text(if (showSeedWords) "Hide Seed Words" else "Backup Seed Words")
-        }
+            modifier = Modifier.fillMaxWidth()
+        )
 
         seedAuthError?.let {
-            Spacer(Modifier.height(4.dp))
+            Spacer(Modifier.height(Sp.xs))
             Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
         }
 
         if (showSeedWords) {
             val words = appState.nodeService.savedMnemonic
             if (!words.isNullOrEmpty()) {
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(Sp.md))
                 Text(
                     "Write these words down on paper and store them in a safe place. Never share them. Anyone with these words can access your funds.",
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFFD97706)
+                    color = semantic.warning
                 )
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(Sp.md))
                 val wordList = words.split(" ")
                 val columns = 3
                 val rows = (wordList.size + columns - 1) / columns
@@ -170,18 +167,14 @@ fun BackupView(appState: AppState) {
                     }
                     if (row < rows - 1) Spacer(Modifier.height(6.dp))
                 }
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(Sp.md))
                 var copied by remember { mutableStateOf(false) }
                 var showClipboardWarning by remember { mutableStateOf(false) }
                 OutlinedButton(
                     onClick = {
                         showClipboardWarning = true
                     },
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.outlinedButtonColors(
-                        contentColor = Color(0xFF3B82F6)
-                    ),
-                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF3B82F6))
+                    modifier = Modifier.fillMaxWidth()
                 ) {
                     Text(if (copied) "Copied" else "Copy Seed Words")
                 }
@@ -195,8 +188,8 @@ fun BackupView(appState: AppState) {
                         shape = RoundedCornerShape(20.dp),
                         icon = {
                             Surface(
-                                shape = RoundedCornerShape(12.dp),
-                                color = Color(0xFFF59E0B).copy(alpha = 0.12f),
+                                shape = MaterialTheme.shapes.small,
+                                color = semantic.warning.copy(alpha = 0.12f),
                                 modifier = Modifier.size(48.dp)
                             ) {
                                 Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
@@ -219,17 +212,15 @@ fun BackupView(appState: AppState) {
                             )
                         },
                         confirmButton = {
-                            Button(
+                            SCPillButton(
+                                text = "Copy",
                                 onClick = {
                                     showClipboardWarning = false
                                     ClipboardUtils.copySensitive(context, "Seed Phrase", words)
                                     copied = true
                                 },
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = Color(0xFF10B981),
-                                    contentColor = Color.White
-                                )
-                            ) { Text("Copy") }
+                                modifier = Modifier.fillMaxWidth(0.6f)
+                            )
                         },
                         dismissButton = {
                             OutlinedButton(
@@ -239,7 +230,7 @@ fun BackupView(appState: AppState) {
                     )
                 }
             } else {
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(Sp.sm))
                 Text(
                     "Seed phrase not available for this wallet.",
                     style = MaterialTheme.typography.bodySmall,
@@ -248,16 +239,12 @@ fun BackupView(appState: AppState) {
             }
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(Sp.lg))
 
         // Restore from seed
         OutlinedButton(
             onClick = { showRestore = true },
-            modifier = Modifier.fillMaxWidth(),
-            colors = ButtonDefaults.outlinedButtonColors(
-                contentColor = Color(0xFF3B82F6)
-            ),
-            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF3B82F6))
+            modifier = Modifier.fillMaxWidth()
         ) {
             Text("Restore from Seed")
         }
@@ -283,10 +270,10 @@ fun BackupView(appState: AppState) {
                     Icon(
                         imageVector = Icons.Default.Restore,
                         contentDescription = "Restore",
-                        tint = Color(0xFFF59E0B),
+                        tint = semantic.warning,
                         modifier = Modifier.size(48.dp)
                     )
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(Sp.sm))
                     Text(
                         "Restore from Seed",
                         style = MaterialTheme.typography.titleLarge,
@@ -303,7 +290,7 @@ fun BackupView(appState: AppState) {
                         textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                         modifier = Modifier.fillMaxWidth()
                     )
-                    Spacer(Modifier.height(16.dp))
+                    Spacer(Modifier.height(Sp.lg))
                     OutlinedTextField(
                         value = restoreMnemonic,
                         onValueChange = { restoreMnemonic = it },
@@ -314,10 +301,10 @@ fun BackupView(appState: AppState) {
                         textStyle = MaterialTheme.typography.bodyMedium.copy(
                             fontFamily = FontFamily.Monospace
                         ),
-                        shape = RoundedCornerShape(12.dp)
+                        shape = MaterialTheme.shapes.small
                     )
                     if (restoreError != null) {
-                        Spacer(Modifier.height(8.dp))
+                        Spacer(Modifier.height(Sp.sm))
                         Text(
                             restoreError!!,
                             style = MaterialTheme.typography.bodySmall,
@@ -325,7 +312,7 @@ fun BackupView(appState: AppState) {
                         )
                     }
                     if (isRestoring) {
-                        Spacer(Modifier.height(16.dp))
+                        Spacer(Modifier.height(Sp.lg))
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.Center,
@@ -335,7 +322,7 @@ fun BackupView(appState: AppState) {
                                 modifier = Modifier.size(20.dp),
                                 strokeWidth = 2.dp
                             )
-                            Spacer(Modifier.width(8.dp))
+                            Spacer(Modifier.width(Sp.sm))
                             Text(
                                 "Restoring wallet...",
                                 style = MaterialTheme.typography.bodyMedium,

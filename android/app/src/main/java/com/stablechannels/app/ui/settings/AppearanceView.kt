@@ -9,11 +9,12 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.stablechannels.app.ui.components.SCCard
+import com.stablechannels.app.ui.theme.Sp
 import com.stablechannels.app.ui.theme.ThemePreference
 
 @Composable
@@ -25,14 +26,14 @@ fun AppearanceView() {
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(16.dp)
+            .padding(Sp.lg)
     ) {
         Text(
             text = "Theme",
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.Bold
         )
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(Sp.sm))
         Text(
             text = "Choose how the app looks. Changes apply immediately.",
             style = MaterialTheme.typography.bodyMedium,
@@ -40,12 +41,8 @@ fun AppearanceView() {
         )
         Spacer(Modifier.height(20.dp))
 
-        Surface(
-            shape = MaterialTheme.shapes.medium,
-            tonalElevation = 1.dp,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(Modifier.selectableGroup().padding(vertical = 4.dp)) {
+        SCCard(modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.selectableGroup().padding(vertical = Sp.xs)) {
                 ThemePreference.entries.forEach { preference ->
                     Row(
                         modifier = Modifier
@@ -58,19 +55,18 @@ fun AppearanceView() {
                                     ThemePreference.save(context, preference)
                                 },
                                 role = Role.RadioButton
-                            )
-                            .padding(horizontal = 16.dp),
+                            ),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         RadioButton(
                             selected = (selectedTheme == preference),
                             onClick = null,
                             colors = RadioButtonDefaults.colors(
-                                selectedColor = Color(0xFF10B981),
+                                selectedColor = MaterialTheme.colorScheme.primary,
                                 unselectedColor = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         )
-                        Spacer(Modifier.width(16.dp))
+                        Spacer(Modifier.width(Sp.lg))
                         Text(
                             text = preference.label,
                             style = MaterialTheme.typography.bodyLarge

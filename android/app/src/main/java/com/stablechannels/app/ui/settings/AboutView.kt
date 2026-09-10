@@ -6,32 +6,27 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.stablechannels.app.BuildConfig
+import com.stablechannels.app.ui.components.DetailRow
+import com.stablechannels.app.ui.components.SCCard
+import com.stablechannels.app.ui.theme.LocalSemanticColors
+import com.stablechannels.app.ui.theme.Sp
 
 @Composable
 fun AboutView() {
+    val semantic = LocalSemanticColors.current
     Column(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(16.dp)
+            .padding(Sp.lg)
     ) {
         // App info card
-        Surface(
-            shape = MaterialTheme.shapes.medium,
-            tonalElevation = 1.dp,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                AboutRow("Version", BuildConfig.VERSION_NAME)
-                Spacer(Modifier.height(14.dp))
-                AboutRow("Network", "Bitcoin", valueColor = Color(0xFFF59E0B))
-                Spacer(Modifier.height(14.dp))
-                AboutRow("Custody", "Self-custodial", valueColor = Color(0xFF10B981))
-            }
+        SCCard(modifier = Modifier.fillMaxWidth()) {
+            DetailRow(label = "Version", value = BuildConfig.VERSION_NAME)
+            DetailRow(label = "Network", value = "Bitcoin", valueColor = semantic.btcText)
+            DetailRow(label = "Custody", value = "Self-custodial", valueColor = semantic.success)
         }
 
         Spacer(Modifier.height(20.dp))
@@ -40,22 +35,6 @@ fun AboutView() {
             text = "Stable Channels is a self-custodial Bitcoin wallet that maintains a stable USD value using Lightning Network channels. You control your private keys. No third party can access or freeze your funds.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-    }
-}
-
-@Composable
-private fun AboutRow(label: String, value: String, valueColor: Color = Color.Unspecified) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Text(text = label, style = MaterialTheme.typography.bodyLarge)
-        Text(
-            text = value,
-            style = MaterialTheme.typography.bodyLarge,
-            fontWeight = FontWeight.Medium,
-            color = if (valueColor != Color.Unspecified) valueColor else MaterialTheme.colorScheme.onSurface
         )
     }
 }

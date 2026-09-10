@@ -1,5 +1,6 @@
 package com.stablechannels.app.ui.settings
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -8,13 +9,16 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.stablechannels.app.AppState
+import com.stablechannels.app.ui.components.DetailRow
+import com.stablechannels.app.ui.components.SCCard
+import com.stablechannels.app.ui.theme.LocalSemanticColors
+import com.stablechannels.app.ui.theme.Sp
 import com.stablechannels.app.util.Constants
 
 @Composable
@@ -23,21 +27,17 @@ fun NodeView(appState: AppState) {
     val isRunning by appState.nodeService.isRunningFlow.collectAsState()
     var showNodeId by remember { mutableStateOf(false) }
     var copiedNodeId by remember { mutableStateOf(false) }
+    val semantic = LocalSemanticColors.current
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(16.dp)
+            .padding(Sp.lg)
     ) {
         // Status section
-        Surface(
-            shape = MaterialTheme.shapes.medium,
-            tonalElevation = 1.dp,
-            modifier = Modifier.fillMaxWidth()
-        ) {
+        SCCard(modifier = Modifier.fillMaxWidth()) {
             Row(
-                modifier = Modifier.padding(16.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
@@ -46,14 +46,14 @@ fun NodeView(appState: AppState) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     Surface(
                         shape = MaterialTheme.shapes.small,
-                        color = if (isRunning) Color(0xFF10B981) else Color(0xFFEF4444),
+                        color = if (isRunning) semantic.usdStable else semantic.error,
                         modifier = Modifier.size(8.dp)
                     ) {}
                     Text(
                         text = if (isRunning) "Running" else "Stopped",
                         style = MaterialTheme.typography.bodyLarge,
                         fontWeight = FontWeight.Medium,
-                        color = if (isRunning) Color(0xFF10B981) else Color(0xFFEF4444)
+                        color = if (isRunning) semantic.usdText else semantic.error
                     )
                 }
             }
@@ -62,20 +62,19 @@ fun NodeView(appState: AppState) {
         Spacer(Modifier.height(20.dp))
 
         // Node ID section
-        Surface(
-            onClick = {
-                if (!showNodeId) {
-                    showNodeId = true
-                } else if (appState.nodeService.nodeId.isNotEmpty()) {
-                    clipboardManager.setText(AnnotatedString(appState.nodeService.nodeId))
-                    copiedNodeId = true
+        SCCard(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable {
+                    if (!showNodeId) {
+                        showNodeId = true
+                    } else if (appState.nodeService.nodeId.isNotEmpty()) {
+                        clipboardManager.setText(AnnotatedString(appState.nodeService.nodeId))
+                        copiedNodeId = true
+                    }
                 }
-            },
-            shape = MaterialTheme.shapes.medium,
-            tonalElevation = 1.dp,
-            modifier = Modifier.fillMaxWidth()
         ) {
-            Column(modifier = Modifier.padding(16.dp)) {
+            Column {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -86,18 +85,18 @@ fun NodeView(appState: AppState) {
                         Text(
                             text = if (copiedNodeId) "Copied ✓" else "Tap to copy",
                             style = MaterialTheme.typography.labelSmall,
-                            color = if (copiedNodeId) Color(0xFF10B981) else MaterialTheme.colorScheme.onSurfaceVariant
+                            color = if (copiedNodeId) semantic.success else MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     } else {
                         Text(
                             text = "Tap to reveal",
                             style = MaterialTheme.typography.labelSmall,
-                            color = Color(0xFF3B82F6)
+                            color = MaterialTheme.colorScheme.primary
                         )
                     }
                 }
                 if (showNodeId && appState.nodeService.nodeId.isNotEmpty()) {
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(Sp.sm))
                     Text(
                         text = appState.nodeService.nodeId,
                         style = MaterialTheme.typography.bodySmall,
@@ -116,20 +115,12 @@ fun NodeView(appState: AppState) {
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(bottom = 12.dp)
+            modifier = Modifier.padding(bottom = Sp.md)
         )
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text("Network", style = MaterialTheme.typography.bodyLarge)
-            Text(Constants.DEFAULT_NETWORK, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
-        }
-        Spacer(Modifier.height(12.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text("Explorer", style = MaterialTheme.typography.bodyLarge)
-            Text(
-                Constants.PRIMARY_CHAIN_URL.removePrefix("https://").take(20),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
+        DetailRow(label = "Network", value = Constants.DEFAULT_NETWORK)
+        DetailRow(
+            label = "Explorer",
+            value = Constants.PRIMARY_CHAIN_URL.removePrefix("https://").take(20)
+        )
     }
 }

@@ -10,12 +10,15 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.stablechannels.app.AppState
+import com.stablechannels.app.ui.components.DetailRow
+import com.stablechannels.app.ui.components.SCCard
+import com.stablechannels.app.ui.theme.LocalSemanticColors
+import com.stablechannels.app.ui.theme.Sp
 import com.stablechannels.app.util.satsFormatted
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -26,6 +29,7 @@ fun ChannelView(appState: AppState) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var showCloseConfirm by remember { mutableStateOf(false) }
+    val semantic = LocalSemanticColors.current
 
     val channels = appState.nodeService.channels
     val hasReadyChannel = channels.any { it.isChannelReady }
@@ -34,7 +38,7 @@ fun ChannelView(appState: AppState) {
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(16.dp)
+            .padding(Sp.lg)
     ) {
         if (channels.isNotEmpty() && !appState.isChannelClosing) {
             val ch = channels.first()
@@ -49,14 +53,14 @@ fun ChannelView(appState: AppState) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     Surface(
                         shape = MaterialTheme.shapes.small,
-                        color = if (ch.isChannelReady) Color(0xFF10B981) else Color(0xFFF59E0B),
+                        color = if (ch.isChannelReady) semantic.usdStable else semantic.warning,
                         modifier = Modifier.size(8.dp)
                     ) {}
                     Text(
                         text = if (ch.isChannelReady) "Ready" else "Pending",
                         style = MaterialTheme.typography.bodyLarge,
                         fontWeight = FontWeight.Medium,
-                        color = if (ch.isChannelReady) Color(0xFF10B981) else Color(0xFFF59E0B)
+                        color = if (ch.isChannelReady) semantic.usdText else semantic.warning
                     )
                 }
             }
@@ -64,38 +68,32 @@ fun ChannelView(appState: AppState) {
             Spacer(Modifier.height(20.dp))
 
             // Capacity
-            ChannelDetailRow("Capacity", ch.channelValueSats.toLong().satsFormatted())
-            Spacer(Modifier.height(16.dp))
+            DetailRow("Capacity", ch.channelValueSats.toLong().satsFormatted())
 
             // Outbound
-            ChannelDetailRow("Outbound", (ch.outboundCapacityMsat.toLong() / 1000).satsFormatted())
-            Spacer(Modifier.height(16.dp))
+            DetailRow("Outbound", (ch.outboundCapacityMsat.toLong() / 1000).satsFormatted())
 
             // Inbound
-            ChannelDetailRow("Inbound", (ch.inboundCapacityMsat.toLong() / 1000).satsFormatted())
+            DetailRow("Inbound", (ch.inboundCapacityMsat.toLong() / 1000).satsFormatted())
 
             // Funding Tx
             appState.fundingTxid?.let { txid ->
                 if (txid.isNotEmpty()) {
                     Spacer(Modifier.height(20.dp))
-                    Surface(
-                        shape = MaterialTheme.shapes.medium,
-                        tonalElevation = 1.dp,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(modifier = Modifier.padding(16.dp)) {
+                    SCCard(modifier = Modifier.fillMaxWidth()) {
+                        Column {
                             Text(
                                 text = "Funding Transaction",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
-                            Spacer(Modifier.height(4.dp))
+                            Spacer(Modifier.height(Sp.xs))
                             Text(
                                 text = "${txid.take(8)}...${txid.takeLast(8)}",
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontFamily = FontFamily.Monospace
                             )
-                            Spacer(Modifier.height(8.dp))
+                            Spacer(Modifier.height(Sp.sm))
                             TextButton(
                                 onClick = {
                                     val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://mempool.space/tx/${txid.substringBefore(":")}"))
@@ -103,7 +101,7 @@ fun ChannelView(appState: AppState) {
                                 },
                                 contentPadding = PaddingValues(0.dp)
                             ) {
-                                Text("View on explorer ↗", color = Color(0xFF3B82F6))
+                                Text("View on explorer ↗", color = semantic.info)
                             }
                         }
                     }
@@ -111,36 +109,36 @@ fun ChannelView(appState: AppState) {
             }
 
             if (hasReadyChannel) {
-                Spacer(Modifier.height(32.dp))
+                Spacer(Modifier.height(Sp.xxl))
                 OutlinedButton(
                     onClick = { showCloseConfirm = true },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.outlinedButtonColors(
-                        contentColor = Color(0xFFEF4444)
+                        contentColor = MaterialTheme.colorScheme.error
                     ),
-                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFEF4444))
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.error)
                 ) {
                     Text("Close channel")
                 }
             }
         } else if (appState.isChannelClosing) {
             // Channel is closing — show status
-            Spacer(Modifier.height(32.dp))
+            Spacer(Modifier.height(Sp.xxl))
             Column(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 CircularProgressIndicator(
                     modifier = Modifier.size(48.dp),
-                    color = Color(0xFFF59E0B)
+                    color = semantic.warning
                 )
-                Spacer(Modifier.height(16.dp))
+                Spacer(Modifier.height(Sp.lg))
                 Text(
                     text = "Closing channel...",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Medium
                 )
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(Sp.sm))
                 Text(
                     text = "Funds will be swept to your onchain wallet",
                     style = MaterialTheme.typography.bodyMedium,
@@ -153,7 +151,7 @@ fun ChannelView(appState: AppState) {
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(Sp.sm))
             Text(
                 text = "Receive bitcoin over Lightning to open your first channel.",
                 style = MaterialTheme.typography.bodyMedium,
@@ -190,17 +188,5 @@ fun ChannelView(appState: AppState) {
                 TextButton(onClick = { showCloseConfirm = false }) { Text("Cancel") }
             }
         )
-    }
-}
-
-@Composable
-private fun ChannelDetailRow(label: String, value: String) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text(text = label, style = MaterialTheme.typography.bodyLarge)
-        Text(text = value, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
     }
 }

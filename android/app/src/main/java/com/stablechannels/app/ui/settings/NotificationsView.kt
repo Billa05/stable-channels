@@ -11,16 +11,20 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.PermissionChecker
+import com.stablechannels.app.ui.components.SCCard
+import com.stablechannels.app.ui.components.SCPillButton
+import com.stablechannels.app.ui.theme.LocalSemanticColors
+import com.stablechannels.app.ui.theme.Sp
 
 @Composable
 fun NotificationsView() {
     val context = LocalContext.current
+    val semantic = LocalSemanticColors.current
 
     val notifEnabled = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         ContextCompat.checkSelfPermission(
@@ -32,16 +36,11 @@ fun NotificationsView() {
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(16.dp)
+            .padding(Sp.lg)
     ) {
         // Status card
-        Surface(
-            shape = MaterialTheme.shapes.medium,
-            tonalElevation = 1.dp,
-            modifier = Modifier.fillMaxWidth()
-        ) {
+        SCCard(modifier = Modifier.fillMaxWidth()) {
             Row(
-                modifier = Modifier.padding(16.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
@@ -50,20 +49,20 @@ fun NotificationsView() {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     Surface(
                         shape = MaterialTheme.shapes.small,
-                        color = if (notifEnabled) Color(0xFF10B981) else Color(0xFFEF4444),
+                        color = if (notifEnabled) semantic.usdStable else semantic.error,
                         modifier = Modifier.size(8.dp)
                     ) {}
                     Text(
                         text = if (notifEnabled) "Enabled" else "Disabled",
                         style = MaterialTheme.typography.bodyLarge,
                         fontWeight = FontWeight.Medium,
-                        color = if (notifEnabled) Color(0xFF10B981) else Color(0xFFEF4444)
+                        color = if (notifEnabled) semantic.usdText else semantic.error
                     )
                 }
             }
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(Sp.lg))
 
         Text(
             text = "Notifications are required to receive stability payments while the app is closed. Without them, your USD position may drift when BTC price moves.",
@@ -73,21 +72,16 @@ fun NotificationsView() {
 
         if (!notifEnabled) {
             Spacer(Modifier.height(20.dp))
-            Button(
+            SCPillButton(
+                text = "Enable in Settings",
                 onClick = {
                     val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
                         putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
                     }
                     context.startActivity(intent)
                 },
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Color(0xFF10B981),
-                    contentColor = Color.White
-                )
-            ) {
-                Text("Enable in Settings")
-            }
+                modifier = Modifier.fillMaxWidth()
+            )
         }
     }
 }

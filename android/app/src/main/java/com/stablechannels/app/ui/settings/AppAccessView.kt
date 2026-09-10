@@ -7,11 +7,12 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.biometric.BiometricManager
+import com.stablechannels.app.ui.components.SCCard
+import com.stablechannels.app.ui.theme.Sp
 
 @Composable
 fun AppAccessView() {
@@ -35,12 +36,11 @@ fun AppAccessView() {
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(16.dp)
+            .padding(Sp.lg)
     ) {
         if (!biometricsAvailable) {
             Surface(
                 shape = MaterialTheme.shapes.medium,
-                tonalElevation = 1.dp,
                 color = MaterialTheme.colorScheme.errorContainer,
                 modifier = Modifier.fillMaxWidth()
             ) {
@@ -48,20 +48,15 @@ fun AppAccessView() {
                     text = "Biometric enrollment is required to use these features. Please set up fingerprint, face, or device credentials in your device settings.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onErrorContainer,
-                    modifier = Modifier.padding(16.dp)
+                    modifier = Modifier.padding(Sp.lg)
                 )
             }
             Spacer(Modifier.height(20.dp))
         }
 
         // App Unlock
-        Surface(
-            shape = MaterialTheme.shapes.medium,
-            tonalElevation = 1.dp,
-            modifier = Modifier.fillMaxWidth()
-        ) {
+        SCCard(modifier = Modifier.fillMaxWidth()) {
             Row(
-                modifier = Modifier.padding(16.dp),
                 verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
             ) {
                 Column(modifier = Modifier.weight(1f)) {
@@ -70,7 +65,7 @@ fun AppAccessView() {
                         style = MaterialTheme.typography.bodyLarge,
                         fontWeight = FontWeight.Medium
                     )
-                    Spacer(Modifier.height(4.dp))
+                    Spacer(Modifier.height(Sp.xs))
                     Text(
                         text = "Require authentication on app launch and resume",
                         style = MaterialTheme.typography.bodyMedium,
@@ -86,27 +81,16 @@ fun AppAccessView() {
                         }
                     },
                     enabled = biometricsAvailable,
-                    colors = SwitchDefaults.colors(
-                        checkedThumbColor = Color.White,
-                        checkedTrackColor = Color(0xFF10B981),
-                        uncheckedThumbColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                        uncheckedTrackColor = MaterialTheme.colorScheme.surfaceVariant
-                    ),
                     modifier = Modifier.height(24.dp)
                 )
             }
         }
 
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(Sp.md))
 
         // Payment Confirmation
-        Surface(
-            shape = MaterialTheme.shapes.medium,
-            tonalElevation = 1.dp,
-            modifier = Modifier.fillMaxWidth()
-        ) {
+        SCCard(modifier = Modifier.fillMaxWidth()) {
             Row(
-                modifier = Modifier.padding(16.dp),
                 verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
             ) {
                 Column(modifier = Modifier.weight(1f)) {
@@ -115,7 +99,7 @@ fun AppAccessView() {
                         style = MaterialTheme.typography.bodyLarge,
                         fontWeight = FontWeight.Medium
                     )
-                    Spacer(Modifier.height(4.dp))
+                    Spacer(Modifier.height(Sp.xs))
                     Text(
                         text = "Require authentication before sends (Lightning and on-chain)",
                         style = MaterialTheme.typography.bodyMedium,
@@ -131,12 +115,6 @@ fun AppAccessView() {
                         }
                     },
                     enabled = biometricsAvailable,
-                    colors = SwitchDefaults.colors(
-                        checkedThumbColor = Color.White,
-                        checkedTrackColor = Color(0xFF10B981),
-                        uncheckedThumbColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                        uncheckedTrackColor = MaterialTheme.colorScheme.surfaceVariant
-                    ),
                     modifier = Modifier.height(24.dp)
                 )
             }

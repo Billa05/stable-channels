@@ -7,7 +7,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -15,6 +14,9 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.stablechannels.app.AppState
+import com.stablechannels.app.ui.components.SCCard
+import com.stablechannels.app.ui.theme.LocalSemanticColors
+import com.stablechannels.app.ui.theme.Sp
 import com.stablechannels.app.util.LspPreferencesManager
 import kotlinx.coroutines.launch
 
@@ -23,6 +25,7 @@ fun LspSettingsView(appState: AppState) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val clipboardManager = LocalClipboardManager.current
+    val semantic = LocalSemanticColors.current
 
     // Recompute whenever a switch/reset completes.
     var refreshKey by remember { mutableStateOf(0) }
@@ -47,22 +50,18 @@ fun LspSettingsView(appState: AppState) {
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(16.dp)
+            .padding(Sp.lg)
     ) {
         Text(
             text = "Connection",
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(bottom = 12.dp)
+            modifier = Modifier.padding(bottom = Sp.md)
         )
 
-        Surface(
-            shape = MaterialTheme.shapes.medium,
-            tonalElevation = 1.dp,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
+        SCCard(modifier = Modifier.fillMaxWidth()) {
+            Column {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -73,11 +72,11 @@ fun LspSettingsView(appState: AppState) {
                         Text(
                             text = "Custom",
                             style = MaterialTheme.typography.labelSmall,
-                            color = Color(0xFF3B82F6)
+                            color = semantic.info
                         )
                     }
                 }
-                Spacer(Modifier.height(4.dp))
+                Spacer(Modifier.height(Sp.xs))
                 Text(
                     text = activeAddress,
                     style = MaterialTheme.typography.bodyMedium,
@@ -85,7 +84,7 @@ fun LspSettingsView(appState: AppState) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
-                Spacer(Modifier.height(16.dp))
+                Spacer(Modifier.height(Sp.lg))
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -109,19 +108,19 @@ fun LspSettingsView(appState: AppState) {
             }
         }
 
-        Spacer(Modifier.height(24.dp))
+        Spacer(Modifier.height(Sp.xl))
 
         if (hasActiveChannels) {
             Surface(
                 shape = MaterialTheme.shapes.medium,
-                color = Color(0xFFF59E0B).copy(alpha = 0.12f),
+                color = semantic.warning.copy(alpha = 0.12f),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text(
                     text = "Your LSP cannot be changed while channels are active. Close all channels before switching.",
                     style = MaterialTheme.typography.bodyMedium,
-                    color = Color(0xFFF59E0B),
-                    modifier = Modifier.padding(16.dp)
+                    color = semantic.warning,
+                    modifier = Modifier.padding(Sp.lg)
                 )
             }
         } else {
@@ -133,7 +132,7 @@ fun LspSettingsView(appState: AppState) {
                 Text("Switch LSP")
             }
 
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(Sp.md))
 
             OutlinedButton(
                 onClick = {
@@ -151,19 +150,19 @@ fun LspSettingsView(appState: AppState) {
         }
 
         if (isBusy) {
-            Spacer(Modifier.height(16.dp))
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Spacer(Modifier.height(Sp.lg))
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Sp.sm)) {
                 CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
                 Text("Restarting node...", style = MaterialTheme.typography.bodyMedium)
             }
         }
 
         resultMessage?.let { message ->
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(Sp.lg))
             Text(
                 text = message,
                 style = MaterialTheme.typography.bodyMedium,
-                color = if (message.startsWith("LSP updated")) Color(0xFF10B981) else Color(0xFFEF4444)
+                color = if (message.startsWith("LSP updated")) semantic.success else semantic.error
             )
         }
     }
@@ -204,7 +203,7 @@ private fun SwitchLspDialog(
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Spacer(Modifier.height(16.dp))
+                Spacer(Modifier.height(Sp.lg))
                 OutlinedTextField(
                     value = pubkey,
                     onValueChange = { pubkey = it; error = null },
@@ -213,7 +212,7 @@ private fun SwitchLspDialog(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(Sp.md))
                 OutlinedTextField(
                     value = address,
                     onValueChange = { address = it; error = null },
@@ -223,7 +222,7 @@ private fun SwitchLspDialog(
                     modifier = Modifier.fillMaxWidth()
                 )
                 error?.let {
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(Sp.sm))
                     Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                 }
             }
