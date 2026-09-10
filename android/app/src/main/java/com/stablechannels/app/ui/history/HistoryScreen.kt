@@ -1,6 +1,5 @@
 package com.stablechannels.app.ui.history
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -18,15 +17,18 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.stablechannels.app.AppState
 import com.stablechannels.app.models.PaymentRecord
 import com.stablechannels.app.models.TradeRecord
+import com.stablechannels.app.ui.components.SegmentedControl
+import com.stablechannels.app.ui.components.StatusBadge
+import com.stablechannels.app.ui.components.StatusKind
+import com.stablechannels.app.ui.theme.LocalSemanticColors
+import com.stablechannels.app.ui.theme.Sp
 import com.stablechannels.app.util.Constants
 import com.stablechannels.app.util.relativeString
 import com.stablechannels.app.util.satsFormatted
@@ -35,7 +37,7 @@ import com.stablechannels.app.util.usdFormatted
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HistoryScreen(appState: AppState, modifier: Modifier = Modifier) {
-    var selectedSegment by remember { mutableIntStateOf(0) }
+    var selectedTab by remember { mutableStateOf("Orders") }
     var trades by remember { mutableStateOf<List<TradeRecord>>(emptyList()) }
     var payments by remember { mutableStateOf<List<PaymentRecord>>(emptyList()) }
     var selectedTrade by remember { mutableStateOf<TradeRecord?>(null) }
@@ -69,7 +71,7 @@ fun HistoryScreen(appState: AppState, modifier: Modifier = Modifier) {
     Column(
         modifier = modifier
             .fillMaxSize()
-            .padding(16.dp)
+            .padding(Sp.lg)
     ) {
         // Title — same position as Settings and Home
         Text(
@@ -79,66 +81,24 @@ fun HistoryScreen(appState: AppState, modifier: Modifier = Modifier) {
             textAlign = TextAlign.Center,
             modifier = Modifier.fillMaxWidth()
         )
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(Sp.md))
 
-        // Segmented control (like iOS Picker .segmented)
-        val isDark = MaterialTheme.colorScheme.background == Color(0xFF000000)
-        val activeBg = if (isDark) Color(0xFF3A3A3C) else Color.White
-        val inactiveBg = if (isDark) Color(0xFF1C1C1E) else Color(0xFFE5E5EA)
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(inactiveBg, shape = RoundedCornerShape(8.dp))
-                .padding(2.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .background(
-                        color = if (selectedSegment == 0) activeBg else Color.Transparent,
-                        shape = RoundedCornerShape(6.dp)
-                    )
-                    .clickable { selectedSegment = 0 }
-                    .padding(vertical = 8.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "Orders",
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = if (selectedSegment == 0) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .background(
-                        color = if (selectedSegment == 1) activeBg else Color.Transparent,
-                        shape = RoundedCornerShape(6.dp)
-                    )
-                    .clickable { selectedSegment = 1 }
-                    .padding(vertical = 8.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "Payments",
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = if (selectedSegment == 1) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        }
+        SegmentedControl(
+            options = listOf("Orders", "Payments"),
+            selected = selectedTab,
+            onSelect = { selectedTab = it },
+            label = { it }
+        )
 
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(Sp.lg))
 
-            if (selectedSegment == 0 && trades.isEmpty()) {
+            if (selectedTab == "Orders" && trades.isEmpty()) {
                 EmptyStateView(
                     icon = Icons.Default.SwapHoriz,
                     title = "No Orders",
                     description = "Convert BTC to see orders here."
                 )
-            } else if (selectedSegment == 1 && payments.isEmpty()) {
+            } else if (selectedTab == "Payments" && payments.isEmpty()) {
                 EmptyStateView(
                     icon = Icons.Default.ElectricBolt,
                     title = "No Payments",
@@ -146,7 +106,7 @@ fun HistoryScreen(appState: AppState, modifier: Modifier = Modifier) {
                 )
             } else {
                 LazyColumn {
-                    if (selectedSegment == 0) {
+                    if (selectedTab == "Orders") {
                         itemsIndexed(trades) { index, trade ->
                             TradeRow(trade) { selectedTrade = trade }
                             if (index < trades.lastIndex) {
@@ -186,9 +146,12 @@ fun HistoryScreen(appState: AppState, modifier: Modifier = Modifier) {
 
 @Composable
 private fun TradeRow(trade: TradeRecord, onClick: () -> Unit) {
+    val semantic = LocalSemanticColors.current
     val isBuy = trade.action == "buy"
     val icon = if (isBuy) Icons.Default.TrendingUp else Icons.Default.TrendingDown
-    val iconColor = if (isBuy) Color(0xFFF59E0B) else Color(0xFF8B5CF6)
+    // Buy gains bitcoin (BTC color), sell gains dollars (USD color)
+    val tileColor = if (isBuy) semantic.btcNative else semantic.usdStable
+    val iconColor = if (isBuy) semantic.btcText else semantic.usdText
 
     Row(
         modifier = Modifier
@@ -200,7 +163,7 @@ private fun TradeRow(trade: TradeRecord, onClick: () -> Unit) {
         // Icon with colored background
         Surface(
             shape = RoundedCornerShape(10.dp),
-            color = iconColor.copy(alpha = 0.12f),
+            color = tileColor.copy(alpha = 0.12f),
             modifier = Modifier.size(40.dp)
         ) {
             Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
@@ -208,7 +171,7 @@ private fun TradeRow(trade: TradeRecord, onClick: () -> Unit) {
             }
         }
 
-        Spacer(Modifier.width(12.dp))
+        Spacer(Modifier.width(Sp.md))
 
         // Title + time
         Column(modifier = Modifier.weight(1f)) {
@@ -231,16 +194,19 @@ private fun TradeRow(trade: TradeRecord, onClick: () -> Unit) {
                 style = MaterialTheme.typography.bodyLarge,
                 fontWeight = FontWeight.Medium
             )
-            StatusBadge(trade.status)
+            StatusBadge(trade.status, statusKindFor(trade.status))
         }
     }
 }
 
 @Composable
 private fun PaymentRow(payment: PaymentRecord, currentPrice: Double, onClick: () -> Unit) {
+    val semantic = LocalSemanticColors.current
     val isIncoming = payment.isIncoming
     val icon = if (isIncoming) Icons.Default.ArrowCircleDown else Icons.Default.ArrowCircleUp
-    val iconColor = if (isIncoming) Color(0xFF10B981) else Color(0xFF3B82F6)
+    // Incoming value carries the USD color; outgoing stays ink (send is not a money-direction action)
+    val tileColor = if (isIncoming) semantic.usdStable else MaterialTheme.colorScheme.onSurface
+    val iconColor = if (isIncoming) semantic.usdText else MaterialTheme.colorScheme.onSurface
     val typeLabel = when (payment.paymentType) {
         "stability" -> "Settlement"
         "lightning" -> "Lightning"
@@ -262,7 +228,7 @@ private fun PaymentRow(payment: PaymentRecord, currentPrice: Double, onClick: ()
         // Icon with colored background
         Surface(
             shape = RoundedCornerShape(10.dp),
-            color = iconColor.copy(alpha = 0.12f),
+            color = tileColor.copy(alpha = 0.12f),
             modifier = Modifier.size(40.dp)
         ) {
             Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
@@ -270,7 +236,7 @@ private fun PaymentRow(payment: PaymentRecord, currentPrice: Double, onClick: ()
             }
         }
 
-        Spacer(Modifier.width(12.dp))
+        Spacer(Modifier.width(Sp.md))
 
         // Title + type + time
         Column(modifier = Modifier.weight(1f)) {
@@ -297,29 +263,19 @@ private fun PaymentRow(payment: PaymentRecord, currentPrice: Double, onClick: ()
                 text = (if (isIncoming) "+" else "-") + amountText,
                 style = MaterialTheme.typography.bodyLarge,
                 fontWeight = FontWeight.Medium,
-                color = if (isIncoming) Color(0xFF10B981) else MaterialTheme.colorScheme.onSurface
+                color = if (isIncoming) semantic.usdText else MaterialTheme.colorScheme.onSurface
             )
             val statusLabel = payment.historyStatusLabel()
-            val statusColor = payment.historyStatusColor()
-            StatusBadge(statusLabel, statusColor)
+            StatusBadge(statusLabel, payment.historyStatusKind())
         }
     }
 }
 
-@Composable
-private fun StatusBadge(status: String, color: Color? = null) {
-    val resolvedColor = color ?: when (status.lowercase()) {
-        "completed" -> Color(0xFF10B981)
-        "pending" -> Color(0xFFF59E0B)
-        "failed" -> Color(0xFFEF4444)
-        else -> MaterialTheme.colorScheme.onSurfaceVariant
-    }
-    Text(
-        text = status,
-        style = MaterialTheme.typography.labelSmall,
-        fontWeight = FontWeight.Medium,
-        color = resolvedColor
-    )
+private fun statusKindFor(status: String): StatusKind = when (status.lowercase()) {
+    "completed", "succeeded", "settled" -> StatusKind.Positive
+    "failed" -> StatusKind.Negative
+    "pending", "in-flight" -> StatusKind.Pending
+    else -> StatusKind.Neutral
 }
 
 private fun PaymentRecord.shouldShowConfirmationProgress(): Boolean {
@@ -340,20 +296,11 @@ private fun PaymentRecord.historyStatusLabel(): String {
     }
 }
 
-private fun PaymentRecord.historyStatusColor(): Color {
+private fun PaymentRecord.historyStatusKind(): StatusKind {
     if (!shouldShowConfirmationProgress()) {
-        return when (status) {
-            "completed" -> Color(0xFF10B981)
-            "pending" -> Color(0xFFF59E0B)
-            "failed" -> Color(0xFFEF4444)
-            else -> Color(0xFF6B7280)
-        }
+        return statusKindFor(status)
     }
-    return when {
-        confirmations >= requiredConfirmationsForDisplay() -> Color(0xFF10B981)
-        confirmations > 0 -> Color(0xFF3B82F6)
-        else -> Color(0xFFF59E0B)
-    }
+    return if (confirmations >= requiredConfirmationsForDisplay()) StatusKind.Positive else StatusKind.Pending
 }
 
 private fun PaymentRecord.requiredConfirmationsForDisplay(): Int {
@@ -374,7 +321,7 @@ private fun EmptyStateView(
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Surface(
-                shape = RoundedCornerShape(16.dp),
+                shape = MaterialTheme.shapes.medium,
                 color = MaterialTheme.colorScheme.surfaceVariant,
                 modifier = Modifier.size(64.dp)
             ) {
@@ -387,13 +334,13 @@ private fun EmptyStateView(
                     )
                 }
             }
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(Sp.lg))
             Text(
                 title,
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold
             )
-            Spacer(Modifier.height(4.dp))
+            Spacer(Modifier.height(Sp.xs))
             Text(
                 description,
                 style = MaterialTheme.typography.bodyMedium,
