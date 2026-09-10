@@ -17,6 +17,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
+import com.stablechannels.app.ui.theme.ScTextStyles
 
 /**
  * A text composable that animates each digit independently,
@@ -26,7 +27,7 @@ import androidx.compose.ui.unit.dp
 @Composable
 fun RollingDigitText(
     text: String,
-    style: TextStyle,
+    style: TextStyle = ScTextStyles.Amount,
     color: Color = Color.Unspecified,
     modifier: Modifier = Modifier
 ) {

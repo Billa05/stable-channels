@@ -22,19 +22,18 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import android.view.HapticFeedbackConstants
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CurrencyBitcoin
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material3.Icon
+import com.stablechannels.app.ui.theme.LocalSemanticColors
 import com.stablechannels.app.util.Constants
 import com.stablechannels.app.services.StabilizationPolicy
 import com.stablechannels.app.util.btcSpacedFormatted
@@ -91,8 +90,7 @@ fun BalanceBar(
     val usdPct = (visFrac * 100).roundToInt()
     val btcPct = 100 - usdPct
 
-    val stableColor = Color(0xFF10B981)
-    val nativeColor = Color(0xFFF59E0B)
+    val semantic = LocalSemanticColors.current
 
     // Pulse animation for thumb
     val pulseScale = remember { Animatable(1f) }
@@ -207,7 +205,7 @@ fun BalanceBar(
                         Modifier
                             .weight(max(visFrac, 0.03f))
                             .fillMaxHeight()
-                            .background(Brush.horizontalGradient(listOf(stableColor.copy(alpha = 0.8f), stableColor)))
+                            .background(Brush.horizontalGradient(listOf(semantic.usdStable.copy(alpha = 0.8f), semantic.usdStable)))
                     )
                 }
                 if ((1 - visFrac) > 0.01f) {
@@ -215,7 +213,7 @@ fun BalanceBar(
                         Modifier
                             .weight(max(1f - visFrac, 0.03f))
                             .fillMaxHeight()
-                            .background(Brush.horizontalGradient(listOf(nativeColor, nativeColor.copy(alpha = 0.8f))))
+                            .background(Brush.horizontalGradient(listOf(semantic.btcNative, semantic.btcNative.copy(alpha = 0.8f))))
                     )
                 }
             }
@@ -230,7 +228,7 @@ fun BalanceBar(
                         .scale(if (isDragging) 1.15f else pulseScale.value)
                         .shadow(4.dp, CircleShape)
                         .clip(CircleShape)
-                        .background(Color.White)
+                        .background(MaterialTheme.colorScheme.surface)
                 )
 
                 // Percentage label while dragging
@@ -254,14 +252,13 @@ fun BalanceBar(
                                 .widthIn(max = labelWidth)
                                 .background(
                                     MaterialTheme.colorScheme.surfaceVariant,
-                                    RoundedCornerShape(12.dp)
+                                    MaterialTheme.shapes.small
                                 )
                                 .padding(horizontal = 8.dp, vertical = 6.dp)
                         ) {
                             Text(
                                 if (atSellLimit) StabilizationPolicy.limitExceededMessage((maxSellUSD * 100 + 1e-7).toLong()) else "$usdPct% USD  $btcPct% BTC",
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.Bold
+                                style = MaterialTheme.typography.labelSmall
                             )
                         }
                     }
@@ -278,8 +275,8 @@ fun BalanceBar(
             val stableSats = if (btcPrice > 0) (stableUSD / btcPrice * Constants.SATS_IN_BTC).toLong() else 0L
             Column {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Icon(Icons.Default.Shield, contentDescription = null, tint = stableColor, modifier = Modifier.size(12.dp))
-                    Text("USD", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = stableColor)
+                    Icon(Icons.Default.Shield, contentDescription = null, tint = semantic.usdText, modifier = Modifier.size(12.dp))
+                    Text("USD", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = semantic.usdText)
                 }
                 Text(
                     if (showBtcFormat) stableSats.btcSpacedFormatted() else stableUSD.usdFormatted(),
@@ -291,8 +288,8 @@ fun BalanceBar(
             // Right: BTC label + amount
             Column(horizontalAlignment = Alignment.End) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("BTC", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = nativeColor)
-                    Icon(Icons.Default.CurrencyBitcoin, contentDescription = null, tint = nativeColor, modifier = Modifier.size(12.dp))
+                    Text("BTC", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = semantic.btcText)
+                    Icon(Icons.Default.CurrencyBitcoin, contentDescription = null, tint = semantic.btcText, modifier = Modifier.size(12.dp))
                 }
                 Text(
                     if (showBtcFormat) nativeSats.btcSpacedFormatted()

@@ -6,6 +6,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import com.stablechannels.app.ui.theme.LocalSemanticColors
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 
@@ -13,12 +14,13 @@ import kotlinx.coroutines.launch
  * Modifier that applies a payment flash animation:
  * - Scale 1.0 → 1.08 over 300ms (ease-out)
  * - Scale 1.08 → 1.0 over 400ms (ease-in-out)
- * - Green tint overlay during scale-up phase
+ * - Tint overlay during scale-up phase
  *
  * Restarts from beginning if a new flash triggers during animation.
  */
 @Composable
-fun Modifier.paymentFlash(isFlashing: Boolean): Modifier {
+fun Modifier.paymentFlash(isFlashing: Boolean, tint: Color = Color.Unspecified): Modifier {
+    val flashTint = if (tint == Color.Unspecified) LocalSemanticColors.current.usdStable else tint
     val scale = remember { Animatable(1f) }
     val tintAlpha = remember { Animatable(0f) }
 
@@ -75,7 +77,7 @@ fun Modifier.paymentFlash(isFlashing: Boolean): Modifier {
             drawContent()
             if (currentTintAlpha > 0f) {
                 drawRect(
-                    color = Color(0xFF10B981).copy(alpha = currentTintAlpha),
+                    color = flashTint.copy(alpha = currentTintAlpha),
                     size = size
                 )
             }

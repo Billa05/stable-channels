@@ -17,21 +17,20 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Fill
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.stablechannels.app.AppState
 import com.stablechannels.app.models.PriceRecord
 import com.stablechannels.app.services.DatabaseService
 import com.stablechannels.app.ui.components.CurvePattern
 import com.stablechannels.app.ui.components.CurveProgressIndicator
+import com.stablechannels.app.ui.theme.LocalSemanticColors
+import com.stablechannels.app.ui.theme.Sp
 import com.stablechannels.app.util.usdFormatted
 import androidx.compose.ui.tooling.preview.Preview
 import kotlinx.coroutines.Dispatchers
@@ -76,6 +75,7 @@ fun PriceChart(
     var chartPeriod by remember { mutableStateOf(ChartPeriod.ALL) }
     var priceHistory by remember { mutableStateOf(emptyList<PriceRecord>()) }
     var selectedPoint by remember { mutableStateOf<PriceRecord?>(null) }
+    val semantic = LocalSemanticColors.current
 
     // Local refs — initialized from AppState cache (survives tab switches)
     var allDailyPrices by remember { mutableStateOf(appState.cachedChartDaily) }
@@ -152,15 +152,13 @@ fun PriceChart(
                         )
                         Text(
                             selected.price.usdFormatted(),
-                            style = MaterialTheme.typography.headlineSmall,
-                            fontWeight = FontWeight.Bold
+                            style = MaterialTheme.typography.headlineSmall
                         )
                     } else {
                         Text("BTC Price", style = MaterialTheme.typography.labelMedium)
                         Text(
                             livePriceText,
-                            style = MaterialTheme.typography.headlineSmall,
-                            fontWeight = FontWeight.Bold
+                            style = MaterialTheme.typography.headlineSmall
                         )
                     }
                 }
@@ -168,7 +166,8 @@ fun PriceChart(
                     val displayPrice = selectedPoint?.price ?: currentPrice
                     val firstPrice = priceHistory.first().price
                     val isUp = displayPrice >= firstPrice
-                    val changeColor = if (isUp) Color(0xFF10B981) else Color(0xFFEF4444)
+                    // BTC price change — keeps the bitcoin family when up (teal is dollar-only)
+                    val changeColor = if (isUp) semantic.btcText else semantic.error
                     val changePercent = if (firstPrice > 0) ((displayPrice - firstPrice) / firstPrice) * 100 else 0.0
 
                     Column(horizontalAlignment = Alignment.End) {
@@ -179,9 +178,8 @@ fun PriceChart(
                         )
                         Text(
                             String.format("%+.2f%%", changePercent),
-                            color = changeColor,
-                            fontWeight = FontWeight.SemiBold,
-                            fontSize = 14.sp
+                            style = MaterialTheme.typography.labelLarge,
+                            color = changeColor
                         )
                     }
                 }
@@ -199,13 +197,12 @@ fun PriceChart(
                     Surface(
                         onClick = { chartPeriod = period },
                         shape = RoundedCornerShape(20.dp),
-                        color = if (selected) Color(0xFF3B82F6) else MaterialTheme.colorScheme.surfaceVariant,
+                        color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
                     ) {
                         Text(
                             period.label,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
                             textAlign = TextAlign.Center
                         )
@@ -213,17 +210,20 @@ fun PriceChart(
                 }
             }
 
-            Spacer(Modifier.height(4.dp))
+            Spacer(Modifier.height(Sp.xs))
 
             if (priceHistory.size >= 2) {
                 val prices = priceHistory.map { it.price }
                 val minPrice = prices.min() * 0.98
                 val maxPrice = prices.max() * 1.02
                 val priceRange = maxPrice - minPrice
-                val firstPrice = prices.first()
-                val displayPrice = selectedPoint?.price ?: currentPrice
-                val isUp = displayPrice >= firstPrice
-                val lineColor = if (isUp) Color(0xFF10B981) else Color(0xFFEF4444)
+
+                // Capture theme colors outside the Canvas draw lambda
+                // BTC price series — stroke stays in the bitcoin family regardless of direction
+                val lineColor = semantic.btcNative
+                val gridColor = MaterialTheme.colorScheme.outlineVariant
+                val scrubColor = MaterialTheme.colorScheme.outline
+                val dotCore = MaterialTheme.colorScheme.surface
 
                 val selectedIndex = selectedPoint?.let { sp ->
                     priceHistory.indexOfFirst { it.id == sp.id }.takeIf { it >= 0 }
@@ -279,7 +279,7 @@ fun PriceChart(
                             for (i in 1..3) {
                                 val gy = h * i / 4
                                 drawLine(
-                                    color = Color.Gray.copy(alpha = 0.15f),
+                                    color = gridColor,
                                     start = Offset(0f, gy),
                                     end = Offset(w, gy),
                                     strokeWidth = 0.5f,
@@ -343,9 +343,9 @@ fun PriceChart(
                                 val sx = (selectedIndex.toFloat() / (priceHistory.size - 1)) * w
                                 val record = priceHistory[selectedIndex]
                                 val sy = h - ((record.price - minPrice) / priceRange).toFloat() * h
-                                drawLine(Color.Gray.copy(alpha = 0.5f), Offset(sx, 0f), Offset(sx, h), 1f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 6f)))
+                                drawLine(scrubColor, Offset(sx, 0f), Offset(sx, h), 1f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 6f)))
                                 drawCircle(lineColor, 5f, Offset(sx, sy))
-                                drawCircle(Color.White, 3f, Offset(sx, sy))
+                                drawCircle(dotCore, 3f, Offset(sx, sy))
                             }
                         }
                     }
@@ -359,14 +359,14 @@ fun PriceChart(
                             val price = maxPrice - (maxPrice - minPrice) * i / 3
                             Text(
                                 formatYAxis(price),
-                                fontSize = 9.sp,
+                                style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                     }
                 }
 
-                Spacer(Modifier.height(4.dp))
+                Spacer(Modifier.height(Sp.xs))
 
                 // X-axis time labels
                 val xFmt = when {
@@ -384,7 +384,7 @@ fun PriceChart(
                         if (i < priceHistory.size) {
                             Text(
                                 xFmt.format(Date(priceHistory[i].timestamp * 1000)),
-                                fontSize = 9.sp,
+                                style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
@@ -402,7 +402,7 @@ fun PriceChart(
                         CurveProgressIndicator(
                             size = 68.dp,
                             pattern = CurvePattern.SPIRAL_SEARCH,
-                            primaryColor = Color(0xFF38BDF8)
+                            primaryColor = semantic.info
                         )
                         Text(
                             "Collecting price data...",
@@ -448,7 +448,7 @@ private fun PriceChartCollectingDataPreview() {
                     CurveProgressIndicator(
                         size = 68.dp,
                         pattern = CurvePattern.SPIRAL_SEARCH,
-                        primaryColor = Color(0xFF38BDF8)
+                        primaryColor = LocalSemanticColors.current.info
                     )
                     Text(
                         "Collecting price data...",

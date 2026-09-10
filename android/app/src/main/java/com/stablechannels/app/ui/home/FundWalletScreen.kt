@@ -4,7 +4,6 @@ import android.graphics.Bitmap
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -16,7 +15,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
@@ -26,6 +24,9 @@ import androidx.compose.ui.unit.dp
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import com.stablechannels.app.AppState
+import com.stablechannels.app.ui.components.SCCard
+import com.stablechannels.app.ui.theme.LocalSemanticColors
+import com.stablechannels.app.ui.theme.Sp
 import com.stablechannels.app.util.QRCodeUtils
 
 @Composable
@@ -33,6 +34,7 @@ fun FundWalletScreen(appState: AppState, onBack: () -> Unit) {
     var address by remember { mutableStateOf<String?>(null) }
     var isCopied by remember { mutableStateOf(false) }
     val clipboardManager = LocalClipboardManager.current
+    val semantic = LocalSemanticColors.current
 
     LaunchedEffect(Unit) {
         try {
@@ -68,11 +70,7 @@ fun FundWalletScreen(appState: AppState, onBack: () -> Unit) {
                 onClick = onBack,
                 modifier = Modifier.align(Alignment.CenterStart),
                 colors = ButtonDefaults.textButtonColors(
-                    containerColor = if (isSystemInDarkTheme()) {
-                        MaterialTheme.colorScheme.surfaceVariant
-                    } else {
-                        Color(0xFFE5E5EA)
-                    },
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
                     contentColor = MaterialTheme.colorScheme.primary
                 ),
                 shape = RoundedCornerShape(20.dp),
@@ -83,12 +81,11 @@ fun FundWalletScreen(appState: AppState, onBack: () -> Unit) {
             Text(
                 text = "Onchain Receive",
                 style = MaterialTheme.typography.titleMedium,
-                fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
                 modifier = Modifier.align(Alignment.Center)
             )
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(Sp.lg))
 
         val addr = address
         if (addr != null) {
@@ -101,12 +98,10 @@ fun FundWalletScreen(appState: AppState, onBack: () -> Unit) {
                     modifier = Modifier.size(200.dp)
                 )
             }
-            Spacer(Modifier.height(24.dp))
+            Spacer(Modifier.height(Sp.xl))
 
             // Address container with background
-            Card(
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp),
+            SCCard(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable {
@@ -115,7 +110,6 @@ fun FundWalletScreen(appState: AppState, onBack: () -> Unit) {
                     }
             ) {
                 Row(
-                    modifier = Modifier.padding(16.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     SelectionContainer(modifier = Modifier.weight(1f)) {
@@ -127,7 +121,7 @@ fun FundWalletScreen(appState: AppState, onBack: () -> Unit) {
                             maxLines = 2
                         )
                     }
-                    Spacer(Modifier.width(8.dp))
+                    Spacer(Modifier.width(Sp.sm))
                     IconButton(
                         onClick = {
                             clipboardManager.setText(AnnotatedString(addr))
@@ -137,16 +131,16 @@ fun FundWalletScreen(appState: AppState, onBack: () -> Unit) {
                         Icon(
                             imageVector = if (isCopied) Icons.Default.Check else Icons.Default.ContentCopy,
                             contentDescription = "Copy Address",
-                            tint = if (isCopied) Color(0xFF10B981) else MaterialTheme.colorScheme.onSurface
+                            tint = if (isCopied) semantic.success else MaterialTheme.colorScheme.onSurface
                         )
                     }
                 }
             }
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(Sp.md))
             Text(
                 text = if (isCopied) "Address Copied!" else "Tap here to copy address",
                 style = MaterialTheme.typography.labelSmall,
-                color = if (isCopied) Color(0xFF10B981) else MaterialTheme.colorScheme.onSurfaceVariant,
+                color = if (isCopied) semantic.success else MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.clickable {
                     clipboardManager.setText(AnnotatedString(addr))
                     isCopied = true

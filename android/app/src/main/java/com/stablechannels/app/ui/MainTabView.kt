@@ -4,10 +4,8 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -28,6 +26,8 @@ import com.stablechannels.app.AppState
 import com.stablechannels.app.ui.history.HistoryScreen
 import com.stablechannels.app.ui.home.HomeScreen
 import com.stablechannels.app.ui.settings.SettingsNavHost
+import com.stablechannels.app.ui.theme.ScElevation
+import com.stablechannels.app.ui.theme.scShadow
 
 enum class Tab(val label: String, val icon: ImageVector) {
     HOME("Home", Icons.Default.Home),
@@ -73,7 +73,8 @@ fun ModernBottomNavBar(
     onTabSelected: (Tab) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val isDark = isSystemInDarkTheme()
+    val pillShape = RoundedCornerShape(50)
+    val tabShape = MaterialTheme.shapes.small
     Box(
         modifier = modifier
             .fillMaxWidth()
@@ -84,15 +85,8 @@ fun ModernBottomNavBar(
             modifier = Modifier
                 .widthIn(min = 180.dp, max = 228.dp)
                 .fillMaxWidth()
-                .then(
-                    if (isDark) Modifier.border(
-                        width = 0.5.dp,
-                        color = MaterialTheme.colorScheme.outlineVariant,
-                        shape = RoundedCornerShape(20.dp)
-                    ) else Modifier
-                ),
-            shape = RoundedCornerShape(20.dp),
-            shadowElevation = if (isDark) 0.dp else 12.dp,
+                .scShadow(ScElevation.Floating, pillShape),
+            shape = pillShape,
             color = MaterialTheme.colorScheme.surface
         ) {
             Row(
@@ -104,7 +98,7 @@ fun ModernBottomNavBar(
                 Tab.entries.forEach { tab ->
                     val isSelected = selectedTab == tab
                     val animatedColor by animateColorAsState(
-                        targetValue = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        targetValue = if (isSelected) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
                         animationSpec = tween(200),
                         label = "color"
                     )
@@ -113,14 +107,14 @@ fun ModernBottomNavBar(
                         contentAlignment = Alignment.Center,
                         modifier = Modifier
                             .size(44.dp)
-                            .clip(RoundedCornerShape(12.dp))
+                            .clip(tabShape)
                             .clickable(
                                 interactionSource = remember { MutableInteractionSource() },
                                 indication = null
                             ) { onTabSelected(tab) }
                             .background(
                                 color = if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f) else Color.Transparent,
-                                shape = RoundedCornerShape(12.dp)
+                                shape = tabShape
                             )
                     ) {
                         Icon(

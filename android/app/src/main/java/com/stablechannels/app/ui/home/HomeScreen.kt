@@ -5,13 +5,8 @@ import android.content.Intent
 import android.os.Build
 import android.provider.Settings
 import androidx.compose.animation.core.*
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.ui.platform.LocalView
-import androidx.compose.ui.window.DialogWindowProvider
-import androidx.core.view.WindowCompat
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -31,15 +26,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
-import androidx.compose.ui.draw.rotate
-import androidx.compose.ui.draw.clip
-import androidx.compose.foundation.isSystemInDarkTheme
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
-import com.stablechannels.app.ui.theme.LocalDarkTheme
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -51,8 +39,15 @@ import com.stablechannels.app.ui.history.OrderDetailBottomSheet
 import com.stablechannels.app.models.PaymentRecord
 import com.stablechannels.app.ui.history.PaymentDetailBottomSheet
 import com.stablechannels.app.AppState
-import com.stablechannels.app.ui.components.SheetEdgeToEdgeEffect
+import com.stablechannels.app.ui.components.AmountStyle
+import com.stablechannels.app.ui.components.AmountText
+import com.stablechannels.app.ui.components.SCCard
+import com.stablechannels.app.ui.components.SCButtonTone
+import com.stablechannels.app.ui.components.SCPillButton
+import com.stablechannels.app.ui.components.SheetScaffold
 import com.stablechannels.app.ui.components.StatusCapsule
+import com.stablechannels.app.ui.theme.LocalSemanticColors
+import com.stablechannels.app.ui.theme.Sp
 import com.stablechannels.app.ui.trade.BuyScreen
 import com.stablechannels.app.ui.trade.SellScreen
 import com.stablechannels.app.ui.transfer.ReceiveScreen
@@ -135,6 +130,7 @@ fun HomeScreen(appState: AppState, modifier: Modifier = Modifier) {
 
     val totalUSD = (totalSats.toDouble() / Constants.SATS_IN_BTC) * btcPrice
     val scope = rememberCoroutineScope()
+    val semantic = LocalSemanticColors.current
 
     var isRefreshing by remember { mutableStateOf(false) }
     val pullRefreshState = rememberPullToRefreshState()
@@ -195,13 +191,12 @@ fun HomeScreen(appState: AppState, modifier: Modifier = Modifier) {
                             Text(
                                 "Notifications Disabled",
                                 color = MaterialTheme.colorScheme.onError,
-                                fontWeight = FontWeight.SemiBold,
-                                fontSize = 14.sp
+                                style = MaterialTheme.typography.labelLarge
                             )
                             Text(
                                 "Enable notifications for stability payments",
                                 color = MaterialTheme.colorScheme.onError.copy(alpha = 0.9f),
-                                fontSize = 12.sp
+                                style = MaterialTheme.typography.bodySmall
                             )
                         }
                         Icon(
@@ -212,67 +207,53 @@ fun HomeScreen(appState: AppState, modifier: Modifier = Modifier) {
                         )
                     }
                 }
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(Sp.sm))
             }
 
-            Spacer(Modifier.height(24.dp))
+            Spacer(Modifier.height(Sp.xl))
 
             // Balance (tap to toggle USD/BTC)
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier
                     .clickable { showBTC = !showBTC }
-                    .paymentFlash(isFlashing)
+                    .paymentFlash(isFlashing, tint = semantic.usdStable)
             ) {
                 Text(
                     text = "Total Balance",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Spacer(Modifier.height(4.dp))
+                Spacer(Modifier.height(Sp.xs))
                 if (showBTC) {
                     RollingDigitText(
-                        text = totalSats.btcSpacedFormatted() + " BTC",
-                        style = MaterialTheme.typography.headlineLarge.copy(
-                            fontSize = 32.sp,
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
-                        )
+                        text = totalSats.btcSpacedFormatted() + " BTC"
                     )
                 } else {
                     if (btcPrice > 0) {
                         RollingDigitText(
-                            text = totalUSD.usdFormatted(),
-                            style = MaterialTheme.typography.headlineLarge.copy(
-                                fontSize = 36.sp,
-                                fontWeight = FontWeight.Bold
-                            )
+                            text = totalUSD.usdFormatted()
                         )
                     } else if (totalSats > 0) {
                         Text(
                             text = "Fetching price...",
-                            fontSize = 24.sp,
-                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.headlineMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     } else {
-                        Text(
-                            text = "$0.00",
-                            fontSize = 36.sp,
-                            fontWeight = FontWeight.Bold
-                        )
+                        AmountText(text = "$0.00")
                     }
                 }
-                Text(
+                AmountText(
                     text = if (showBTC) {
                         if (btcPrice > 0) totalUSD.usdFormatted() else "—"
                     } else totalSats.btcSpacedFormatted() + " BTC",
-                    fontSize = 14.sp,
+                    style = AmountStyle.Small,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
 
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(Sp.sm))
 
             // Balance bar
             if (lightningSats > 0) {
@@ -290,7 +271,7 @@ fun HomeScreen(appState: AppState, modifier: Modifier = Modifier) {
                         if (direction == TradeDirection.BUY) showBuy = true else showSell = true
                     } else null
                 )
-                Spacer(Modifier.height(4.dp))
+                Spacer(Modifier.height(Sp.xs))
             }
 
             // Syncing indicator
@@ -305,14 +286,14 @@ fun HomeScreen(appState: AppState, modifier: Modifier = Modifier) {
                         strokeWidth = 2.dp,
                         color = MaterialTheme.colorScheme.primary
                     )
-                    Spacer(Modifier.width(8.dp))
+                    Spacer(Modifier.width(Sp.sm))
                     Text(
                         "Syncing...",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(Sp.sm))
             }
 
             // On-chain section
@@ -320,12 +301,8 @@ fun HomeScreen(appState: AppState, modifier: Modifier = Modifier) {
                 val onchainUSD = (onchainSats.toDouble() / Constants.SATS_IN_BTC) * btcPrice
                 val isSweeping by appState.isSpliceInFlightFlow.collectAsState()
 
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
-                ) {
-                    Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                SCCard(modifier = Modifier.fillMaxWidth()) {
+                    Column {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
@@ -342,15 +319,15 @@ fun HomeScreen(appState: AppState, modifier: Modifier = Modifier) {
                         val hasPendingOnchainReceive = latestPendingOnchainReceive != null
                         if (isSweeping) {
                             // 1. Splice-in in progress
-                            Spacer(Modifier.height(4.dp))
+                            Spacer(Modifier.height(Sp.xs))
                             PendingRow("Move pending...", appState.spliceTxid, context)
                         } else if (isChannelClosing) {
                             // 2. Channel closing
-                            Spacer(Modifier.height(4.dp))
+                            Spacer(Modifier.height(Sp.xs))
                             PendingRow("Channel closing\u2026", lastCloseTxid, context)
                         } else if (hasReadyChannel && spendableOnchainSats > 0) {
                             // Has channel + confirmed funds — offer to sweep
-                            Spacer(Modifier.height(4.dp))
+                            Spacer(Modifier.height(Sp.xs))
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -365,7 +342,7 @@ fun HomeScreen(appState: AppState, modifier: Modifier = Modifier) {
                                     },
                                     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)
                                 ) {
-                                    Text("Move", fontSize = 13.sp)
+                                    Text("Move", style = MaterialTheme.typography.labelMedium)
                                 }
                             }
                             if (hasPendingOnchainReceive) {
@@ -374,7 +351,7 @@ fun HomeScreen(appState: AppState, modifier: Modifier = Modifier) {
                             }
                         } else if (spendableOnchainSats == 0L) {
                             // 3. Unconfirmed deposit (with or without channel)
-                            Spacer(Modifier.height(8.dp))
+                            Spacer(Modifier.height(Sp.sm))
                             val pendingCloseId = appState.pendingClosePaymentId
                             // Prefer close txid if known — pendingClosePaymentId may already be
                             // cleared by detectOnchainDeposit even while funds are still unconfirmed
@@ -399,7 +376,7 @@ fun HomeScreen(appState: AppState, modifier: Modifier = Modifier) {
                             }
                         } else {
                             // 4. No channel, confirmed deposit — just needs Lightning
-                            Spacer(Modifier.height(4.dp))
+                            Spacer(Modifier.height(Sp.xs))
                             Text("Receive a payment over Lightning to activate your account.",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -422,7 +399,7 @@ fun HomeScreen(appState: AppState, modifier: Modifier = Modifier) {
                 Text("Receive BTC to get started",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Spacer(Modifier.height(4.dp))
+                Spacer(Modifier.height(Sp.xs))
             }
 
             // Action buttons
@@ -430,21 +407,21 @@ fun HomeScreen(appState: AppState, modifier: Modifier = Modifier) {
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                val sendColor = if (isSystemInDarkTheme()) Color(0xFF0A84FF) else Color(0xFF007AFF)
-                val receiveColor = if (isSystemInDarkTheme()) Color(0xFF30D158) else Color(0xFF34C759)
-                ActionButton("Send", Icons.Default.ArrowCircleUp, sendColor, Modifier.weight(1f)) { showSend = true }
-                ActionButton("Receive", Icons.Default.ArrowCircleDown, receiveColor, Modifier.weight(1f), pulse = !hasReadyChannel) { showReceive = true }
+                SCPillButton("Send", onClick = { showSend = true }, modifier = Modifier.weight(1f),
+                    leadingIcon = Icons.Default.ArrowCircleUp)
+                SCPillButton("Receive", onClick = { showReceive = true }, modifier = Modifier.weight(1f),
+                    leadingIcon = Icons.Default.ArrowCircleDown)
             }
 
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(Sp.sm))
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                val buyColor = if (isSystemInDarkTheme()) Color(0xFFFF9F0A) else Color(0xFFFF9500)
-                val sellColor = if (isSystemInDarkTheme()) Color(0xFFBF5AF2) else Color(0xFFAF52DE)
-                ActionButton("USD → BTC", Icons.Default.ArrowCircleUp, buyColor, Modifier.weight(1f), rotation = 45f, enabled = hasReadyChannel) { showBuy = true }
-                ActionButton("BTC → USD", Icons.Default.ArrowCircleDown, sellColor, Modifier.weight(1f), rotation = -45f, enabled = hasReadyChannel) { showSell = true }
+                SCPillButton("USD → BTC", onClick = { showBuy = true }, modifier = Modifier.weight(1f),
+                    tone = SCButtonTone.Btc, leadingIcon = Icons.Default.ArrowCircleUp, enabled = hasReadyChannel)
+                SCPillButton("BTC → USD", onClick = { showSell = true }, modifier = Modifier.weight(1f),
+                    tone = SCButtonTone.Usd, leadingIcon = Icons.Default.ArrowCircleDown, enabled = hasReadyChannel)
             }
 
             // Status capsule
@@ -483,55 +460,23 @@ fun HomeScreen(appState: AppState, modifier: Modifier = Modifier) {
 
     // Bottom sheets
     if (showSend) {
-        ModalBottomSheet(
-            onDismissRequest = { showSend = false },
-            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
-            containerColor = if (isSystemInDarkTheme()) Color.Black else Color.White,
-            contentWindowInsets = @Composable { WindowInsets(0, 0, 0, 0) }
-        ) {
-            SheetEdgeToEdgeEffect()
-            Box(modifier = Modifier.fillMaxHeight(0.9f)) {
-                SendScreen(appState) { showSend = false }
-            }
+        SheetScaffold(onDismiss = { showSend = false }) {
+            SendScreen(appState) { showSend = false }
         }
     }
     if (showReceive) {
-        ModalBottomSheet(
-            onDismissRequest = { showReceive = false },
-            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
-            containerColor = if (isSystemInDarkTheme()) Color.Black else Color.White,
-            contentWindowInsets = @Composable { WindowInsets(0, 0, 0, 0) }
-        ) {
-            SheetEdgeToEdgeEffect()
-            Box(modifier = Modifier.fillMaxHeight(0.9f)) {
-                ReceiveScreen(appState) { showReceive = false }
-            }
+        SheetScaffold(onDismiss = { showReceive = false }) {
+            ReceiveScreen(appState) { showReceive = false }
         }
     }
     if (showBuy) {
-        ModalBottomSheet(
-            onDismissRequest = { showBuy = false },
-            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
-            containerColor = if (isSystemInDarkTheme()) Color.Black else Color.White,
-            contentWindowInsets = @Composable { WindowInsets(0, 0, 0, 0) }
-        ) {
-            SheetEdgeToEdgeEffect()
-            Box(modifier = Modifier.fillMaxHeight(0.9f)) {
-                BuyScreen(appState, prefillAmountUSD = prefillTradeAmount) { showBuy = false; prefillTradeAmount = 0.0 }
-            }
+        SheetScaffold(onDismiss = { showBuy = false }) {
+            BuyScreen(appState, prefillAmountUSD = prefillTradeAmount) { showBuy = false; prefillTradeAmount = 0.0 }
         }
     }
     if (showSell) {
-        ModalBottomSheet(
-            onDismissRequest = { showSell = false },
-            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
-            containerColor = if (isSystemInDarkTheme()) Color.Black else Color.White,
-            contentWindowInsets = @Composable { WindowInsets(0, 0, 0, 0) }
-        ) {
-            SheetEdgeToEdgeEffect()
-            Box(modifier = Modifier.fillMaxHeight(0.9f)) {
-                SellScreen(appState, prefillAmountUSD = prefillTradeAmount) { showSell = false; prefillTradeAmount = 0.0 }
-            }
+        SheetScaffold(onDismiss = { showSell = false }) {
+            SellScreen(appState, prefillAmountUSD = prefillTradeAmount) { showSell = false; prefillTradeAmount = 0.0 }
         }
     }
 
@@ -544,46 +489,6 @@ fun HomeScreen(appState: AppState, modifier: Modifier = Modifier) {
             currentPrice = btcPrice,
             onDismiss = { selectedPayment = null }
         )
-    }
-}
-
-@Composable
-fun ActionButton(title: String, icon: ImageVector, color: Color, modifier: Modifier = Modifier, rotation: Float = 0f, pulse: Boolean = false, enabled: Boolean = true, onClick: () -> Unit) {
-    Box(modifier = modifier.defaultMinSize(minHeight = 52.dp).clip(RoundedCornerShape(12.dp))) {
-        FilledTonalButton(
-            onClick = onClick,
-            modifier = Modifier.fillMaxWidth().defaultMinSize(minHeight = 52.dp),
-            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
-            shape = RoundedCornerShape(12.dp),
-            enabled = enabled,
-            colors = ButtonDefaults.filledTonalButtonColors(
-                containerColor = color.copy(alpha = if (isSystemInDarkTheme()) 0.1f else 0.15f),
-                contentColor = color,
-                disabledContainerColor = color.copy(alpha = 0.05f),
-                disabledContentColor = color.copy(alpha = 0.3f)
-            )
-        ) {
-            Icon(icon, contentDescription = title, modifier = Modifier.size(20.dp).rotate(rotation))
-            Spacer(Modifier.width(6.dp))
-            Text(title)
-        }
-        if (pulse) {
-            key(pulse) {
-                val transition = rememberInfiniteTransition(label = "btnPulse")
-                val alpha by transition.animateFloat(
-                    initialValue = 0f,
-                    targetValue = 0.2f,
-                    animationSpec = infiniteRepeatable(animation = tween(800, easing = EaseInOut), repeatMode = RepeatMode.Reverse),
-                    label = "btnAlpha"
-                )
-                Box(
-                    Modifier
-                        .matchParentSize()
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(color.copy(alpha = alpha))
-                )
-            }
-        }
     }
 }
 
@@ -605,7 +510,7 @@ private fun PendingRow(text: String, txid: String?, context: android.content.Con
                 },
                 contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
             ) {
-                Text("View on explorer", fontSize = 12.sp)
+                Text("View on explorer", style = MaterialTheme.typography.labelMedium)
             }
         }
     } else {
