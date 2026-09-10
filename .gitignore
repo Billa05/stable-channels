@@ -216,3 +216,6 @@ server/lsp-server-gui/dist/
 # SC daemon runtime data (when run from repo root)
 server/stable-channels-lsp/data/
 sc-config.toml
+
+# Superpowers brainstorm mockups
+.superpowers/
