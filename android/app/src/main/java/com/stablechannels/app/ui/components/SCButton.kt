@@ -26,7 +26,9 @@ import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -127,6 +129,7 @@ fun SCPillButton(
     tone: SCButtonTone = SCButtonTone.Neutral,
     enabled: Boolean = true,
     pulse: Boolean = false,
+    busy: Boolean = false,
     iconRotationDegrees: Float = 0f,
     leadingIcon: ImageVector? = null,
 ) {
@@ -139,7 +142,8 @@ fun SCPillButton(
     }
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
-    val scale by animateFloatAsState(if (pressed) 0.97f else 1f, label = "scPillPress")
+    // A busy button isn't pressable feedback — the dip would imply interactivity
+    val scale by animateFloatAsState(if (pressed && !busy) 0.97f else 1f, label = "scPillPress")
     Box(modifier = modifier) {
         androidx.compose.material3.Button(
             onClick = onClick,
@@ -153,10 +157,19 @@ fun SCPillButton(
                 .graphicsLayer { scaleX = scale; scaleY = scale }
                 .scShadow(ScElevation.Subtle, RoundedCornerShape(50), insetHighlight = true),
         ) {
-            if (leadingIcon != null) {
-                Icon(leadingIcon, null, modifier = Modifier.padding(end = Sp.sm).rotate(iconRotationDegrees))
+            if (busy) {
+                // Spinner replaces text/icon; LocalContentColor = the exact color the text would render in
+                CircularProgressIndicator(
+                    modifier = Modifier.size(20.dp),
+                    strokeWidth = 2.dp,
+                    color = LocalContentColor.current,
+                )
+            } else {
+                if (leadingIcon != null) {
+                    Icon(leadingIcon, null, modifier = Modifier.padding(end = Sp.sm).rotate(iconRotationDegrees))
+                }
+                Text(text, style = MaterialTheme.typography.labelLarge)
             }
-            Text(text, style = MaterialTheme.typography.labelLarge)
         }
         PulseHalo(pulse, content, RoundedCornerShape(50))
     }

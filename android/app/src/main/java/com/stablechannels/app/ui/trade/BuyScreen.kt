@@ -252,6 +252,7 @@ fun BuyScreen(appState: AppState, prefillAmountUSD: Double = 0.0, onDismiss: () 
                         }
                     },
                     tone = SCButtonTone.Btc,
+                    busy = isExecuting,
                     enabled = !isExecuting && btcPrice > 0.0,
                     modifier = Modifier.fillMaxWidth()
                 )
