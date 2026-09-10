@@ -64,7 +64,7 @@ fun SellScreen(appState: AppState, prefillAmountUSD: Double = 0.0, onDismiss: ()
             .navigationBarsPadding()
             .imePadding()
             .verticalScroll(rememberScrollState())
-            .padding(Sp.xl),
+            .padding(vertical = Sp.xl),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         // Toolbar header

@@ -66,7 +66,7 @@ fun BuyScreen(appState: AppState, prefillAmountUSD: Double = 0.0, onDismiss: () 
             .navigationBarsPadding()
             .imePadding()
             .verticalScroll(rememberScrollState())
-            .padding(Sp.xl),
+            .padding(vertical = Sp.xl),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         // Top Toolbar (Cancel / Title)
@@ -211,7 +211,7 @@ fun BuyScreen(appState: AppState, prefillAmountUSD: Double = 0.0, onDismiss: () 
                     DetailRow("Amount", amountUSD.usdFormatted(), valueStyle = DetailValueStyle.Amount)
                     DetailRow(feeLabel, feeUSD.usdFormatted(), valueStyle = DetailValueStyle.Amount)
                     DetailRow("BTC Price", btcPrice.usdFormatted(), valueStyle = DetailValueStyle.Amount)
-                    DetailRow("You receive", Math.round(btcAmount * Constants.SATS_IN_BTC).btcSpacedFormatted() + " BTC", valueStyle = DetailValueStyle.Amount)
+                    DetailRow("You receive", Math.round(btcAmount * Constants.SATS_IN_BTC).btcSpacedFormatted() + " BTC", valueStyle = DetailValueStyle.Amount, valueColor = semantic.btcText)
                 }
 
                 error?.let {

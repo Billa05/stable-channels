@@ -206,7 +206,7 @@ fun BackupView(appState: AppState) {
                         },
                         text = {
                             Text(
-                                "Clipboard contents may be readable by other apps. The clipboard will be cleared after 60 seconds.",
+                                "Clipboard contents may be readable by other apps. Are you sure you want to copy your seed phrase?",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -218,8 +218,7 @@ fun BackupView(appState: AppState) {
                                     showClipboardWarning = false
                                     ClipboardUtils.copySensitive(context, "Seed Phrase", words)
                                     copied = true
-                                },
-                                modifier = Modifier.fillMaxWidth(0.6f)
+                                }
                             )
                         },
                         dismissButton = {

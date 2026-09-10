@@ -332,7 +332,7 @@ fun SendScreen(appState: AppState, onDismiss: () -> Unit) {
             .navigationBarsPadding()
             .imePadding()
             .verticalScroll(rememberScrollState())
-            .padding(Sp.xl),
+            .padding(vertical = Sp.xl),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         // Header row

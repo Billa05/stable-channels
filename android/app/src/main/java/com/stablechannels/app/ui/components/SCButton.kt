@@ -16,7 +16,6 @@ import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -144,7 +143,8 @@ fun SCPillButton(
     val pressed by interaction.collectIsPressedAsState()
     // A busy button isn't pressable feedback — the dip would imply interactivity
     val scale by animateFloatAsState(if (pressed && !busy) 0.97f else 1f, label = "scPillPress")
-    Box(modifier = modifier) {
+    // Caller width modifiers land on the Button itself so the pill wraps by default but honors fill
+    Box {
         androidx.compose.material3.Button(
             onClick = onClick,
             enabled = enabled,
@@ -152,8 +152,7 @@ fun SCPillButton(
             shape = RoundedCornerShape(50),
             colors = ButtonDefaults.buttonColors(containerColor = container, contentColor = content),
             contentPadding = PaddingValues(horizontal = Sp.xl, vertical = Sp.md),
-            modifier = Modifier
-                .fillMaxWidth()
+            modifier = modifier
                 .graphicsLayer { scaleX = scale; scaleY = scale }
                 .scShadow(ScElevation.Subtle, RoundedCornerShape(50), insetHighlight = true),
         ) {

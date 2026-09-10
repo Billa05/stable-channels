@@ -249,7 +249,8 @@ fun BalanceBar(
                     ) {
                         Box(
                             modifier = Modifier
-                                .widthIn(max = labelWidth)
+                                // Percent label sizes to content so it can't wrap mid-drag; only the long limit message stays capped
+                                .then(if (atSellLimit) Modifier.widthIn(max = labelWidth) else Modifier)
                                 .background(
                                     MaterialTheme.colorScheme.surfaceVariant,
                                     MaterialTheme.shapes.small

@@ -45,6 +45,7 @@ import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.common.InputImage
 import com.stablechannels.app.ui.components.SCPillButton
+import com.stablechannels.app.ui.theme.ScDarkColorScheme
 import com.stablechannels.app.ui.theme.Sp
 import com.stablechannels.app.util.QRCodeUtils
 import java.util.concurrent.atomic.AtomicBoolean
@@ -97,13 +98,14 @@ fun QRScannerScreen(
     }
 
     // Reticle colors captured outside the draw lambda so tokens recompose, not redraw-resolve
-    val overlayScrim = MaterialTheme.colorScheme.surface.copy(alpha = 0.5f)
-    val bracketColor = MaterialTheme.colorScheme.onSurface
+    // Scanner chrome resolves the DARK scheme directly: scrim + light brackets must read over live video in both themes
+    val overlayScrim = ScDarkColorScheme.surface.copy(alpha = 0.5f)
+    val bracketColor = ScDarkColorScheme.onSurface
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
+            .background(ScDarkColorScheme.background)
     ) {
         when {
             permissionGranted -> {
@@ -159,7 +161,7 @@ fun QRScannerScreen(
                 // Hint text at bottom
                 Text(
                     text = "Scan invoice, offer, or Bitcoin address",
-                    color = MaterialTheme.colorScheme.onSurface,
+                    color = ScDarkColorScheme.onSurface,
                     style = MaterialTheme.typography.bodyMedium,
                     textAlign = TextAlign.Center,
                     modifier = Modifier
@@ -181,14 +183,14 @@ fun QRScannerScreen(
                     Text(
                         text = "Camera access needed",
                         style = MaterialTheme.typography.headlineSmall,
-                        color = MaterialTheme.colorScheme.onSurface,
+                        color = ScDarkColorScheme.onSurface,
                         textAlign = TextAlign.Center
                     )
                     Spacer(Modifier.height(Sp.md))
                     Text(
                         text = "Camera access is needed to scan QR codes. Please enable it in Settings.",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = ScDarkColorScheme.onSurfaceVariant,
                         textAlign = TextAlign.Center
                     )
                     Spacer(Modifier.height(Sp.xl))
@@ -210,7 +212,7 @@ fun QRScannerScreen(
                     modifier = Modifier.fillMaxSize(),
                     contentAlignment = Alignment.Center
                 ) {
-                    CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+                    CircularProgressIndicator(color = ScDarkColorScheme.primary)
                 }
             }
         }
@@ -226,7 +228,7 @@ fun QRScannerScreen(
             Icon(
                 imageVector = Icons.Default.Close,
                 contentDescription = "Cancel",
-                tint = MaterialTheme.colorScheme.onSurface,
+                tint = ScDarkColorScheme.onSurface,
                 modifier = Modifier.size(28.dp)
             )
         }

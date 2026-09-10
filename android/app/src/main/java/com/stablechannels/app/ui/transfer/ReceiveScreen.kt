@@ -68,7 +68,7 @@ fun ReceiveScreen(appState: AppState, onDismiss: () -> Unit) {
             .navigationBarsPadding()
             .imePadding()
             .verticalScroll(rememberScrollState())
-            .padding(Sp.xl),
+            .padding(vertical = Sp.xl),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         // Toolbar (Done button, centered title, top-right Onchain button)

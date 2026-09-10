@@ -1,9 +1,10 @@
 package com.stablechannels.app.ui.components
 
-import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -15,6 +16,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.tooling.preview.Preview
 import com.stablechannels.app.ui.theme.ScElevation
 import com.stablechannels.app.ui.theme.Sp
@@ -22,7 +24,7 @@ import com.stablechannels.app.ui.theme.StableChannelsTheme
 import com.stablechannels.app.ui.theme.ThemePreference
 import com.stablechannels.app.ui.theme.scShadow
 
-// iOS-style segmented control on tokens
+// iOS-style segmented control on tokens: full-width track, equal-weight segments
 @Composable
 fun <T> SegmentedControl(
     options: List<T>,
@@ -31,18 +33,23 @@ fun <T> SegmentedControl(
     label: (T) -> String,
     modifier: Modifier = Modifier,
 ) {
-    Row(modifier = modifier) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surfaceVariant, MaterialTheme.shapes.small)
+            .padding(Sp.xs),
+    ) {
         options.forEach { option ->
             val isSelected = option == selected
             Surface(
                 onClick = { onSelect(option) },
-                color = if (isSelected) MaterialTheme.colorScheme.surface else androidx.compose.ui.graphics.Color.Transparent,
+                color = if (isSelected) MaterialTheme.colorScheme.surface else Color.Transparent,
                 shape = MaterialTheme.shapes.small,
                 modifier = Modifier
-                    .padding(end = Sp.xs)
+                    .weight(1f)
                     .then(if (isSelected) Modifier.scShadow(ScElevation.Subtle, MaterialTheme.shapes.small) else Modifier),
             ) {
-                Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(horizontal = Sp.lg, vertical = Sp.sm)) {
+                Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxWidth().padding(vertical = Sp.sm)) {
                     Text(
                         label(option),
                         style = MaterialTheme.typography.labelMedium,

@@ -57,7 +57,7 @@ fun FundWalletScreen(appState: AppState, onBack: () -> Unit) {
             .fillMaxWidth()
             .navigationBarsPadding()
             .verticalScroll(rememberScrollState())
-            .padding(24.dp),
+            .padding(vertical = Sp.xl),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         // Toolbar (Back button, centered title)
