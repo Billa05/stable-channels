@@ -115,6 +115,8 @@ fun StableChannelsTheme(
     ) {
         MaterialTheme(
             colorScheme = colorScheme,
+            typography = ScTypography,
+            shapes = ScShapes,
             content = content
         )
     }
