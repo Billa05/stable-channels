@@ -51,6 +51,7 @@ import com.stablechannels.app.ui.history.OrderDetailBottomSheet
 import com.stablechannels.app.models.PaymentRecord
 import com.stablechannels.app.ui.history.PaymentDetailBottomSheet
 import com.stablechannels.app.AppState
+import com.stablechannels.app.ui.components.SheetEdgeToEdgeEffect
 import com.stablechannels.app.ui.components.StatusCapsule
 import com.stablechannels.app.ui.trade.BuyScreen
 import com.stablechannels.app.ui.trade.SellScreen
@@ -620,46 +621,5 @@ private fun PendingRow(text: String, txid: String?, context: android.content.Con
                 Text("pending confirmation", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
             }
         }
-    }
-}
-
-// Edge-to-edge for a ModalBottomSheet's dialog window. Android 15+ enforces
-// transparent system bars, so the (deprecated) color setters only run on older
-// versions, where they are still the only way to clear the bars.
-@Composable
-private fun SheetEdgeToEdgeEffect() {
-    val view = LocalView.current
-    val isDark = LocalDarkTheme.current
-    DisposableEffect(view, isDark) {
-        var context = view.context
-        var dialog: android.app.Dialog? = null
-        while (context is android.content.ContextWrapper) {
-            if (context is android.app.Dialog) {
-                dialog = context
-                break
-            }
-            context = context.baseContext
-        }
-        val window = dialog?.window
-        if (window != null) {
-            WindowCompat.setDecorFitsSystemWindows(window, false)
-            val insetsController = WindowCompat.getInsetsController(window, view)
-            insetsController.isAppearanceLightStatusBars = !isDark
-            insetsController.isAppearanceLightNavigationBars = !isDark
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-                @Suppress("DEPRECATION")
-                window.navigationBarColor = android.graphics.Color.TRANSPARENT
-                @Suppress("DEPRECATION")
-                window.statusBarColor = android.graphics.Color.TRANSPARENT
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                window.isNavigationBarContrastEnforced = false
-            }
-            window.setLayout(
-                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
-                android.view.ViewGroup.LayoutParams.MATCH_PARENT
-            )
-        }
-        onDispose {}
     }
 }

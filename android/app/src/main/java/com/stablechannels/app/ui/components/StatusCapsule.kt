@@ -10,12 +10,14 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.stablechannels.app.ui.theme.ScElevation
+import com.stablechannels.app.ui.theme.scShadow
 
 /**
  * A pill-shaped status capsule with slide+fade enter/exit animations.
  *
  * - Pill shape with RoundedCornerShape(50)
- * - tonalElevation 3dp for subtle surface tint
+ * - Layered raised shadow (ScElevation.Raised) on surface color
  * - Slide-up + fade-in on appear (300ms)
  * - Slide-down + fade-out on disappear (300ms)
  */
@@ -39,15 +41,14 @@ fun StatusCapsule(
     ) {
         Surface(
             shape = RoundedCornerShape(50),
-            tonalElevation = 3.dp,
             color = MaterialTheme.colorScheme.surface,
             onClick = { onClick?.invoke() },
-            modifier = if (onClick != null) Modifier else Modifier
+            modifier = Modifier.scShadow(ScElevation.Raised, RoundedCornerShape(50))
         ) {
             Text(
                 text = message,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurface,
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
             )
         }
