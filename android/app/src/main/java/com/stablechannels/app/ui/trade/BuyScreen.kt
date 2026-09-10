@@ -1,6 +1,5 @@
 package com.stablechannels.app.ui.trade
 
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -13,18 +12,24 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.stablechannels.app.AppState
 import com.stablechannels.app.models.PendingTradePayment
 import com.stablechannels.app.services.BuyAmountPolicy
+import com.stablechannels.app.ui.components.AmountStyle
+import com.stablechannels.app.ui.components.AmountText
 import com.stablechannels.app.ui.components.CurveProgressIndicator
+import com.stablechannels.app.ui.components.DetailRow
+import com.stablechannels.app.ui.components.DetailValueStyle
+import com.stablechannels.app.ui.components.SCCard
+import com.stablechannels.app.ui.components.SCButtonTone
+import com.stablechannels.app.ui.components.SCPillButton
+import com.stablechannels.app.ui.theme.LocalSemanticColors
+import com.stablechannels.app.ui.theme.ScTextStyles
+import com.stablechannels.app.ui.theme.Sp
 import com.stablechannels.app.util.usdFormatted
 import com.stablechannels.app.util.btcSpacedFormatted
 import com.stablechannels.app.util.Constants
@@ -44,6 +49,7 @@ fun BuyScreen(appState: AppState, prefillAmountUSD: Double = 0.0, onDismiss: () 
     var isExecuting by remember { mutableStateOf(false) }
     var pendingPaymentId by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
+    val semantic = LocalSemanticColors.current
 
     val sc by appState.stableChannel.collectAsState()
     // Trading fails closed while the displayed cache is stale or quarantined.
@@ -60,7 +66,7 @@ fun BuyScreen(appState: AppState, prefillAmountUSD: Double = 0.0, onDismiss: () 
             .navigationBarsPadding()
             .imePadding()
             .verticalScroll(rememberScrollState())
-            .padding(24.dp),
+            .padding(Sp.xl),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         // Top Toolbar (Cancel / Title)
@@ -74,11 +80,7 @@ fun BuyScreen(appState: AppState, prefillAmountUSD: Double = 0.0, onDismiss: () 
                     onClick = onDismiss,
                     modifier = Modifier.align(Alignment.CenterStart),
                     colors = ButtonDefaults.textButtonColors(
-                        containerColor = if (isSystemInDarkTheme()) {
-                            MaterialTheme.colorScheme.surfaceVariant
-                        } else {
-                            Color(0xFFE5E5EA)
-                        },
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
                         contentColor = MaterialTheme.colorScheme.primary
                     ),
                     shape = androidx.compose.foundation.shape.RoundedCornerShape(20.dp),
@@ -90,11 +92,10 @@ fun BuyScreen(appState: AppState, prefillAmountUSD: Double = 0.0, onDismiss: () 
             Text(
                 text = if (step == TradeStep.CONFIRM) "Review USD -> BTC" else "USD → BTC",
                 style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
                 modifier = Modifier.align(Alignment.Center)
             )
         }
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(Sp.lg))
 
         when (step) {
             TradeStep.AMOUNT -> {
@@ -110,11 +111,7 @@ fun BuyScreen(appState: AppState, prefillAmountUSD: Double = 0.0, onDismiss: () 
                             error = null
                         },
                         colors = ButtonDefaults.textButtonColors(
-                            containerColor = if (isSystemInDarkTheme()) {
-                                MaterialTheme.colorScheme.surfaceVariant
-                            } else {
-                                androidx.compose.ui.graphics.Color(0xFFE5E5EA)
-                            },
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant,
                             contentColor = MaterialTheme.colorScheme.primary
                         ),
                         shape = androidx.compose.foundation.shape.RoundedCornerShape(20.dp),
@@ -123,14 +120,14 @@ fun BuyScreen(appState: AppState, prefillAmountUSD: Double = 0.0, onDismiss: () 
                         Text("Max", style = MaterialTheme.typography.labelMedium)
                     }
                 }
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(Sp.md))
 
                 Row(
                     horizontalArrangement = Arrangement.Center,
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("$", fontSize = 44.sp, fontWeight = FontWeight.Bold)
+                    Text("$", style = ScTextStyles.Amount)
                     Spacer(Modifier.width(2.dp))
                     BasicTextField(
                         value = amountText,
@@ -139,9 +136,7 @@ fun BuyScreen(appState: AppState, prefillAmountUSD: Double = 0.0, onDismiss: () 
                             error = null
                         },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                        textStyle = TextStyle(
-                            fontSize = 44.sp,
-                            fontWeight = FontWeight.Bold,
+                        textStyle = ScTextStyles.Amount.copy(
                             color = MaterialTheme.colorScheme.onSurface,
                             textAlign = TextAlign.Start
                         ),
@@ -153,9 +148,7 @@ fun BuyScreen(appState: AppState, prefillAmountUSD: Double = 0.0, onDismiss: () 
                                 if (amountText.isEmpty()) {
                                     Text(
                                         text = "0.00",
-                                        style = TextStyle(
-                                            fontSize = 44.sp,
-                                            fontWeight = FontWeight.Bold,
+                                        style = ScTextStyles.Amount.copy(
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
                                             textAlign = TextAlign.Start
                                         )
@@ -168,24 +161,28 @@ fun BuyScreen(appState: AppState, prefillAmountUSD: Double = 0.0, onDismiss: () 
                 }
 
                 if (amountUSD > 0 && btcPrice > 0) {
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        "~ ${String.format(Locale.US, "%.8f", btcAmount)}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    Spacer(Modifier.height(Sp.xs))
+                    AmountText(
+                        text = "~ ${String.format(Locale.US, "%.8f", btcAmount)}",
+                        style = AmountStyle.Small,
+                        color = semantic.btcText
                     )
                 }
 
-                Spacer(Modifier.height(8.dp))
-                Text("Max: ${maxBuyUSD.usdFormatted()}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.height(Sp.sm))
+                AmountText(
+                    text = "Max: ${maxBuyUSD.usdFormatted()}",
+                    style = AmountStyle.Small,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
 
                 error?.let {
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(Sp.sm))
                     Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                 }
 
                 if (btcPrice <= 0.0) {
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(Sp.sm))
                     Text(
                         "A fresh BTC/USD consensus is required before trading",
                         color = MaterialTheme.colorScheme.tertiary,
@@ -193,8 +190,9 @@ fun BuyScreen(appState: AppState, prefillAmountUSD: Double = 0.0, onDismiss: () 
                     )
                 }
 
-                Spacer(Modifier.height(16.dp))
-                Button(
+                Spacer(Modifier.height(Sp.lg))
+                SCPillButton(
+                    text = "Continue",
                     onClick = {
                         if (!BuyAmountPolicy.accepts(amountUSD, sc.expectedUSD.amount)) {
                             error = "Enter an amount between $0 and ${maxBuyUSD.usdFormatted()}"
@@ -205,33 +203,25 @@ fun BuyScreen(appState: AppState, prefillAmountUSD: Double = 0.0, onDismiss: () 
                     },
                     enabled = btcPrice > 0.0,
                     modifier = Modifier.fillMaxWidth()
-                ) { Text("Continue") }
+                )
             }
 
             TradeStep.CONFIRM -> {
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
-                    shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        ConfirmRow("Amount", amountUSD.usdFormatted())
-                        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
-                        ConfirmRow(feeLabel, feeUSD.usdFormatted())
-                        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
-                        ConfirmRow("BTC Price", btcPrice.usdFormatted())
-                        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
-                        ConfirmRow("You receive", Math.round(btcAmount * Constants.SATS_IN_BTC).btcSpacedFormatted() + " BTC")
-                    }
+                SCCard(modifier = Modifier.fillMaxWidth()) {
+                    DetailRow("Amount", amountUSD.usdFormatted(), valueStyle = DetailValueStyle.Amount)
+                    DetailRow(feeLabel, feeUSD.usdFormatted(), valueStyle = DetailValueStyle.Amount)
+                    DetailRow("BTC Price", btcPrice.usdFormatted(), valueStyle = DetailValueStyle.Amount)
+                    DetailRow("You receive", Math.round(btcAmount * Constants.SATS_IN_BTC).btcSpacedFormatted() + " BTC", valueStyle = DetailValueStyle.Amount)
                 }
 
                 error?.let {
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(Sp.sm))
                     Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                 }
 
-                Spacer(Modifier.height(24.dp))
-                Button(
+                Spacer(Modifier.height(Sp.xl))
+                SCPillButton(
+                    text = "Confirm Order",
                     onClick = {
                         isExecuting = true
                         error = null
@@ -261,13 +251,11 @@ fun BuyScreen(appState: AppState, prefillAmountUSD: Double = 0.0, onDismiss: () 
                             isExecuting = false
                         }
                     },
+                    tone = SCButtonTone.Btc,
                     enabled = !isExecuting && btcPrice > 0.0,
                     modifier = Modifier.fillMaxWidth()
-                ) {
-                    if (isExecuting) CircularProgressIndicator(Modifier.size(20.dp))
-                    else Text("Confirm Order")
-                }
-                Spacer(Modifier.height(8.dp))
+                )
+                Spacer(Modifier.height(Sp.sm))
                 TextButton(onClick = { step = TradeStep.AMOUNT }) { Text("Back") }
             }
 
@@ -295,12 +283,12 @@ fun BuyScreen(appState: AppState, prefillAmountUSD: Double = 0.0, onDismiss: () 
                     Icon(
                         Icons.Filled.Cancel,
                         contentDescription = "Rejected",
-                        tint = Color(0xFFEF4444),
+                        tint = semantic.error,
                         modifier = Modifier.size(48.dp)
                     )
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(Sp.sm))
                     Text("Order Rejected", style = MaterialTheme.typography.headlineMedium)
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(Sp.sm))
                     Text(
                         outcome?.message ?: "The provider could not process the trade.",
                         style = MaterialTheme.typography.bodyMedium
@@ -309,44 +297,31 @@ fun BuyScreen(appState: AppState, prefillAmountUSD: Double = 0.0, onDismiss: () 
                     Icon(
                         Icons.Filled.CheckCircle,
                         contentDescription = "Confirmed",
-                        tint = Color(0xFF10B981),
+                        tint = semantic.success,
                         modifier = Modifier.size(48.dp)
                     )
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(Sp.sm))
                     Text("Order Confirmed", style = MaterialTheme.typography.headlineMedium)
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(Sp.sm))
                     Text(
                         "Your order has been confirmed.",
                         style = MaterialTheme.typography.bodyMedium
                     )
                 } else {
                     CurveProgressIndicator(size = 56.dp)
-                    Spacer(Modifier.height(12.dp))
+                    Spacer(Modifier.height(Sp.md))
                     Text("Order Pending", style = MaterialTheme.typography.headlineMedium)
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(Sp.sm))
                     Text(
                         "Your order is being processed. Balance will update when the payment confirms.",
                         style = MaterialTheme.typography.bodyMedium
                     )
                 }
-                Spacer(Modifier.height(16.dp))
+                Spacer(Modifier.height(Sp.lg))
                 if (isConfirmed || isRejected) {
-                    Button(onClick = onDismiss) { Text("Done") }
+                    SCPillButton(text = "Done", onClick = onDismiss)
                 }
             }
         }
-    }
-}
-
-@Composable
-fun ConfirmRow(label: String, value: String) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 4.dp),
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Text(label, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(value, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
     }
 }
