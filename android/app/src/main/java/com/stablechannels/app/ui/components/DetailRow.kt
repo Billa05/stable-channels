@@ -20,6 +20,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -41,6 +42,7 @@ fun DetailRow(
     valueStyle: DetailValueStyle = DetailValueStyle.Body,
     onCopy: (() -> Unit)? = null,
     trailing: (@Composable () -> Unit)? = null,
+    valueColor: Color = Color.Unspecified,
 ) {
     val clipboard = LocalClipboardManager.current
     var copied by remember { mutableStateOf(false) }
@@ -61,7 +63,7 @@ fun DetailRow(
                 DetailValueStyle.Mono -> MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
                 DetailValueStyle.Amount -> ScTextStyles.AmountSmall
             },
-            color = MaterialTheme.colorScheme.onSurface,
+            color = if (valueColor == Color.Unspecified) MaterialTheme.colorScheme.onSurface else valueColor,
         )
         if (onCopy != null) {
             IconButton(onClick = {

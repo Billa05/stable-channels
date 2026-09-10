@@ -15,9 +15,8 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
 import com.stablechannels.app.models.TradeRecord
-import com.stablechannels.app.ui.components.AmountStyle
-import com.stablechannels.app.ui.components.AmountText
 import com.stablechannels.app.ui.components.DetailRow
+import com.stablechannels.app.ui.components.DetailValueStyle
 import com.stablechannels.app.ui.components.SCCard
 import com.stablechannels.app.ui.components.SCPillButton
 import com.stablechannels.app.ui.components.SheetScaffold
@@ -71,19 +70,11 @@ fun OrderDetailBottomSheet(trade: TradeRecord, onDismiss: () -> Unit) {
 
             SCCard(modifier = Modifier.fillMaxWidth()) {
                 DetailRow("Action", if (trade.action == "buy") "USD → BTC" else "BTC → USD")
-                // Money values carry their side's token color; DetailRow has no value-color slot, so they ride the trailing slot
-                DetailRow("Amount", "", trailing = {
-                    AmountText(text = trade.amountUSD.usdFormatted(), style = AmountStyle.Small, color = semantic.usdText)
-                })
-                DetailRow("BTC Amount", "", trailing = {
-                    AmountText(text = Math.round(trade.amountBTC * Constants.SATS_IN_BTC).btcSpacedFormatted(), style = AmountStyle.Small, color = semantic.btcText)
-                })
-                DetailRow("BTC Price", "", trailing = {
-                    AmountText(text = trade.btcPrice.usdFormatted(), style = AmountStyle.Small, color = semantic.usdText)
-                })
-                DetailRow("Fee", "", trailing = {
-                    AmountText(text = trade.feeUSD.usdFormatted(), style = AmountStyle.Small, color = semantic.usdText)
-                })
+                // Money values render as amounts and carry their side's token color
+                DetailRow("Amount", trade.amountUSD.usdFormatted(), valueStyle = DetailValueStyle.Amount, valueColor = semantic.usdText)
+                DetailRow("BTC Amount", Math.round(trade.amountBTC * Constants.SATS_IN_BTC).btcSpacedFormatted(), valueStyle = DetailValueStyle.Amount, valueColor = semantic.btcText)
+                DetailRow("BTC Price", trade.btcPrice.usdFormatted(), valueStyle = DetailValueStyle.Amount, valueColor = semantic.usdText)
+                DetailRow("Fee", trade.feeUSD.usdFormatted(), valueStyle = DetailValueStyle.Amount, valueColor = semantic.usdText)
                 DetailRow("Status", trade.status.replaceFirstChar { it.uppercase() })
                 DetailRow("Date", trade.date.shortString())
                 trade.paymentId?.let { pid ->
