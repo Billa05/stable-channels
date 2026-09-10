@@ -410,7 +410,7 @@ fun HomeScreen(appState: AppState, modifier: Modifier = Modifier) {
                 SCPillButton("Send", onClick = { showSend = true }, modifier = Modifier.weight(1f),
                     leadingIcon = Icons.Default.ArrowCircleUp)
                 SCPillButton("Receive", onClick = { showReceive = true }, modifier = Modifier.weight(1f),
-                    leadingIcon = Icons.Default.ArrowCircleDown)
+                    pulse = !hasReadyChannel, leadingIcon = Icons.Default.ArrowCircleDown)
             }
 
             Spacer(Modifier.height(Sp.sm))
@@ -419,9 +419,11 @@ fun HomeScreen(appState: AppState, modifier: Modifier = Modifier) {
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 SCPillButton("USD → BTC", onClick = { showBuy = true }, modifier = Modifier.weight(1f),
-                    tone = SCButtonTone.Btc, leadingIcon = Icons.Default.ArrowCircleUp, enabled = hasReadyChannel)
+                    tone = SCButtonTone.Btc, iconRotationDegrees = 45f, enabled = hasReadyChannel,
+                    leadingIcon = Icons.Default.ArrowCircleUp)
                 SCPillButton("BTC → USD", onClick = { showSell = true }, modifier = Modifier.weight(1f),
-                    tone = SCButtonTone.Usd, leadingIcon = Icons.Default.ArrowCircleDown, enabled = hasReadyChannel)
+                    tone = SCButtonTone.Usd, iconRotationDegrees = -45f, enabled = hasReadyChannel,
+                    leadingIcon = Icons.Default.ArrowCircleDown)
             }
 
             // Status capsule

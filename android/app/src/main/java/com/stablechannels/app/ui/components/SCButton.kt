@@ -1,12 +1,22 @@
 package com.stablechannels.app.ui.components
 
+import androidx.compose.animation.core.EaseInOut
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -22,9 +32,12 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -41,6 +54,23 @@ import com.stablechannels.app.ui.theme.ScElevation
 
 enum class SCButtonTone { Neutral, Usd, Btc }
 
+// Pulse halo overlay derived from the button's tone color (state signal, not decoration)
+@Composable
+private fun BoxScope.PulseHalo(pulse: Boolean, color: Color, shape: androidx.compose.ui.graphics.Shape) {
+    if (pulse) {
+        key(pulse) {
+            val transition = rememberInfiniteTransition(label = "btnPulse")
+            val haloAlpha by transition.animateFloat(
+                initialValue = 0f,
+                targetValue = 0.2f,
+                animationSpec = infiniteRepeatable(animation = tween(800, easing = EaseInOut), repeatMode = RepeatMode.Reverse),
+                label = "btnAlpha"
+            )
+            Box(Modifier.matchParentSize().clip(shape).background(color.copy(alpha = haloAlpha)))
+        }
+    }
+}
+
 // Circular inset-highlight button (spec §4) — 40-46dp, layered shadow, no flat fill
 @Composable
 fun SCCircleButton(
@@ -50,6 +80,8 @@ fun SCCircleButton(
     modifier: Modifier = Modifier,
     tone: SCButtonTone = SCButtonTone.Neutral,
     size: Dp = 44.dp,
+    pulse: Boolean = false,
+    iconRotationDegrees: Float = 0f,
     label: String? = null,
 ) {
     val semantic = LocalSemanticColors.current
@@ -63,17 +95,21 @@ fun SCCircleButton(
     val pressed by interaction.collectIsPressedAsState()
     val scale by animateFloatAsState(if (pressed) 0.94f else 1f, label = "scCirclePress")
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = modifier) {
-        Surface(
-            onClick = onClick,
-            shape = CircleShape,
-            color = scheme.surface,
-            interactionSource = interaction,
-            modifier = Modifier
-                .graphicsLayer { scaleX = scale; scaleY = scale }
-                .size(size)
-                .scShadow(ScElevation.Raised, CircleShape, insetHighlight = true),
-        ) {
-            Icon(icon, contentDescription, tint = iconColor, modifier = Modifier.padding(Sp.md))
+        Box {
+            Surface(
+                onClick = onClick,
+                shape = CircleShape,
+                color = scheme.surface,
+                interactionSource = interaction,
+                modifier = Modifier
+                    .graphicsLayer { scaleX = scale; scaleY = scale }
+                    .size(size)
+                    .scShadow(ScElevation.Raised, CircleShape, insetHighlight = true),
+            ) {
+                Icon(icon, contentDescription, tint = iconColor,
+                    modifier = Modifier.padding(Sp.md).rotate(iconRotationDegrees))
+            }
+            PulseHalo(pulse, iconColor, CircleShape)
         }
         if (label != null) {
             Text(label, style = MaterialTheme.typography.labelSmall, color = scheme.onSurfaceVariant,
@@ -90,6 +126,8 @@ fun SCPillButton(
     modifier: Modifier = Modifier,
     tone: SCButtonTone = SCButtonTone.Neutral,
     enabled: Boolean = true,
+    pulse: Boolean = false,
+    iconRotationDegrees: Float = 0f,
     leadingIcon: ImageVector? = null,
 ) {
     val semantic = LocalSemanticColors.current
@@ -102,21 +140,25 @@ fun SCPillButton(
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     val scale by animateFloatAsState(if (pressed) 0.97f else 1f, label = "scPillPress")
-    androidx.compose.material3.Button(
-        onClick = onClick,
-        enabled = enabled,
-        interactionSource = interaction,
-        shape = RoundedCornerShape(50),
-        colors = ButtonDefaults.buttonColors(containerColor = container, contentColor = content),
-        contentPadding = PaddingValues(horizontal = Sp.xl, vertical = Sp.md),
-        modifier = modifier
-            .graphicsLayer { scaleX = scale; scaleY = scale }
-            .scShadow(ScElevation.Subtle, RoundedCornerShape(50), insetHighlight = true),
-    ) {
-        if (leadingIcon != null) {
-            Icon(leadingIcon, null, modifier = Modifier.padding(end = Sp.sm))
+    Box(modifier = modifier) {
+        androidx.compose.material3.Button(
+            onClick = onClick,
+            enabled = enabled,
+            interactionSource = interaction,
+            shape = RoundedCornerShape(50),
+            colors = ButtonDefaults.buttonColors(containerColor = container, contentColor = content),
+            contentPadding = PaddingValues(horizontal = Sp.xl, vertical = Sp.md),
+            modifier = Modifier
+                .fillMaxWidth()
+                .graphicsLayer { scaleX = scale; scaleY = scale }
+                .scShadow(ScElevation.Subtle, RoundedCornerShape(50), insetHighlight = true),
+        ) {
+            if (leadingIcon != null) {
+                Icon(leadingIcon, null, modifier = Modifier.padding(end = Sp.sm).rotate(iconRotationDegrees))
+            }
+            Text(text, style = MaterialTheme.typography.labelLarge)
         }
-        Text(text, style = MaterialTheme.typography.labelLarge)
+        PulseHalo(pulse, content, RoundedCornerShape(50))
     }
 }
 
