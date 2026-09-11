@@ -206,7 +206,7 @@ fun BackupView(appState: AppState) {
                         },
                         text = {
                             Text(
-                                "Clipboard contents may be readable by other apps. Are you sure you want to copy your seed phrase?",
+                                "Clipboard contents may be readable by other apps. The clipboard will be cleared after 60 seconds.",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
