@@ -8,7 +8,7 @@ Living document. See [`PLAN.md`](./PLAN.md) for scope, method and severity scale
 |---|---|
 | 1. PR and issue history | done: [`PR-ISSUE-CATALOG.md`](./PR-ISSUE-CATALOG.md) |
 | 2. Architecture map | first draft below |
-| 3. Code review A–H | A, B, D, E, F done; C (payment events) and G/H (price, protocol) in progress |
+| 3. Code review A–H | A, B, D, E, F, G/H done; C (payment events) in progress |
 | 4. Validation | not started |
 | 5. Synthesis | not started |
 
@@ -186,10 +186,12 @@ IDs are assigned in the order findings are confirmed and stay stable. The table 
 | LSP-042 | Medium | E | The forwarded-spend path still changes memory before the DB and can SYNC unsaved books (#321 class) | #321, #326 | not fixed |
 | LSP-043 | Medium | E | One pending settlement whose LDK lookup keeps failing stops live event handling for every channel (Plausible) | #416 class | not fixed |
 | LSP-044 | Medium | E | Migrations ignore every `ALTER TABLE` error and there is no schema version | #38 | made worse by #415 |
+| LSP-025 | Medium | A/H | Settlements re-anchor to the LSP's price, which moves real value from user to LSP and can block full exits | #232 | not fixed |
+| LSP-026 | Medium | B/H | The legacy trade path (no `trade_id`) is still accepted; `ts == 0` envelopes can be replayed from any node to reset a user's target (Plausible) | #145, #235, #284 | not fixed |
+| LSP-048 | Medium | G | Half the responding price feeds can shift the LSP price about 5%, a majority can walk it anywhere in steps, and nothing caps the top-ups that follow | #45, #239 | not fixed |
+| LSP-049 | Medium | G | The desktop wallet books LSP top-ups and SYNCs at a stale or quarantined price, losing the hedge on large moves | #232 | not fixed |
 | LSP-023 | Low | A | A channel with a USD target but zero recorded backing values the whole balance as stable | #401 | kept by #400 |
 | LSP-024 | Low | A | The unsigned pay-back path changes memory before the DB and ignores a failed save | #414 | not fixed |
-| LSP-025 | Low | A/H | Settlements re-anchor to the LSP's price instead of the amount paid | #232 | not fixed |
-| LSP-026 | Low | B | The legacy trade path (no `trade_id`) is still reachable: `ts == 0` replays, silent rejections, memory before DB | #235, #284 | not fixed |
 | LSP-027 | Low | F | TLS "pinning" adds the self-signed cert to the trust store instead of replacing it | — | n/a |
 | LSP-028 | Low | F | A huge `max_lines` in `/LdkLog` pre-allocates enough memory to abort the daemon | — | n/a |
 | LSP-029 | Low | F | `EditStableChannel` accepts NaN, infinite and negative targets and a cold price, with no SYNC to the wallet | — | n/a |
@@ -200,6 +202,9 @@ IDs are assigned in the order findings are confirmed and stay stable. The table 
 | LSP-045 | Low | E | One unreadable `channels` row stops the daemon from starting; corrupt money cells read as 0 or huge values | #416 class | not fixed |
 | LSP-046 | Low | E | A half-open event stream still counts as healthy (no keepalive), so a gap is never opened (Plausible) | — | not fixed |
 | LSP-047 | Low | E | The ledger is append-only by convention only, and some money audit rows are written outside the transaction that changes the books | — | not fixed |
+| LSP-050 | Low | G | The price refresh "in progress" flag is not panic-safe, so one panic stops pricing until restart (Plausible) | — | not fixed |
+| LSP-051 | Low | H | The iOS notification extension looks up uncorrelated SYNCs by the LSP's `user_channel_id`, which never matches, and blocks later background events | — | not fixed |
+| LSP-052 | Low | H | `/SignMessage` lets any api key holder sign arbitrary bytes with the node key that signs protocol messages | — | not fixed |
 
 ### High
 
@@ -459,6 +464,19 @@ IDs are assigned in the order findings are confirmed and stay stable. The table 
 - What happens: on the first boot after an upgrade, an `ALTER` that fails with BUSY, an I/O error or a full disk is swallowed and startup succeeds. The first money write naming the column then fails at runtime: if `settlement_payments.backing_sats_before` is missing, every top-up record fails, which is the LSP-003 drain for every top-up. Without a version a downgrade is not detected, which #400's own deploy notes warn about.
 - Fix: run schema init in one IMMEDIATE transaction; ignore only "duplicate column name"; verify required columns with `PRAGMA table_info` and refuse to start if missing; set `PRAGMA user_version` and refuse a DB newer than the binary.
 
+### LSP-048: Half the responding price feeds can shift the LSP price about 5%, a majority can walk it anywhere in steps, and nothing caps the top-ups that follow
+- Severity: Medium (needs control or a correlated failure of about half the feeds; impact is book-wide) · Confidence: Confirmed (mechanism)
+- Where: `src/price_feeds.rs:214-231` (median of whatever feeds responded; even count takes the midpoint), `251-288` (≥3 feeds within 5% of that median "agree"; the 10% breaker compares against the **last accepted** price), `240-243` (an anchor older than 60 s is dropped, so after a quarantine the next consensus is accepted unbounded); payout `stable_manager.rs:2287-2340` (no cap).
+- What happens: with 3 honest feeds at P and 3 wrong at P(1−X) for X ≤ 9.5%, all six agree with the midpoint and the accepted price is P(1−X/2), up to −4.76%. Two wrong out of four responding (two honest ones rate-limited) does the same. With a majority, 9.9% steps are accepted every 15 s refresh (about 46% per 60 s tick), and a larger jump only pauses pricing for 60 s. The next tick tops up every stable channel at once with no per-tick budget. Android and desktop wallets cap a top-up at their own (correct) equilibrium and keep the excess as native, so it is not paid back.
+- Why it matters: a 4.76% shift for one tick pays out about 4.76% of the whole stable book.
+- Fix: require a strict majority of the configured feeds (≥4 of 6), not ≥3 of those that answered; pay only when two consecutive refreshes agree within about 0.5% (or use a short TWAP); make the breaker cumulative over a window against a slow anchor and stay paused when the anchor expires during a quarantine; add the per-tick and per-channel caps from LSP-013.
+
+### LSP-049: The desktop wallet books LSP top-ups and SYNCs at a stale or quarantined price, losing the hedge on large moves
+- Severity: Medium (wallet side; user loss in exactly the large-move case the product exists for) · Confidence: Confirmed code path
+- Where: `src/user.rs:1005-1077` (`sc.latest_price` only updated on a fresh refresh), `src/stable.rs:568-571` (keeps the old value when the fresh price is 0), `src/user.rs:2883-2900` (signed top-up booked at `sc.latest_price`, only checked `> 0`), `3998-4007` (SYNC delta at the same price).
+- What happens: BTC falls 12% within one refresh. The desktop quarantines and keeps its old price; the LSP's anchor expires first and it pays a top-up at the new price. The desktop computes equilibrium at the old price, sees it already met, and books the whole top-up as native. The LSP is at par, the wallet is $120 below par in its own view, and nothing corrects it. Android handles this correctly by refusing and retrying.
+- Fix: book with the fresh price only; if it is 0, do not acknowledge and retry, as Android does.
+
 ### Low
 
 ### LSP-023: A channel with a USD target but zero recorded backing values the whole balance as stable
@@ -468,11 +486,11 @@ IDs are assigned in the order findings are confirmed and stay stable. The table 
 ### LSP-024: The unsigned pay-back path changes memory before the DB and ignores a failed save
 - Confidence: Confirmed. Where: `stable_manager.rs:2064-2099` (memory first), `2101-2114` (save error only audited). The next reconnect reloads the old backing and the backstop cuts the target by the amount paid back. This is the only stability write not using `PendingBookUpdate`. Fix: same transaction pattern as the signed path.
 
-### LSP-025: Settlements re-anchor to the LSP's price instead of the amount paid
-- Confidence: Confirmed. Where: `src/stable.rs:782-788` (`.max(equilibrium)` at the LSP price), used by both settlement paths. Related: #232. Effect: peers disagree by up to the 0.5% quote band (about 40 sats on $10), and each later settlement starts from different backing. Fix: drop the floor (#232); longer term, sign the post-state or price into the settlement.
+### LSP-025: Settlements re-anchor to the LSP's price, which moves real value from user to LSP and can block full exits
+- Severity: Medium (raised from Low by the protocol review). Confidence: Confirmed. Where: `src/stable.rs:782-788` (`.max(equilibrium)` at the LSP price), used by both settlement paths. Related: #232. Effect: this is not only a ledger mismatch as #232 says. Worked example: E = $1000, the wallet sees $110,000 and the LSP $109,560 (0.4% apart, inside the normal band). The wallet pays 90,909 sats; the LSP floors backing at its own equilibrium, 3,651 sats higher. When the price returns, the LSP's top-up is 3,651 sats short, so a round trip with no net price change costs the user about $3.65. The gap ratchets to the largest disagreement seen. While the LSP sees that gap as a surplus it rejects a full-exit trade with `SettlementRequired` (`src/stable.rs:407-413`), the wallet sees nothing to settle, and each attempt costs the fee. Fix: make the result amount-faithful (`current.saturating_sub(amount)` plus the live clamp), as #232 proposes; longer term, sign the payer's price or post-state into `STABILITY_PAYMENT_V1`.
 
-### LSP-026: The legacy trade path (no `trade_id`) is still reachable
-- Confidence: Confirmed. Where: `stable_manager.rs:3412-3426` (`ts == 0` skips the freshness check, and there is no nonce inside the 300 s window), `3447-3488`, `3592-3618` (memory updated before `save_channel`). Effect: a signed legacy request can be replayed later by its signer's channel; rejections are silent and unrefundable; a failed save leaves memory ahead of the DB with no SYNC. No current client uses it. Fix: finish #235/#284 and remove the path.
+### LSP-026: The legacy trade path (no `trade_id`) is still accepted; `ts == 0` envelopes can be replayed from any node to reset a user's target
+- Severity: Medium (raised from Low by the protocol review). Confidence: Confirmed code path; Plausible exploit (needs an old envelope, for example from logs, backups or the LDK payment store). Where: `stable_manager.rs:3412-3426` (`ts == 0` skips the freshness check, and there is no nonce inside the 300 s window), `3447-3488`, `3592-3618` (memory updated before `save_channel`). Effect: LDK does not tell the daemon which channel a keysend came in on, so anyone holding an old signed legacy envelope can keysend it from any node with the recomputed fee. The signature still verifies against the named channel's counterparty, and the LSP resets that user's `expected_usd` to the old target and SYNCs it (for example $5000 back to $50), for 1% of the delta. Envelopes with `ts != 0` can be replayed within 300 s. Rejections on this path are silent and unrefundable, and a failed save leaves memory ahead of the DB with no SYNC. Every current client sends `trade_id`, which is signed, so current envelopes cannot be downgraded. Fix: reject `TRADE_V1` without `trade_id` (#284); at minimum reject `ts == 0` now, as #145 planned.
 
 ### LSP-027: TLS "pinning" adds the self-signed cert to the trust store instead of replacing it
 - Confidence: Confirmed. Where: `server/sc-rest-client/src/client.rs:95-104` (`add_root_certificate` with reqwest's built-in roots still on). Effect: any public-CA cert for the daemon's DNS name is also trusted. Fix: `tls_built_in_root_certs(false)`, or verify the leaf SPKI hash.
@@ -503,6 +521,29 @@ IDs are assigned in the order findings are confirmed and stay stable. The table 
 
 ### LSP-047: The ledger is append-only by convention only, and some money audit rows are written outside the transaction that changes the books
 - Confidence: Confirmed. Where: `src/ledger.rs:231-279` (no UPDATE/DELETE triggers, no hash chain, `ON DELETE CASCADE` refs); `STABLE_SPEND_DEDUCTED` before the save (`stable_manager.rs:2839`), `STABILITY_PAYMENT_V1_SENT` before the record (`2454`), `TRADE_ACCEPTED` after the trade commit (`3390`, and `persist_trade_acceptance` writes no ledger row). Effect: a crash can leave a book change with no ledger row, or a ledger row for a change that never committed, and edits leave no trace. Fix: write every book-changing event in the same transaction; add a hash chain and BEFORE UPDATE/DELETE triggers; anchor the chain head externally.
+
+### LSP-050: The price refresh "in progress" flag is not panic-safe
+- Confidence: Plausible (needs a panic in a fetch thread, for example `println!` to a closed pipe). Where: `src/price_feeds.rs:89-98`, `154-169` (`updating = true` with no RAII guard). Effect: pricing stops until restart, which stops all ticks. Fix: a drop guard that clears the flag.
+
+### LSP-051: The iOS notification extension looks up uncorrelated SYNCs by the LSP's `user_channel_id`, which never matches, and blocks later background events
+- Confidence: Confirmed (wallet side). Where: `ios/StableChannels/NotificationService/Services/SQLitePaymentDatabase.swift:770-783` (`WHERE user_channel_id = ?`); the LSP signs its own id (`stable_manager.rs:2640-2646`), which differs from the wallet's; foreground iOS and Android key by `channel_id`. The extension then stops its event loop without acknowledging, so later background events wait until the app is opened. Fix: key by `channel_id` like the other clients.
+
+### LSP-052: `/SignMessage` lets any api key holder sign arbitrary bytes with the node key that signs protocol messages
+- Confidence: Confirmed. Where: `main.rs:237` → `handlers/tools.rs:14-23`; the same key signs SYNC, rejections and top-ups (`stable_manager.rs:245-249`, `2373`, `2648`), and the only domain separation is the JSON `type` field. Effect: whoever holds the api key (see LSP-006, LSP-017) can forge a `SYNC_V1` with a huge `sync_version`, after which the wallet ignores every real SYNC. Fix: remove or gate `/SignMessage` behind a separate operator credential, and prefix protocol payloads with a protocol-specific domain tag that `/SignMessage` refuses to sign.
+
+### Protocol message table
+
+All signatures are LDK `sign_message` (zbase32, recoverable, over `"Lightning Signed Message:" ‖ payload`); the payload is the exact JSON string in the envelope. From the protocol review, checked against the code.
+
+| Message | Direction | TLV | Verified against | Replay protection | Legacy fallback still accepted |
+|---|---|---|---|---|---|
+| `TRADE_V1` (with `trade_id`) | wallet → LSP | 13377331 | counterparty of the named channel | unique `trade_id`, payment id idempotent, `ts` ±15 min | **yes**: without `trade_id` it takes the legacy path (LSP-026) |
+| `SYNC_V1` | LSP → wallet | 13377331, 1 msat | pinned LSP key | monotone `sync_version` per channel, no expiry | n/a |
+| `TRADE_REJECTED_V1` | LSP → wallet | 13377331, 1 msat | LSP key | correlation and terminal state | n/a |
+| `STABILITY_PAYMENT_V1` | both ways | 13377333 | counterparty of the named channel | durable settlement registry, expiry ≤14 days | **yes**: unsigned `[0x01]` on 13377331 from any sender (LSP-015) |
+| `REGISTER_PUSH_V1` | wallet → LSP, HTTP | n/a | `node_id` in request | `ts` ±300 s | **yes**: unsigned `/api/register-push`, the only path the mobile apps use (LSP-001) |
+
+Note: LDK does not tell the daemon which channel a keysend arrived on, so the LSP cannot bind any message to its payer; it relies on the signature naming the channel. Every signed path is safe under that model except the legacy ones in the last column.
 
 ### Crash-window table
 

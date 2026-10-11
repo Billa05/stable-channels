@@ -11,3 +11,4 @@ These notes are unedited. Some items are marked Plausible, and finding ids here 
 | `D-channel-lifecycle.md` | D: channel ready, splices, closes, startup reconcile, operator edits |
 | `E-persistence-concurrency.md` | E: DB ordering, crash windows, migrations, locks, ledger |
 | `F-api-auth-push.md` | F: REST surface, HMAC, TLS, push, secrets, Umbrel |
+| `GH-price-protocol.md` | G and H: price oracle, wire protocol, wallet counterparts |
