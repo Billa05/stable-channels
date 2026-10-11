@@ -117,3 +117,5 @@ Each subsystem is reviewed against the goal questions. Reviewers trace realistic
 | Date | Step |
 |---|---|
 | 2026-10-11 | Phase 0 done. Plan committed. |
+| 2026-10-11 | Architecture map and invariants added to FINDINGS. |
+| 2026-10-11 | Phase 1 done: PR-ISSUE-CATALOG.md. Baseline tests green. First two findings (LSP-001, LSP-002). |
