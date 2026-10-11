@@ -8,7 +8,7 @@ Living document. See [`PLAN.md`](./PLAN.md) for scope, method and severity scale
 |---|---|
 | 1. PR and issue history | done: [`PR-ISSUE-CATALOG.md`](./PR-ISSUE-CATALOG.md) |
 | 2. Architecture map | first draft below |
-| 3. Code review A–H | in progress |
+| 3. Code review A–H | A (stability), B (trades), F (API/auth) done; C, D, E, G/H in progress |
 | 4. Validation | not started |
 | 5. Synthesis | not started |
 
@@ -119,16 +119,136 @@ Steps 4 and 5 race: LDK events and ticks can be processed before the manager has
 
 ## What we do right
 
-_Filled in as reviews complete._
+These are design choices worth keeping. Each was checked in the code.
+
+**Concurrency and state**
+- **One writer for the books.** Every money path (tick, wake pass, LDK events, REST edits, startup reconcile) runs under one `tokio::sync::Mutex<StableChannelManager>`. Ticks cannot overlap, and a tick cannot race a trade or a forward. Events are read by a separate task into a buffer, so a long hold does not drop them (`state.rs:30`, `event_loop.rs:32-75`).
+- **Save before publish (#326).** For trades, signed settlements and forward deductions, the DB is written first, memory only after commit, and SYNC only carries saved values. A failed save is queued in `pending_book_updates` and later events for that channel wait behind it (`stable_manager.rs:385-458`).
+
+**Trades**
+- **The LSP computes the allocation itself.** The signature is checked against the counterparty LDK reports for the named channel. The new allocation uses the LSP's own price and LDK's live balances; nothing from the message is booked as-is (`stable_manager.rs:3074-3108`, `3296-3310`).
+- **One atomic decision per trade.** An acceptance is one transaction with the channel update, with duplicate and version checks (`src/db.rs:1513-1565`). A trade cannot be both accepted and rejected. Rejections are signed, stored, use a closed reason list, and are re-sent after a crash (`stable_manager.rs:545-690`).
+- **Fee checked against what arrived.** The fee is checked against the amount actually received, and a quote more than 0.5% from the LSP price is rejected.
+
+**Settlements**
+- **Signed pay-backs are tightly bound.** `STABILITY_PAYMENT_V1` binds amount, direction, channel, expiry and signer. It is written to a durable inbox before any booking, cannot be replayed (primary key plus compare-and-swap), and books atomically (`stable_manager.rs:1500-1950`).
+- **A settlement moves backing by its own amount only (#402).** A lower live balance is left for its own event and is never written off by this payment (`src/stable.rs:762-795`).
+- **The LSP never pulls funds.** An unpaid surplus stays on the books as a debt; it is not taken.
+
+**Price**
+- **Price for money decisions is guarded.** It needs 3 agreeing feeds, at most a 10% move per refresh and at most 60 s age, and is quarantined after a large move. A stale or quarantined price stops the tick.
+
+**API surface**
+- **No wallet holds the admin key.** Android and iOS only call two unauthenticated JSON routes (`/api/register-push`, `/api/channel-exists`); the desktop wallet never calls the REST API. The README line that wallets are "equal clients of the same REST surface" is not true in the code, which is the safe outcome.
+- **HMAC done carefully.** Constant-time compare and a ±60 s timestamp window (`auth.rs:41-76`). Oversized bodies are rejected before the HMAC read, plus a router-wide body cap (`auth.rs:115-131`, `main.rs:300`).
+- **Signed `RegisterPush` is well formed.** It has a type tag, a 300 s freshness window and fails closed. On Umbrel, nginx forwards `/api/` without adding a credential, so the GUI web page is not an open proxy by itself.
+- **Secrets on the LDK hop are separate.** The SC daemon uses LDK Server's own api key and pinned cert, independent of its own.
+
+**Testing**
+- 322 LSP unit tests and 273 shared-library tests pass on `main`, and many are regression tests named after real incidents.
 
 ## What we do wrong
 
-IDs are assigned in the order findings are confirmed and stay stable. The table is sorted by severity.
+IDs are assigned in the order findings are confirmed and stay stable. The table is sorted by severity. **Confirmed** means traced end to end in the code; **Plausible** means one step is unverified (named in the entry). Raw reviewer notes are in [`reviews/`](./reviews/); this file is the checked summary.
 
-| ID | Severity | Area | Title | Upstream |
-|---|---|---|---|---|
-| LSP-001 | Medium | F | Unauthenticated legacy `/api/register-push` lets anyone take over a node's wake pushes | #162 (closed, still open on main) |
-| LSP-002 | Medium | H | A signed settlement whose `expected_usd` disagrees with the LSP's is applied, not refused | #296, #299 |
+| ID | Severity | Area | Title | Upstream | Open PRs |
+|---|---|---|---|---|---|
+| LSP-003 | **High** | A | A top-up is sent before it is recorded; if the record fails, the same top-up is sent again every 120 s | #411 | not fixed by #400 |
+| LSP-004 | **High** | A | A top-up whose send errors after LDK already dispatched it is sent again 60 s later (Plausible) | #411 class | not fixed |
+| LSP-005 | **High** | A | An unclaimed top-up is booked at send, then cut from the user's USD target as a spend | #392 | fixed by #400 |
+| LSP-006 | **High** | F | The Umbrel web GUI sends the full admin key, and every signed request, over plain LAN HTTP (Plausible) | #192, #210 | n/a |
+| LSP-007 | **High** | B | A trade that never reaches a stored decision keeps the 1% fee, gets no answer, cannot be refunded, and blocks trading on that channel | #205, #240 | not fixed |
+| LSP-008 | **High** | B | Every rejection keeps the full fee; a wallet with a stale base state pays for repeated `invalid_fee` rejections and gets no corrective SYNC | #296, #240 | not fixed |
+| LSP-001 | Medium | F | Unauthenticated legacy `/api/register-push` lets anyone take over a node's wake pushes | #162 | n/a |
+| LSP-002 | Medium | H | A signed settlement whose `expected_usd` disagrees with the LSP's is applied, not refused | #296, #299 | not fixed |
+| LSP-009 | Medium | F | The HMAC covers only timestamp and body: requests can be replayed for 60 s, and to a different route | #87 | n/a |
+| LSP-010 | Medium | A | A top-up failure missed during an event-stream gap is never rolled back | — | fixed by #400 |
+| LSP-011 | Medium | A | A top-up meant for one channel can land on the same peer's other channel and is still booked on the first | — | not fixed |
+| LSP-012 | Medium | A/E | The manager lock is held across every LDK Server call, and those calls have no timeout | — | made worse by #400, #415 |
+| LSP-013 | Medium | A | No cap on top-up size or rate; the only limit is a cooldown kept in memory and reset on every reconnect; no backoff after failures | #401 | partly (#400 in-flight guard) |
+| LSP-014 | Medium | A | The channel reserve counts as stable backing, so a pay-back owed to the LSP can be unpayable | #401, #136 | not fixed |
+| LSP-015 | Medium | A | An unsigned pay-back right after a top-up claim is not matched, so the user's target is cut | #414 | not fixed |
+| LSP-016 | Medium | F | Anonymous clients can fill the disk through the two unauthenticated routes | #162 | n/a |
+| LSP-017 | Medium | F | The api key file is world-readable and written non-atomically, and an empty key file is accepted | #345 | n/a |
+| LSP-018 | Medium | F/B | Any Lightning peer can make the LSP write ledger rows and run LDK calls under the main lock for 1 msat; the 20/s limit from #230 is not on main | #230 | not fixed |
+| LSP-019 | Medium | F | The REST listener has no timeouts, connection limits or concurrency limits (Plausible) | — | n/a |
+| LSP-020 | Medium | B | If a payment lookup fails, the signed trade result carries the wrong id and the wallet discards an acceptance the LSP has booked (Plausible) | — | not fixed |
+| LSP-021 | Medium | B | A trade made while a top-up is in flight builds on the unlanded top-up; if the top-up fails, the rollback misses | — | fixed by #400 |
+| LSP-022 | Medium | B | Trade results reach offline users only on a timer; nothing fires on reconnect, and an accepted trade is dropped after 14 days with no SYNC fallback | — | not fixed |
+| LSP-023 | Low | A | A channel with a USD target but zero recorded backing values the whole balance as stable | #401 | kept by #400 |
+| LSP-024 | Low | A | The unsigned pay-back path changes memory before the DB and ignores a failed save | #414 | not fixed |
+| LSP-025 | Low | A/H | Settlements re-anchor to the LSP's price instead of the amount paid | #232 | not fixed |
+| LSP-026 | Low | B | The legacy trade path (no `trade_id`) is still reachable: `ts == 0` replays, silent rejections, memory before DB | #235, #284 | not fixed |
+| LSP-027 | Low | F | TLS "pinning" adds the self-signed cert to the trust store instead of replacing it | — | n/a |
+| LSP-028 | Low | F | A huge `max_lines` in `/LdkLog` pre-allocates enough memory to abort the daemon | — | n/a |
+| LSP-029 | Low | F | `EditStableChannel` accepts NaN, infinite and negative targets and a cold price, with no SYNC to the wallet | — | n/a |
+| LSP-030 | Low | F | The trade-fee refund preimage can be derived from public data (Plausible) | #378 | n/a |
+
+### High
+
+### LSP-003: A top-up is sent before it is recorded; if the record fails, the same top-up is sent again every 120 s
+- Severity: **High** (LSP funds leave without limit after a common ops failure)
+- Confidence: Confirmed
+- Area: A (stability engine)
+- Where: `server/stable-channels-lsp/src/stable_manager.rs:2451` (send) → `2464-2501` (record) → `2502-2507` (cooldown set; backing changes only if the record succeeded). The cooldown is memory-only (`stable_manager.rs:3712`) and `reconcile_from_grpc` rebuilds memory on every stream reconnect (`event_loop.rs:300-308`).
+- Related: #411. Open PR #400 keeps the same order.
+- What happens:
+  1. The tick sends a top-up and `spontaneous_send` returns Ok.
+  2. `record_stability_settlement_with_rollback` fails (for example a full disk or an I/O error; reads still work), or LDK returns an empty `payment_id`. `persisted = false`.
+  3. `sc.backing_sats` is not changed; only the in-memory cooldown is set.
+  4. 120 s later the tick computes the same drift from the same backing and pays again. Each extra top-up lands as native sats in the wallet, which never pays it back.
+  5. The `PaymentSuccessful` for the unrecorded payment matches no row and is only audited as a plain `PAYMENT_SETTLED` (`event_loop.rs:514-551`). Nothing alarms.
+  6. Crash variant: a crash between steps 1 and 2 loses the cooldown, so the first tick after restart pays once more. A stream reconnect resets the cooldown the same way.
+- Why it matters: every below-par channel is paid its drift about 30 times an hour until writes recover or LSP liquidity runs out, and the books show nothing.
+- Fix: write the intent row (settlement id, channel, amount) before sending, and send with a preimage derived from the settlement id (`SpontaneousSendRequest.preimage`). ldk-node then refuses a second send with the same payment id (`DuplicatePayment`), which makes a resend harmless. If the intent cannot be written, do not send. Until then: stop top-ups for a channel after any failed record, and alarm on an outbound `PaymentSuccessful` that matches no row.
+
+### LSP-004: A top-up whose send errors after LDK already dispatched it is sent again 60 s later
+- Severity: **High**
+- Confidence: Plausible. Unverified: that the ldk-node rev pinned by LDK Server (`f375e4d`) stores the payment after dispatch like `47dad6d` does (not in the local cache).
+- Area: A
+- Where: `stable_manager.rs:2513-2529` (the error arm records nothing and leaves the cooldown unset, by design: "so retry can fire").
+- What happens: an error can reach the daemon after the HTLC is queued: ldk-node's `send_inner` queues the HTLC and then writes the payment store (`spontaneous.rs:111-135`); or LDK Server restarts or the gRPC stream resets before replying (the client has no timeout and no idempotency key). The daemon audits `STABILITY_PAYMENT_FAILED`; the next tick sends a fresh top-up with a new random preimage, and the first one also completes with no row.
+- Why it matters: one double top-up per such error, invisible in the books. There is a test that asserts this retry behavior (`run_tick_send_failure_keeps_cooldown_unset`).
+- Fix: same as LSP-003. With a deterministic preimage and an intent row, "unknown outcome" becomes "look up this payment id, then decide".
+
+### LSP-005: An unclaimed top-up is booked at send, then cut from the user's USD target as a spend
+- Severity: **High** (user loss)
+- Confidence: Confirmed
+- Area: A
+- Where: `stable_manager.rs:2503-2507` (books `backing_after` at send), backstop `2223-2281`.
+- Related: #392. Fixed by open PR #400 (books the top-up when it is claimed).
+- What happens: the LSP raises backing as soon as LDK accepts the send. The live balance does not include the unclaimed HTLC, so if the user's wallet is offline for two ticks the backstop reads the gap as a spend, cuts `expected_usd`, and sends a SYNC. A later claim does not restore it. The wake flow from #376 shortens the window to about 61 s.
+- Fix: merge #400 (with the #416 fix; see the PR notes below).
+
+### LSP-006: The Umbrel web GUI sends the full admin key, and every signed request, over plain LAN HTTP
+- Severity: **High** (full LSP drain if the precondition holds)
+- Confidence: Plausible. Confirmed: the GUI fetches the raw key and sends requests over the app proxy's HTTP hop. Unverified: that an attacker on the LAN can also use the Umbrel session cookie (it travels in the same HTTP stream, so likely).
+- Area: F
+- Where: `server/lsp-server-gui/src/ui/mod.rs:101-118`, `server/lsp-server-gui/src/platform.rs:177-191` (fetches `/setup/key.txt` on every page load), `umbrel/docker/40-provision-gui-api-key.sh:63-81` (writes the hex key there), `umbrel/docker/lsp-gui-nginx.conf.template:35-45`.
+- What happens: Umbrel's default LAN access is `http://umbrel.local:<port>`. The `/setup/` allowlist only admits Umbrel's `app_proxy`, which is correct, but the hop from the browser to `app_proxy` is plain HTTP. Anyone passively watching the operator's LAN sees the key in the `/setup/key.txt` response, plus every request's `X-Auth` and body. With the key they can post `/api/OnchainSend` or `/api/SpliceOut`.
+- Why it matters: the SC api key unlocks every proxied LDK route (`OnchainSend`, `SpontaneousSend`, `SpliceOut`, `SignMessage`, `ForceCloseChannel`). The README says a leaked SC key "gives the attacker access only to the SC daemon"; in practice that is a full drain, and `SignMessage` also lets the holder forge the LSP's signed messages to wallets.
+- Fix: do not serve the raw key to the browser. Sign server-side in a sidecar behind `app_proxy`, or require HTTPS/Tor/Tailscale for the GUI. Split credentials: a read-only key for dashboards and a separate money-moving key (see LSP-009 for the HMAC changes). Mount only the api key file into the GUI container, not the whole data dir with `tls.key` and the DBs (`docker-compose.yml:66-68`).
+
+### LSP-007: A trade that never reaches a stored decision keeps the 1% fee, gets no answer, cannot be refunded, and blocks trading on that channel
+- Severity: **High** (user loss and lock-out after routine events)
+- Confidence: Confirmed
+- Area: B (trades)
+- Where: `event_loop.rs:386-387` ("LDK Server does not replay its stream"), `backfill.rs:107-127` (reconnect backfill only writes `PAYMENT_RECONSTRUCTED` audit rows and never re-runs `handle_payment_received`), `stable_manager.rs:3063-3108` (early returns on transient LDK errors), `revenue.rs:668-671` (refund needs a stored rejection). Wallet lock-out: Android `DatabaseService.kt:682-693`, iOS `ChannelRepository.swift:268-272`, desktop `src/db.rs:2253-2257`.
+- Related: #205, #240 (two-phase confirmation, closed unmerged).
+- What happens: LDK Server claims the trade keysend (and the fee) before the daemon sees it. Nothing is written to an inbox first. Any of these leaves no decision row: the keysend lands while the daemon restarts or its stream reconnects; the daemon crashes mid-trade; a transient `list_channels`, `verify_signature` or `sign_message` error; a DB error while writing the rejection; the channel closes before processing. The operator's `RefundTradeFee` refuses (`NotRejectedTradeFee`). After 15 minutes each wallet marks the trade `uncertain` and refuses every new trade on that channel until a signed result arrives, which never does.
+- Why it matters: one LSP restart during a user's trade costs the fee and disables trading on that channel until manual repair on both sides. The signed-settlement path already has a durable inbox; trades do not.
+- Fix: write `{payment_id, payment_hash, amount, raw TLV, received_at}` to a `trade_inbox` table as the first action in `handle_payment_received`, and process from it, leaving rows pending on transient errors. For stream gaps (where the TLV is lost), add a signed wallet `TRADE_STATUS_V1` query answered from `trade_decisions`, and turn "received but undecided" into a signed `internal_failure` rejection with an automatic refund. Give wallets an expiry exit from `uncertain`.
+
+### LSP-008: Every rejection keeps the full fee; a wallet with a stale base state pays for repeated `invalid_fee` rejections and gets no corrective SYNC
+- Severity: **High** (seen in production: #296, 6 of 6 trades rejected, every fee kept)
+- Confidence: Confirmed
+- Area: B
+- Where: `stable_manager.rs:3280-3290` (fee checked against the LSP's own `expected_usd`), `3270-3295` (LSP-caused rejections: cold or quarantined price, quote vs a price up to 60 s old), `616-690` (rejection sends no SYNC and no refund), `revenue.rs:660-671` (refund is manual only).
+- What happens: `TRADE_V1` carries the new target, not the base state the wallet computed it from. If the wallet's `expected_usd` is off by more than about $0.10 (a missed SYNC after its 10 retries, or any wallet bug), the LSP's fee check fails, the trade is rejected with `invalid_fee`, the fee is kept, and nothing tells the wallet how to recover, so the next trade fails the same way. Several rejection reasons are the LSP's own fault (no fresh price, quote drift against its stale price, its own processing delay past 15 minutes, internal failure) and also keep the fee.
+- Why it matters: users lose 1% per attempt, and the LSP books revenue from its own outages.
+- Fix: add `base_sync_version` (and the old `expected_usd`) to the signed `TRADE_V1`; reject a mismatch with its own reason and queue a SYNC so the wallet converges. Refund automatically (using the existing deterministic-preimage refund path from a worker) for every rejection the user did not cause. Longer term, land the two-phase quote/confirm flow (#240) so the fee is only paid against a signed reservation.
+
+### Medium
 
 ### LSP-001: Unauthenticated legacy `/api/register-push` lets anyone take over a node's wake pushes
 - Severity: Medium
@@ -149,6 +269,125 @@ IDs are assigned in the order findings are confirmed and stay stable. The table 
 - What happens: `handle_signed_stability_payment` compares the signed `expected_usd` with its own, and on mismatch only writes `STABILITY_PAYMENT_STATE_DIVERGENCE` to the audit log, then applies the payment. `backing_after_user_to_lsp_stability` (`src/stable.rs:762-795`) floors backing at the LSP's equilibrium, so any amount above the LSP's own computed surplus comes out of the user's native sats and stays with the LSP. When a wallet bug makes it pay a surplus that does not exist, the LSP keeps the sats.
 - Why it matters: the signature already proves the wallet's view of the books; a large divergence is strong evidence of a wallet bug, and the user loses the overpayment. Keeping it also hides the bug from both sides.
 - Fix: LDK Server claims keysends before the daemon sees them, so the daemon cannot fail the HTLC. Instead, above a tolerance (for example 1% or $0.50), refund the part of the amount above the LSP's own computed surplus (`amount - (backing - equilibrium)`) with a keysend recorded before sending, and send a correction `SYNC_V1`. Keep the audit row.
+
+
+### LSP-009: The HMAC covers only timestamp and body: requests can be replayed for 60 s, and to a different route
+- Severity: Medium · Confidence: Confirmed (capturing a request needs a plaintext vantage point such as LSP-006, a TLS-terminating proxy, or LSP-027)
+- Where: `server/stable-channels-lsp/src/auth.rs:59-61` (MAC over `ts || body`), `server/sc-rest-client/src/client.rs:144-160`
+- What happens: there is no nonce cache, so a captured `/SpontaneousSend` (fresh preimage each call) or `/OnchainSend` pays twice if replayed within ±60 s. The path is not in the MAC, so a valid triple is accepted by any route whose request decodes from that body: `CloseChannelRequest` has the same wire encoding as `ForceCloseChannelRequest`, so an observed cooperative close can be replayed as a force close.
+- Fix: MAC over `method || path || ts || nonce || body`, keep a nonce cache for the timestamp window, and version the header (`HMAC2`).
+
+### LSP-010: A top-up failure missed during an event-stream gap is never rolled back
+- Severity: Medium · Confidence: Confirmed · Fixed by open PR #400
+- Where: `server/stable-channels-lsp/src/backfill.rs:263-307` handles `sync`+Failed and any kind+Succeeded; a `stability`+Failed row falls through `if payment.status != Succeeded { continue; }`. The comment at `backfill.rs:260-262` says the gap is closed.
+- What happens: the LSP booked the top-up at send (LSP-005). If its `PaymentFailed` arrives while the stream is down, the optimistic backing is never undone, so the user's books show sats that never arrived and the backstop later cuts the target.
+- Fix: in backfill, roll back `stability` rows whose LDK payment is Failed (as #400 does).
+
+### LSP-011: A top-up meant for one channel can land on the same peer's other channel and is still booked on the first
+- Severity: Medium · Confidence: Confirmed from LDK's router code; needs a peer with two usable channels, which the daemon supports (`stability_tick.rs:73-96`)
+- Where: `stable_manager.rs:2423-2440` (keysend to `node_id` with `route_parameters: None`); rust-lightning `router.rs:2556-2586` picks first hops by liquidity and can split across channels.
+- What happens: channel A is owed 12,500 sats; LDK routes the keysend over the peer's channel B. The LSP books A as topped up; A's live balance has not moved, so two ticks later the backstop cuts A's target. B holds the extra sats as native.
+- Fix: book a top-up on the channel whose balance actually rose, or settle per peer, or skip top-ups (with an alarm) to a peer with more than one usable channel; set `max_path_count = 1`.
+
+### LSP-012: The manager lock is held across every LDK Server call, and those calls have no timeout
+- Severity: Medium · Confidence: Confirmed
+- Where: `stability_tick.rs:47-57`; inside the tick `stable_manager.rs:2156, 2160, 2372, 2451, 2594-2608`; event dispatch `event_loop.rs:388`; the gRPC client is built with no timeout (`ldk-server-client/src/client.rs:120-123`).
+- What happens: one stalled LDK Server call holds the lock indefinitely. Event dispatch, failure rollbacks, trade decisions, forward deductions and the REST stable-channel routes all stop while the event buffer grows. With N channels below par, a tick makes 2N sequential round trips under the lock. PRs #400 and #415 add more calls under it.
+- Fix: wrap every LDK call in `tokio::time::timeout`; split the tick into decide-and-record under the lock, sign-and-send outside it, record outcomes under it; cap work per tick.
+
+### LSP-013: No cap on top-up size or rate; the only limit is a cooldown kept in memory and reset on every reconnect; no backoff after failures
+- Severity: Medium (defense in depth on the money path) · Confidence: Confirmed
+- Where: `stable_manager.rs:2340-2341` (amount is the raw drift), `2317` (cooldown is the only limit), `3712` (memory only), `732` and `2528` (failures restore or skip the cooldown); no outbound-liquidity check before sending.
+- What happens: nothing says "no top-up above X% of the target", "no more than Y sats per channel per day" or "pause above Z sats per hour". LSP-003, LSP-004 or a bad price that three feeds agree on are limited only by channel liquidity. A channel the LSP can no longer fund sends a failing keysend every 60 s.
+- Fix: per-payment, per-channel-per-day and global hourly caps with a circuit breaker and a red alarm; persist the last send time; exponential backoff after failures; check outbound liquidity first.
+
+### LSP-014: The channel reserve counts as stable backing, so a pay-back owed to the LSP can be unpayable
+- Severity: Medium · Confidence: Confirmed on the LSP side (wallet side in #401)
+- Where: `stable_manager.rs:52-58` (`their_sats` includes the counterparty reserve), used for backing, drift and backstop (`2207`, `2287-2291`); `src/stable.rs:29-62`.
+- What happens: a user spends down to the reserve, so backing is the reserve. The price rises; the LSP is owed the surplus and wakes the phone every tick it is offline, but the wallet cannot pay (spendable is 0). The spend guard from #344 then blocks all of the user's spends.
+- Fix: exclude the reserve from the balance used for backing (coordinated with wallets), or cap the amount owed at what the user can spend; add backoff (LSP-013).
+
+### LSP-015: An unsigned pay-back right after a top-up claim is not matched, so the user's target is cut
+- Severity: Medium (legacy wallets only) · Confidence: Confirmed
+- Where: `stable_manager.rs:2044-2061` matches the balance drop against `stable_receiver_btc`, which is refreshed only at the tick (`2210`, `2285`), not on claim (`event_loop.rs:489-541`); backstop `2223-2281`.
+- Related: #414. Not fixed by #400. Goes away when the legacy `[1]` marker is removed (#235, #284).
+- Fix: refresh the cached balance on claim, or remove the legacy path.
+
+### LSP-016: Anonymous clients can fill the disk through the two unauthenticated routes
+- Severity: Medium · Confidence: Confirmed
+- Where: `handlers/register_push.rs:101-109` writes the parse error, which embeds the whole input, to the channel ledger as `REGISTER_PUSH_LEGACY_INVALID` (a durable event, `src/ledger.rs:1073`, never pruned); `push/tokens.rs:41-65` has no length limits and never deletes rows; each `/api/channel-exists` call makes one `ListChannels` gRPC call.
+- What happens: a 1 MiB invalid body appends about 1 MiB to the SQLite ledger per request, under the DB mutex the stability engine shares. A full disk stops settlement and is one trigger for LSP-003.
+- Fix: log only the error class and length; make pre-auth failures operational (JSONL only); validate field lengths; prune `push_tokens`; per-IP rate limit both `/api/*` routes; cache `ListChannels` briefly.
+
+### LSP-017: The api key file is world-readable and written non-atomically, and an empty key file is accepted
+- Severity: Medium (fail-open of the only control on money-moving routes) · Confidence: Confirmed
+- Where: `server/stable-channels-lsp/src/main.rs:324-355`: `std::fs::write` with the default umask (typically 0644), no fsync or rename; an existing file of any length is accepted. Compare the TLS key, written `0o400` (`tls.rs:155`).
+- What happens: off Umbrel, any local user can read the key. If the first start crashes or hits ENOSPC between create and write, the file is left empty; on restart the daemon uses `""` as the HMAC key, and anyone can sign requests to every route, including `/OnchainSend`.
+- Fix: require exactly 32 bytes or refuse to start; write a temp file with mode 0600, fsync, rename; create the dir 0700; warn if the key is group- or world-readable.
+
+### LSP-018: Any Lightning peer can make the LSP write ledger rows and run LDK calls under the main lock for 1 msat; the 20/s limit from #230 is not on main
+- Severity: Medium · Confidence: Confirmed
+- Where: `stable_manager.rs:1428-1460` (TLV 13377331 handling), `3021-3104` (audit rows, then `ListChannels` at `3063` before the channel and signature checks), `event_loop.rs:388-391` (lock held for the whole dispatch); trade spam: fee floor `stable_manager.rs:133` (`.max(1)`) and ±1000 msat tolerance (`136-142`), decision rows never deleted (`src/db.rs:100-121`).
+- What happens: a keysend of 1 msat with a well-formed `TRADE_V1` naming a random channel writes about three durable ledger rows (with up to 8 KiB of attacker text) and makes one `ListChannels` call under the lock that serializes the whole stability engine. A real user can also spam tiny trades, each creating a permanent decision row and a 14-day response obligation. #230 described a 20/s fixed-window limiter; it is not in the code on main.
+- Fix: restore a rate limit before any audit, DB or gRPC work; resolve the payer's channel from a cached list first and drop messages from peers without a stable channel; make pre-auth failures operational; add a minimum trade size.
+
+### LSP-019: The REST listener has no timeouts, connection limits or concurrency limits
+- Severity: Medium · Confidence: Plausible (axum-server 0.7 / hyper 1.x defaults for HTTP/2 streams and header timeouts not checked)
+- Where: `main.rs:298-318` (only `DefaultBodyLimit` and `TraceLayer`), `auth.rs:123` (body read with no deadline), `example-config.toml:26-28` (suggests exposing :3002).
+- What happens: where :3002 is reachable, an anonymous client opens many HTTP/2 streams each trickling a body up to 1 MiB; the auth layer buffers each without a deadline, so memory grows until the daemon (and the stability engine) is killed.
+- Fix: request and body-read timeouts, a global concurrency limit, low h2 `max_concurrent_streams`, per-IP limits on auth failures.
+
+### LSP-020: If a payment lookup fails, the signed trade result carries the wrong id and the wallet discards an acceptance the LSP has booked
+- Severity: Medium · Confidence: Plausible (needs a transient `get_payment_details` failure at decision time)
+- Where: `stable_manager.rs:595-613` (falls back to the LSP-internal `payment_id` instead of the payment hash), `3168-3169`, `3343-3352`; `event_loop.rs:462-466` does not pass the hash that the event already carries; Android `DatabaseService.kt:1116-1160`.
+- What happens: the wallet correlates results by payment hash, so it drops the acceptance while the LSP has booked the new target. The books disagree until a later SYNC.
+- Fix: pass the payment hash from the `PaymentReceived` event instead of looking it up; never sign a result with a fallback id.
+
+### LSP-021: A trade made while a top-up is in flight builds on the unlanded top-up; if the top-up fails, the rollback misses
+- Severity: Medium · Confidence: Confirmed (needs the top-up HTLC to fail after the trade) · Fixed by open PR #400
+- Where: `stable_manager.rs:2445-2447`, `2503-2507` (optimistic backing at send), `3257-3264`, `3302-3310` (trade builds on in-memory backing), `src/db.rs:4546-4561` (rollback compare-and-swap requires the old target).
+- What happens: the trade changes `expected_usd`, so the rollback's compare-and-swap no longer matches and is skipped. The user keeps backing for sats that never arrived; the backstop then cuts their target.
+- Fix: book top-ups on claim (#400), or reject trades while a top-up is in flight.
+
+### LSP-022: Trade results reach offline users only on a timer; nothing fires on reconnect, and an accepted trade is dropped after 14 days with no SYNC fallback
+- Severity: Medium · Confidence: Confirmed code path; trigger depends on users closing the app right after trading
+- Where: `src/db.rs:1582-1585` (backoff capped at 1 h), `1640-1644` (abandon after 14 days); `stable_manager.rs:472-541` (no wake push), `3332-3409` (acceptance never queues an ordinary SYNC); `stability_tick.rs:261-299` (the reconnect hook runs only a stability pass).
+- Fix: on peer reconnect, flush pending trade responses; send a wake push for a pending result; on abandon, fall back to an ordinary SYNC of the current books.
+
+### Low
+
+### LSP-023: A channel with a USD target but zero recorded backing values the whole balance as stable
+- Confidence: Confirmed. Where: `stable_manager.rs:2287-2291` (`backing_sats == 0` means "use the whole balance"); `src/stable.rs:188-249` can leave `backing = 0` with `expected_usd > 0`. The wallet treats 0 differently (`src/stable.rs:542-553`).
+- Effect: the user's later native receives (or the reserve) are silently counted as stable. Fix: never use 0 as a sentinel for an active target; store backing explicitly.
+
+### LSP-024: The unsigned pay-back path changes memory before the DB and ignores a failed save
+- Confidence: Confirmed. Where: `stable_manager.rs:2064-2099` (memory first), `2101-2114` (save error only audited). The next reconnect reloads the old backing and the backstop cuts the target by the amount paid back. This is the only stability write not using `PendingBookUpdate`. Fix: same transaction pattern as the signed path.
+
+### LSP-025: Settlements re-anchor to the LSP's price instead of the amount paid
+- Confidence: Confirmed. Where: `src/stable.rs:782-788` (`.max(equilibrium)` at the LSP price), used by both settlement paths. Related: #232. Effect: peers disagree by up to the 0.5% quote band (about 40 sats on $10), and each later settlement starts from different backing. Fix: drop the floor (#232); longer term, sign the post-state or price into the settlement.
+
+### LSP-026: The legacy trade path (no `trade_id`) is still reachable
+- Confidence: Confirmed. Where: `stable_manager.rs:3412-3426` (`ts == 0` skips the freshness check, and there is no nonce inside the 300 s window), `3447-3488`, `3592-3618` (memory updated before `save_channel`). Effect: a signed legacy request can be replayed later by its signer's channel; rejections are silent and unrefundable; a failed save leaves memory ahead of the DB with no SYNC. No current client uses it. Fix: finish #235/#284 and remove the path.
+
+### LSP-027: TLS "pinning" adds the self-signed cert to the trust store instead of replacing it
+- Confidence: Confirmed. Where: `server/sc-rest-client/src/client.rs:95-104` (`add_root_certificate` with reqwest's built-in roots still on). Effect: any public-CA cert for the daemon's DNS name is also trusted. Fix: `tls_built_in_root_certs(false)`, or verify the leaf SPKI hash.
+
+### LSP-028: A huge `max_lines` in `/LdkLog` pre-allocates enough memory to abort the daemon
+- Confidence: Confirmed. Where: `handlers/ldk_log.rs:28, 57` (`VecDeque::with_capacity(max_lines)` from a `u32`); the GUI passes the text box through. Effect: one authenticated request (or a typo) stops the stability engine until restart. Fix: clamp (for example 10,000) and do not pre-allocate from input; same in `audit_log.rs`.
+
+### LSP-029: `EditStableChannel` accepts NaN, infinite and negative targets and a cold price, with no SYNC to the wallet
+- Confidence: Confirmed (validation missing); effect on later ticks Plausible. Where: `handlers/stable_channels.rs:72-96`, `stable_manager.rs:761-916` (no `is_finite`, sign or price guard; `btc_price == 0` stores `backing_sats = 0` at `835-840`). Fix: validate on the server; confirmation step in the GUI; send a SYNC or document that edits are LSP-local.
+
+### LSP-030: The trade-fee refund preimage can be derived from public data
+- Confidence: Plausible (only matters if a refund is routed through a node that saw the original payment). Where: `src/trade.rs:122-126` (`sha256(tag || trade_payment_id)`), `revenue.rs:679, 702-708`. Fix: `HMAC(local_secret, trade_payment_id)`, which keeps it deterministic but unguessable.
+
+### Notes on the open PRs #400 and #415
+
+- **#400 (book a top-up when it is claimed)** fixes LSP-005, LSP-010 and LSP-021 and adds a one-top-up-in-flight guard. It does **not** fix LSP-003/LSP-004 (it keeps send-then-record). It introduces two problems that should be fixed before merging:
+  - **#416:** the tick reads all in-flight top-up rows at once, so one unreadable row pauses top-ups for every channel, with an alarm that names no channel.
+  - **Event latency:** every event waits on top-up lookups (`lock_for_event_with_top_ups_resolved`: 3 attempts, 1 s apart, one RPC per in-flight row), so a lookup that keeps failing adds about 2 s per event for up to 14 days. It also adds more LDK calls under the manager lock (LSP-012). Plausible; from the PR code.
+  - Deploy hazards from its own description: deploy only with no top-up in flight; never roll back to an older daemon while one is in flight; the 14-day release is by clock, not blocks.
+- **#415 (do not deduct a payment that is still pending)** fixes #324 for the backstop, but the forward and splice-confirm handlers still read the live balance, and two failed `GetBalances` calls in a row fall back to today's behavior.
 
 ## Fix plan
 

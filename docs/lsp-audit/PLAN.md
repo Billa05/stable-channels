@@ -119,3 +119,4 @@ Each subsystem is reviewed against the goal questions. Reviewers trace realistic
 | 2026-10-11 | Phase 0 done. Plan committed. |
 | 2026-10-11 | Architecture map and invariants added to FINDINGS. |
 | 2026-10-11 | Phase 1 done: PR-ISSUE-CATALOG.md. Baseline tests green. First two findings (LSP-001, LSP-002). |
+| 2026-10-11 | Reviews A, B, F merged into FINDINGS: 28 more findings (LSP-003 to LSP-030), 6 High. Raw notes in reviews/. |
