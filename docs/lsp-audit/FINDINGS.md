@@ -8,7 +8,7 @@ Living document. See [`PLAN.md`](./PLAN.md) for scope, method and severity scale
 |---|---|
 | 1. PR and issue history | done: [`PR-ISSUE-CATALOG.md`](./PR-ISSUE-CATALOG.md) |
 | 2. Architecture map | first draft below |
-| 3. Code review A–H | A (stability), B (trades), D (lifecycle), F (API/auth) done; C, E, G/H in progress |
+| 3. Code review A–H | A, B, D, E, F done; C (payment events) and G/H (price, protocol) in progress |
 | 4. Validation | not started |
 | 5. Synthesis | not started |
 
@@ -162,10 +162,11 @@ IDs are assigned in the order findings are confirmed and stay stable. The table 
 | LSP-031 | **High** | D | At startup, a channel-ready event handled before the channel list is loaded overwrites a tracked channel with a $0 target | #413 | not fixed |
 | LSP-032 | **High** | D | If the startup reconcile is missed, one channel-ready makes the list non-empty and every other channel stays unloaded until the stream reconnects | #413 | not fixed |
 | LSP-033 | **High** | A/H | Paying the LSP is voluntary: a modified wallet can take every top-up and never pay back, then close or splice out (design) | #344, #401 | not fixed |
+| LSP-010 | **High** | A/E | A top-up failure missed during an event-stream gap is never rolled back, so the backstop later cuts the user's target | — | fixed by #400 |
+| LSP-041 | **High** | C/E | A user's signed pay-back that arrives during an event-stream gap, or whose inbox write fails, is never booked; the backstop then cuts their target, so they pay twice | — | not fixed |
 | LSP-001 | Medium | F | Unauthenticated legacy `/api/register-push` lets anyone take over a node's wake pushes | #162 | n/a |
 | LSP-002 | Medium | H | A signed settlement whose `expected_usd` disagrees with the LSP's is applied, not refused | #296, #299 | not fixed |
 | LSP-009 | Medium | F | The HMAC covers only timestamp and body: requests can be replayed for 60 s, and to a different route | #87 | n/a |
-| LSP-010 | Medium | A | A top-up failure missed during an event-stream gap is never rolled back | — | fixed by #400 |
 | LSP-011 | Medium | A | A top-up meant for one channel can land on the same peer's other channel and is still booked on the first | — | not fixed |
 | LSP-012 | Medium | A/E | The manager lock is held across every LDK Server call, and those calls have no timeout | — | made worse by #400, #415 |
 | LSP-013 | Medium | A | No cap on top-up size or rate; the only limit is a cooldown kept in memory and reset on every reconnect; no backoff after failures | #401 | partly (#400 in-flight guard) |
@@ -182,6 +183,9 @@ IDs are assigned in the order findings are confirmed and stay stable. The table 
 | LSP-035 | Medium | D | `EditStableChannel` overwrites the books: it erases drift, writes backing 0 on a cold price (LSP over-pays), and never SYNCs the wallet | #225 | partly |
 | LSP-036 | Medium | D | The backstop reads pending-splice balances as spends: an LSP splice-in books a phantom spend, and a splice-out is deducted before it confirms with no undo (Plausible) | #187, #285 | not fixed |
 | LSP-037 | Medium | D | A channel whose channel-ready event is missed or fails is never registered as stable | #266 | not fixed |
+| LSP-042 | Medium | E | The forwarded-spend path still changes memory before the DB and can SYNC unsaved books (#321 class) | #321, #326 | not fixed |
+| LSP-043 | Medium | E | One pending settlement whose LDK lookup keeps failing stops live event handling for every channel (Plausible) | #416 class | not fixed |
+| LSP-044 | Medium | E | Migrations ignore every `ALTER TABLE` error and there is no schema version | #38 | made worse by #415 |
 | LSP-023 | Low | A | A channel with a USD target but zero recorded backing values the whole balance as stable | #401 | kept by #400 |
 | LSP-024 | Low | A | The unsigned pay-back path changes memory before the DB and ignores a failed save | #414 | not fixed |
 | LSP-025 | Low | A/H | Settlements re-anchor to the LSP's price instead of the amount paid | #232 | not fixed |
@@ -193,6 +197,9 @@ IDs are assigned in the order findings are confirmed and stay stable. The table 
 | LSP-038 | Low | D | Reconcile soft-closes rows missing from one channel list and never re-opens them | #372 | not fixed |
 | LSP-039 | Low | D | A correction that brings the target to $0 is never SYNCed after a restart | #285, #311 | not fixed |
 | LSP-040 | Low | D | A stale pending-splice entry halts the tick for every channel | #163 | not fixed |
+| LSP-045 | Low | E | One unreadable `channels` row stops the daemon from starting; corrupt money cells read as 0 or huge values | #416 class | not fixed |
+| LSP-046 | Low | E | A half-open event stream still counts as healthy (no keepalive), so a gap is never opened (Plausible) | — | not fixed |
+| LSP-047 | Low | E | The ledger is append-only by convention only, and some money audit rows are written outside the transaction that changes the books | — | not fixed |
 
 ### High
 
@@ -289,6 +296,15 @@ IDs are assigned in the order findings are confirmed and stay stable. The table 
 - Why it matters: the LSP's hedge assumes the user pays symmetrically; nothing enforces it beyond the honest wallet code.
 - Fix: keep a durable per-channel "owed to LSP" balance; net future top-ups against it (pay only above a high-water mark); after a grace period of non-payment, stop stabilizing (target to $0 plus SYNC) or close the channel; alarm on long-standing debts. This caps the loss at one grace window's drift.
 
+### LSP-041: A user's signed pay-back that arrives during an event-stream gap, or whose inbox write fails, is never booked; the backstop then cuts their target, so they pay twice
+- Severity: **High** (user loss after a routine restart, does not heal)
+- Confidence: Confirmed
+- Area: C/E
+- Where: `stable_manager.rs:1579-1598` (an error from `register_inbound_stability_settlement` is audited as `STABILITY_PAYMENT_REPLAY_CONFLICT` and dropped, so no inbox row exists for `retry_pending_signed_stability` at `1952` to retry); `backfill.rs:105-127` (reconnect backfill only writes `PAYMENT_RECONSTRUCTED` audit rows; custom TLVs are not reprocessed); `event_loop.rs:386-387` (LDK Server does not replay its stream).
+- What happens: price rises, the wallet pays its surplus with a signed `STABILITY_PAYMENT_V1`. If that keysend lands while the daemon is restarting or its stream is reconnecting, or the first DB write fails, the LSP keeps the sats and the books do not move. The user's live balance is now below the LSP's backing, so two ticks later the backstop reads the gap as a spend, cuts `expected_usd`, and SYNCs it. The user paid the drift and then loses about the same amount again from their target.
+- Why it matters: the signed inbox is otherwise the best-built path in the daemon (see "What we do right"); this is the one hole in it, and the same root cause as LSP-007 for trades.
+- Fix: treat a DB error on registration as retryable (return `Reconnect`, as `PaymentSuccessful` already does). For stream gaps: before the backstop cuts a target, check `list_payments` for inbound keysends from that peer since the gap that were never classified, and hold the cut with an alarm if one is found. Longer term, have wallets keep a settlement pending until the LSP sends a signed acknowledgement of its `settlement_id`, and resend it otherwise (the inbox makes a resend idempotent).
+
 ### Medium
 
 ### LSP-001: Unauthenticated legacy `/api/register-push` lets anyone take over a node's wake pushes
@@ -318,8 +334,8 @@ IDs are assigned in the order findings are confirmed and stay stable. The table 
 - What happens: there is no nonce cache, so a captured `/SpontaneousSend` (fresh preimage each call) or `/OnchainSend` pays twice if replayed within ±60 s. The path is not in the MAC, so a valid triple is accepted by any route whose request decodes from that body: `CloseChannelRequest` has the same wire encoding as `ForceCloseChannelRequest`, so an observed cooperative close can be replayed as a force close.
 - Fix: MAC over `method || path || ts || nonce || body`, keep a nonce cache for the timestamp window, and version the header (`HMAC2`).
 
-### LSP-010: A top-up failure missed during an event-stream gap is never rolled back
-- Severity: Medium · Confidence: Confirmed · Fixed by open PR #400
+### LSP-010: A top-up failure missed during an event-stream gap is never rolled back, so the backstop later cuts the user's target
+- Severity: **High** (raised from Medium: two reviewers traced it to a target cut that does not heal) · Confidence: Confirmed · Fixed by open PR #400
 - Where: `server/stable-channels-lsp/src/backfill.rs:263-307` handles `sync`+Failed and any kind+Succeeded; a `stability`+Failed row falls through `if payment.status != Succeeded { continue; }`. The comment at `backfill.rs:260-262` says the gap is closed.
 - What happens: the LSP booked the top-up at send (LSP-005). If its `PaymentFailed` arrives while the stream is down, the optimistic backing is never undone, so the user's books show sats that never arrived and the backstop later cuts the target.
 - Fix: in backfill, roll back `stability` rows whose LDK payment is Failed (as #400 does).
@@ -425,6 +441,24 @@ IDs are assigned in the order findings are confirmed and stay stable. The table 
 - What happens: a new JIT channel becomes ready while the daemon restarts or its stream is down, or a call fails. The channel never gets a row: the user's trades are rejected with the fee kept, they get no stability, and only a manual edit (LSP-035) recovers it.
 - Fix: in `reconcile_from_grpc`, insert-if-absent a $0 row for every ready channel with no row; queue failed `handle_channel_ready` calls for retry.
 
+### LSP-042: The forwarded-spend path still changes memory before the DB and can SYNC unsaved books
+- Severity: Medium · Confidence: Confirmed ordering; "SYNC with unsaved values" Plausible (needs the save to fail while `next_sync_version` succeeds)
+- Where: `stable_manager.rs:2829` (`reconcile_forwarded` mutates `sc` in place), `2839` (`STABLE_SPEND_DEDUCTED` written to the ledger before the save), `2879-2891` (save failure only audited), `2895-2905` (SYNC from memory). Same pattern on the legacy paths: LSP-024 (pay-back) and LSP-026 (trade).
+- What happens: after a failed save, the tick and later writes work from unsaved books; a later write that copies from memory (`record_stability_settlement_with_rollback` copies `expected_usd` and native) silently persists them, while a restart reverts to the old row and the backstop deducts again at a different price. The wallet can receive two SYNCs with different targets, and the ledger claims a deduction that never committed. #326 fixed only the backstop and splice paths.
+- Fix: route all three paths through `PendingBookUpdate` (compute on a clone, save, swap, then audit and SYNC), with the audit row inside the save transaction.
+
+### LSP-043: One pending settlement whose LDK lookup keeps failing stops live event handling for every channel
+- Severity: Medium · Confidence: Plausible (control flow confirmed; needs a persistent per-payment `GetPaymentDetails` error)
+- Where: `backfill.rs:267-279` (`?` on each lookup aborts the pass), `event_loop.rs:340-346` (`settlement_outcomes_safe = false` → re-subscribe, never reach dispatch), `src/db.rs:4639-4648` (reads every pending row, no age bound).
+- What happens: every loop iteration re-subscribes, re-runs reconcile and backfill, fails on the same row, sleeps 1 s, and starts over; buffered events are dropped with the reader. Trades, pay-backs, forwards and failures are lost for every channel, while the tick keeps paying top-ups and the backstop turns missed events into target cuts. Same class as #416.
+- Fix: handle errors per row (block only that channel, alarm with the payment id, move to an operator queue when old); never gate global dispatch on one row.
+
+### LSP-044: Migrations ignore every `ALTER TABLE` error and there is no schema version
+- Severity: Medium · Confidence: Confirmed (consequence needs an `ALTER` to fail for a reason other than "duplicate column")
+- Where: `src/db.rs:463-722` (34 `let _ = conn.execute("ALTER TABLE …")` sites; `idx_settlement_sync_version` also unchecked); no `PRAGMA user_version`. #38 was closed but the pattern is still on main; #415 adds two more.
+- What happens: on the first boot after an upgrade, an `ALTER` that fails with BUSY, an I/O error or a full disk is swallowed and startup succeeds. The first money write naming the column then fails at runtime: if `settlement_payments.backing_sats_before` is missing, every top-up record fails, which is the LSP-003 drain for every top-up. Without a version a downgrade is not detected, which #400's own deploy notes warn about.
+- Fix: run schema init in one IMMEDIATE transaction; ignore only "duplicate column name"; verify required columns with `PRAGMA table_info` and refuse to start if missing; set `PRAGMA user_version` and refuse a DB newer than the binary.
+
 ### Low
 
 ### LSP-023: A channel with a USD target but zero recorded backing values the whole balance as stable
@@ -460,6 +494,41 @@ IDs are assigned in the order findings are confirmed and stay stable. The table 
 
 ### LSP-040: A stale pending-splice entry halts the tick for every channel
 - Confidence: Confirmed. Where: `stable_manager.rs:2148-2153` (the whole tick returns while any splice is pending), `2950-2955`, `1274-1276`. Effect: if a channel with a pending splice closes and the close is missed in a stream gap, every tick retries it and returns before settling any channel, until the next reconnect. Fix: drop pending splices whose uid is no longer live, and scope the barrier to that uid.
+
+### LSP-045: One unreadable `channels` row stops the daemon from starting; corrupt money cells read as 0 or huge values
+- Confidence: Confirmed. Where: `main.rs:128-131` (`load_all_channels()?` aborts startup), `src/db.rs:1942-1969` (`row?` fails the whole load; `unwrap_or(0)` and `as u64` on money columns). Effect: one damaged row takes down the LSP, or a negative `stable_sats` becomes about 1.8e19 backing. Fix: read rows one at a time, quarantine a bad row with an alarm, use `try_from` for money columns.
+
+### LSP-046: A half-open event stream still counts as healthy, so a gap is never opened
+- Confidence: Plausible (needs an HTTP/2 stream that stops delivering without an error; neither side sets keepalive). Where: `event_loop.rs:41-75`, `159-183`, `src/db/stream_checkpoint.rs:184-192`; LDK Server also skips lagged events without telling the client. Effect: events are lost while the checkpoint keeps recording "healthy", so backfill never runs and nobody is alerted. Fix: HTTP/2 keepalive or an application heartbeat; treat a missed heartbeat as a gap.
+
+### LSP-047: The ledger is append-only by convention only, and some money audit rows are written outside the transaction that changes the books
+- Confidence: Confirmed. Where: `src/ledger.rs:231-279` (no UPDATE/DELETE triggers, no hash chain, `ON DELETE CASCADE` refs); `STABLE_SPEND_DEDUCTED` before the save (`stable_manager.rs:2839`), `STABILITY_PAYMENT_V1_SENT` before the record (`2454`), `TRADE_ACCEPTED` after the trade commit (`3390`, and `persist_trade_acceptance` writes no ledger row). Effect: a crash can leave a book change with no ledger row, or a ledger row for a change that never committed, and edits leave no trace. Fix: write every book-changing event in the same transaction; add a hash chain and BEFORE UPDATE/DELETE triggers; anchor the chain head externally.
+
+### Crash-window table
+
+What a crash or error right after each step leaves behind, per money path. (a) = money sent but not recorded; (b) = received or recorded but not acted on; (c) = memory changed but DB not. From the persistence review, checked against the code.
+
+| Path | Step | Left behind | Handled? |
+|---|---|---|---|
+| Top-up | `spontaneous_send` returns, record not yet committed (`stable_manager.rs:2451`) | (a) restart clears the cooldown, backing unchanged → first tick resends | **no**, LSP-003 |
+| Top-up | send returns Err after LDK queued it (`2513-2529`) | (a) no cooldown → next tick resends with a new preimage | **no**, LSP-004 |
+| Top-up | record fails (`2467`) | (a) same drift paid every 120 s while writes fail | **no**, LSP-003 |
+| Top-up | `PaymentSuccessful` missed | settlement stays pending | yes (reconnect re-poll) |
+| Top-up | `PaymentFailed` missed or its rollback write fails | (b) optimistic backing stays; backstop cuts target | **no**, LSP-010 (fixed by #400) |
+| Signed pay-back | inbox write fails, or keysend lands in a stream gap | (b) LSP keeps the sats; backstop cuts target | **no**, LSP-041 |
+| Signed pay-back | registered, then transient failure | inbox row stays pending, retried each tick | yes |
+| Signed pay-back | persist (payment, channel CAS, inbox, ledger in one transaction) | atomic | yes |
+| Legacy pay-back | memory updated, `save_channel` fails (`2093-2116`) | (c) memory ahead; ledger says reconciled | **no**, LSP-024 |
+| Forwarded spend | memory, ledger row, then save fails (`2829-2905`) | (c) memory ahead, ledger claims deduction, SYNC from unsaved books | **no**, LSP-042 |
+| Backstop deduction | save fails | kept in `PendingBookUpdate` behind the event barrier | yes (recomputed after a crash) |
+| Channel ready, uid not in memory | `save_channel($0)` over existing row (`1371-1377`) | target overwritten with $0 | **no**, LSP-031 |
+| Trade | crash or gap before the decision is stored | (b) fee kept, no decision, no response | **no**, LSP-007 |
+| Trade | `persist_trade_acceptance` (channel CAS, decision, envelope in one transaction) | atomic | yes |
+| Trade | `TRADE_ACCEPTED` audit after commit (`3390`) | book change with no ledger row | partly, LSP-047 |
+| Legacy trade | memory, then save fails (`3592-3618`) | (c) target only in memory, no SYNC | **no**, LSP-026 |
+| SYNC | version reserved, sign, send, record | untracked SYNC; retry sends a newer version | yes (idempotent by version) |
+| Trade-fee refund | claim with deterministic id, send, record (`revenue.rs:679-729`) | ambiguous error resolved by id lookup | **yes: the model pattern for LSP-003** |
+| Close | memory removed, DB write fails | reconcile soft-closes non-live rows | yes |
 
 ### Notes on the open PRs #400 and #415
 

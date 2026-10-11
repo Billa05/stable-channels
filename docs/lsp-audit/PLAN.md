@@ -121,3 +121,4 @@ Each subsystem is reviewed against the goal questions. Reviewers trace realistic
 | 2026-10-11 | Phase 1 done: PR-ISSUE-CATALOG.md. Baseline tests green. First two findings (LSP-001, LSP-002). |
 | 2026-10-11 | Reviews A, B, F merged into FINDINGS: 28 more findings (LSP-003 to LSP-030), 6 High. Raw notes in reviews/. |
 | 2026-10-11 | Review D merged: LSP-031 to LSP-040 (3 High: startup race resets targets to $0, missed startup reconcile, voluntary pay-back). |
+| 2026-10-11 | Review E merged: LSP-041 to LSP-047 and a crash-window table; LSP-010 raised to High. |
