@@ -8,7 +8,7 @@ Living document. See [`PLAN.md`](./PLAN.md) for scope, method and severity scale
 |---|---|
 | 1. PR and issue history | done: [`PR-ISSUE-CATALOG.md`](./PR-ISSUE-CATALOG.md) |
 | 2. Architecture map | first draft below |
-| 3. Code review A–H | A (stability), B (trades), F (API/auth) done; C, D, E, G/H in progress |
+| 3. Code review A–H | A (stability), B (trades), D (lifecycle), F (API/auth) done; C, E, G/H in progress |
 | 4. Validation | not started |
 | 5. Synthesis | not started |
 
@@ -159,6 +159,9 @@ IDs are assigned in the order findings are confirmed and stay stable. The table 
 | LSP-006 | **High** | F | The Umbrel web GUI sends the full admin key, and every signed request, over plain LAN HTTP (Plausible) | #192, #210 | n/a |
 | LSP-007 | **High** | B | A trade that never reaches a stored decision keeps the 1% fee, gets no answer, cannot be refunded, and blocks trading on that channel | #205, #240 | not fixed |
 | LSP-008 | **High** | B | Every rejection keeps the full fee; a wallet with a stale base state pays for repeated `invalid_fee` rejections and gets no corrective SYNC | #296, #240 | not fixed |
+| LSP-031 | **High** | D | At startup, a channel-ready event handled before the channel list is loaded overwrites a tracked channel with a $0 target | #413 | not fixed |
+| LSP-032 | **High** | D | If the startup reconcile is missed, one channel-ready makes the list non-empty and every other channel stays unloaded until the stream reconnects | #413 | not fixed |
+| LSP-033 | **High** | A/H | Paying the LSP is voluntary: a modified wallet can take every top-up and never pay back, then close or splice out (design) | #344, #401 | not fixed |
 | LSP-001 | Medium | F | Unauthenticated legacy `/api/register-push` lets anyone take over a node's wake pushes | #162 | n/a |
 | LSP-002 | Medium | H | A signed settlement whose `expected_usd` disagrees with the LSP's is applied, not refused | #296, #299 | not fixed |
 | LSP-009 | Medium | F | The HMAC covers only timestamp and body: requests can be replayed for 60 s, and to a different route | #87 | n/a |
@@ -175,6 +178,10 @@ IDs are assigned in the order findings are confirmed and stay stable. The table 
 | LSP-020 | Medium | B | If a payment lookup fails, the signed trade result carries the wrong id and the wallet discards an acceptance the LSP has booked (Plausible) | — | not fixed |
 | LSP-021 | Medium | B | A trade made while a top-up is in flight builds on the unlanded top-up; if the top-up fails, the rollback misses | — | fixed by #400 |
 | LSP-022 | Medium | B | Trade results reach offline users only on a timer; nothing fires on reconnect, and an accepted trade is dropped after 14 days with no SYNC fallback | — | not fixed |
+| LSP-034 | Medium | D | An operator edit before the list is loaded resets the user's target to $0 | #413 | not fixed |
+| LSP-035 | Medium | D | `EditStableChannel` overwrites the books: it erases drift, writes backing 0 on a cold price (LSP over-pays), and never SYNCs the wallet | #225 | partly |
+| LSP-036 | Medium | D | The backstop reads pending-splice balances as spends: an LSP splice-in books a phantom spend, and a splice-out is deducted before it confirms with no undo (Plausible) | #187, #285 | not fixed |
+| LSP-037 | Medium | D | A channel whose channel-ready event is missed or fails is never registered as stable | #266 | not fixed |
 | LSP-023 | Low | A | A channel with a USD target but zero recorded backing values the whole balance as stable | #401 | kept by #400 |
 | LSP-024 | Low | A | The unsigned pay-back path changes memory before the DB and ignores a failed save | #414 | not fixed |
 | LSP-025 | Low | A/H | Settlements re-anchor to the LSP's price instead of the amount paid | #232 | not fixed |
@@ -183,6 +190,9 @@ IDs are assigned in the order findings are confirmed and stay stable. The table 
 | LSP-028 | Low | F | A huge `max_lines` in `/LdkLog` pre-allocates enough memory to abort the daemon | — | n/a |
 | LSP-029 | Low | F | `EditStableChannel` accepts NaN, infinite and negative targets and a cold price, with no SYNC to the wallet | — | n/a |
 | LSP-030 | Low | F | The trade-fee refund preimage can be derived from public data (Plausible) | #378 | n/a |
+| LSP-038 | Low | D | Reconcile soft-closes rows missing from one channel list and never re-opens them | #372 | not fixed |
+| LSP-039 | Low | D | A correction that brings the target to $0 is never SYNCed after a restart | #285, #311 | not fixed |
+| LSP-040 | Low | D | A stale pending-splice entry halts the tick for every channel | #163 | not fixed |
 
 ### High
 
@@ -247,6 +257,37 @@ IDs are assigned in the order findings are confirmed and stay stable. The table 
 - What happens: `TRADE_V1` carries the new target, not the base state the wallet computed it from. If the wallet's `expected_usd` is off by more than about $0.10 (a missed SYNC after its 10 retries, or any wallet bug), the LSP's fee check fails, the trade is rejected with `invalid_fee`, the fee is kept, and nothing tells the wallet how to recover, so the next trade fails the same way. Several rejection reasons are the LSP's own fault (no fresh price, quote drift against its stale price, its own processing delay past 15 minutes, internal failure) and also keep the fee.
 - Why it matters: users lose 1% per attempt, and the LSP books revenue from its own outages.
 - Fix: add `base_sync_version` (and the old `expected_usd`) to the signed `TRADE_V1`; reject a mismatch with its own reason and queue a SYNC so the wallet converges. Refund automatically (using the existing deterministic-preimage refund path from a worker) for every rejection the user did not cause. Longer term, land the two-phase quote/confirm flow (#240) so the fee is only paid against a signed reservation.
+
+### LSP-031: At startup, a channel-ready event handled before the channel list is loaded overwrites a tracked channel with a $0 target
+- Severity: **High** (user's USD position deleted on the LSP side, silently and permanently)
+- Confidence: Confirmed
+- Area: D (channel lifecycle and startup)
+- Where: `server/stable-channels-lsp/src/stable_manager.rs:1303-1316` (checks memory only), `1371-1378` (writes $0 / 0 / all-native over the row by uid, `src/db.rs:1162-1176`), `event_loop.rs:305-311` (connect-time reconcile skipped while the price is cold), `main.rs:167-196` (one startup reconcile attempt, waits up to 60 s for a price).
+- Related: #413. Not touched by #400 or #415.
+- What happens:
+  1. The daemon starts. The event loop connects at once. The price task has not fetched yet, so the connect-time reconcile is skipped (`event_loop.rs:305-311`) and live dispatch begins with an empty in-memory list. This happens on most restarts, not only during feed outages.
+  2. A splice on stable channel X confirms, and LDK re-fires `ChannelReady` for X.
+  3. `handle_channel_ready` does not find X in memory, takes the new-channel path, and saves $0 / 0 / all-native over X's existing row.
+  4. The startup reconcile then loads the $0 row. No SYNC, no alarm. The splice deduction is lost too.
+- Why it matters: the LSP stops stabilizing that user while the wallet still shows the old target; every later trade from that wallet fails the fee check (LSP-008).
+- Fix: when the uid is not in memory, load it from the DB first and treat the event as a splice if a row exists; never write a $0 row over an existing row (insert-if-absent); best, gate all dispatch on a `hydrated` flag (see LSP-032).
+
+### LSP-032: If the startup reconcile is missed, one channel-ready makes the list non-empty and every other channel stays unloaded until the stream reconnects
+- Severity: **High** (stability silently suspended for every user but one, for an unbounded time)
+- Confidence: Confirmed
+- Area: D
+- Where: `stable_manager.rs:1272-1282` (`reconcile_if_empty` reconciles only when the list is empty), `1389` (a new channel is pushed into the empty list), `main.rs:170-195` (single attempt), `event_loop.rs:305-311`.
+- What happens: the price stays cold for more than 60 s after start (a feed outage or quarantine), or the one startup reconcile fails on a transient `list_channels` or DB error. Any `ChannelReady` in that window (a new JIT channel, or a splice lock that also triggers LSP-031) adds one entry. From then on the tick's `reconcile_if_empty` sees a non-empty list and never loads the rest. Until the next stream reconnect: no top-ups for those users (the tick iterates memory only), their trades are rejected `InternalFailure` with the fee kept, `ListStableChannels` shows one channel, and any splice lock on them hits LSP-031.
+- Fix: replace `is_empty()` with a `hydrated` flag set only by a successful `reconcile_from_grpc`; let reconcile run without a price (books do not need one); hold event dispatch, trades and edits until hydrated.
+
+### LSP-033: Paying the LSP is voluntary: a modified wallet can take every top-up and never pay back, then close or splice out
+- Severity: **High** (design; an LSP drain by the user, bounded by position size and price moves)
+- Confidence: Confirmed (no server-side enforcement exists)
+- Area: A/H
+- Where: on user-owes drift the LSP only logs `CHECK_ONLY` or sends a wake push (`stable_manager.rs:2530-2560`); the debt helpers `settlement_owed_to_lsp` and `spend_consumes_lsp_surplus` (`src/stable.rs:465-497`) are used only by wallets; the full-exit gate exists only on the trade path (`src/stable.rs:407-413`); `handle_channel_closed` does no settlement (`stable_manager.rs:920-965`).
+- What happens: the LSP pays the shortfall at every new price low. A wallet that never sends `STABILITY_PAYMENT_V1` on rises keeps the surplus, so its backing grows toward `E / p_min`. It can close or splice out whenever the price is above `p_min`; neither path checks for a debt. The LSP's loss is about `E × (p_exit / p_min − 1)` per cycle, and a new channel starts fresh. In effect the LSP has written the user a free put.
+- Why it matters: the LSP's hedge assumes the user pays symmetrically; nothing enforces it beyond the honest wallet code.
+- Fix: keep a durable per-channel "owed to LSP" balance; net future top-ups against it (pay only above a high-water mark); after a grace period of non-payment, stop stabilizing (target to $0 plus SYNC) or close the channel; alarm on long-standing debts. This caps the loss at one grace window's drift.
 
 ### Medium
 
@@ -354,6 +395,36 @@ IDs are assigned in the order findings are confirmed and stay stable. The table 
 - Where: `src/db.rs:1582-1585` (backoff capped at 1 h), `1640-1644` (abandon after 14 days); `stable_manager.rs:472-541` (no wake push), `3332-3409` (acceptance never queues an ordinary SYNC); `stability_tick.rs:261-299` (the reconnect hook runs only a stability pass).
 - Fix: on peer reconnect, flush pending trade responses; send a wake push for a pending result; on abandon, fall back to an ordinary SYNC of the current books.
 
+### LSP-034: An operator edit before the list is loaded resets the user's target to $0
+- Severity: Medium · Confidence: Confirmed
+- Where: `stable_manager.rs:799-813` (`prior` from memory only; `(None, None) => 0.0`), `835-840`, `880-896`. #400/#415 add a `prior_books` path only for channels already in memory.
+- What happens: in the startup window (or while LSP-032 holds), an operator adds a note to channel X. `prior` is None, so the target becomes $0 and backing 0; the "no changes" guard passes because a note was given; `save_channel` overwrites the row and no SYNC is sent.
+- Fix: load the prior state from the DB when it is not in memory, and refuse edits until hydrated.
+
+### LSP-035: `EditStableChannel` overwrites the books: it erases drift, writes backing 0 on a cold price (LSP over-pays), and never SYNCs the wallet
+- Severity: Medium (operator-only, but a direct LSP over-payment) · Confidence: Confirmed
+- Where: `stable_manager.rs:761-918`; backing derivation `835-840`; no `send_sync_message` in the function; stabilization cap in shadow mode by default (`845-858`). Input validation is LSP-029.
+- What happens:
+  - **Cold price:** a note-only edit while the price is 0 keeps the target ($50) and writes backing 0. The user then spends 80,000 of 100,000 sats; with backing 0 nothing is deducted (`src/stable.rs:198-204`), and the tick values the position at the whole live balance ($20). The LSP sends a $30 top-up it does not owe.
+  - **Warm price:** any edit re-anchors backing to `target / price`, erasing accrued drift (for example the $5 the LSP owed after a 10% fall is never paid).
+  - **No SYNC:** the wallet keeps its old target, so its next trades fail the fee check (LSP-008).
+  - #400/#415 fix the note-only and cold-price cases; target edits still erase drift and still send no SYNC.
+- Fix: route target edits through the trade math so drift is preserved; never write backing 0 for an active target; require a warm price; persist, then queue a SYNC; refuse while unhydrated; consider a separate operator role for money-moving routes.
+
+### LSP-036: The backstop reads pending-splice balances as spends: an LSP splice-in books a phantom spend, and a splice-out is deducted before it confirms with no undo
+- Severity: Medium · Confidence: Plausible (LDK logic confirmed in the vendored rust-lightning; not verified that LDK Server's own LDK revision matches, and not reproduced on live nodes)
+- Where: `stable_manager.rs:52-58` adds the current scope's reserve to `inbound_capacity_msat`, while LDK reports the minimum across pending funding scopes, each with its own 1% reserve (rust-lightning `channel.rs:13554-13570`, `2783-2797`); backstop `stable_manager.rs:2223-2280`; `SpliceNegotiated` is audit-only (`event_loop.rs:618-624`).
+- What happens:
+  - **LSP splice-in of s sats:** while pending, the user appears `s / 100` sats poorer (new scope's reserve minus old). After two ticks the backstop cuts their USD by `s / 100 × price` and SYNCs it. A 0.1 BTC splice-in costs the user about 100,000 sats of USD position.
+  - **User splice-out:** the deduction happens through the backstop about 2 minutes after negotiation, not at channel-ready as #187 and #234 describe; if the splice is abandoned the balance returns but the deduction stays.
+- Fix: track a per-uid "splice in flight" flag from `SpliceNegotiated`/`SpliceNegotiationFailed`, suspend the backstop for that uid while set, and settle once at channel-ready.
+
+### LSP-037: A channel whose channel-ready event is missed or fails is never registered as stable
+- Severity: Medium · Confidence: Confirmed
+- Where: `stable_manager.rs:1011-1065` (reconcile walks DB rows only), `1318-1338`, `1371-1387` (`handle_channel_ready` returns on a gRPC or DB error; nothing retries); LDK Server drops events with no subscriber (ldk-server `main.rs:864-870`).
+- What happens: a new JIT channel becomes ready while the daemon restarts or its stream is down, or a call fails. The channel never gets a row: the user's trades are rejected with the fee kept, they get no stability, and only a manual edit (LSP-035) recovers it.
+- Fix: in `reconcile_from_grpc`, insert-if-absent a $0 row for every ready channel with no row; queue failed `handle_channel_ready` calls for retry.
+
 ### Low
 
 ### LSP-023: A channel with a USD target but zero recorded backing values the whole balance as stable
@@ -380,6 +451,15 @@ IDs are assigned in the order findings are confirmed and stay stable. The table 
 
 ### LSP-030: The trade-fee refund preimage can be derived from public data
 - Confidence: Plausible (only matters if a refund is routed through a node that saw the original payment). Where: `src/trade.rs:122-126` (`sha256(tag || trade_payment_id)`), `revenue.rs:679, 702-708`. Fix: `HMAC(local_secret, trade_payment_id)`, which keeps it deterministic but unguessable.
+
+### LSP-038: Reconcile soft-closes rows missing from one channel list and never re-opens them
+- Confidence: Confirmed. Where: `stable_manager.rs:1016-1035` (comment says a future reconcile clears it, but `load_all_channels` excludes closed rows, `src/db.rs:1942-1950`). Effect: one successful-but-incomplete `list_channels` (wrong node, briefly attached empty store) permanently untracks channels; their next splice then hits LSP-031. Fix: re-activate closed rows whose uid is live; treat a close as final only on `ChannelClosed`, or after N consecutive absences.
+
+### LSP-039: A correction that brings the target to $0 is never SYNCed after a restart
+- Confidence: Confirmed. Where: `stable_manager.rs:429-431` (`needs_sync` is memory-only), `1074-1078` (restart re-queues only `expected_usd > 0`). Effect: a splice-out or deduction cuts the target to $0 while the wallet is offline; after a restart nothing is ever sent and the wallet keeps its old target. Fix: persist "SYNC owed" in the same transaction as the books.
+
+### LSP-040: A stale pending-splice entry halts the tick for every channel
+- Confidence: Confirmed. Where: `stable_manager.rs:2148-2153` (the whole tick returns while any splice is pending), `2950-2955`, `1274-1276`. Effect: if a channel with a pending splice closes and the close is missed in a stream gap, every tick retries it and returns before settling any channel, until the next reconnect. Fix: drop pending splices whose uid is no longer live, and scope the barrier to that uid.
 
 ### Notes on the open PRs #400 and #415
 

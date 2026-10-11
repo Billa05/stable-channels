@@ -8,4 +8,5 @@ These notes are unedited. Some items are marked Plausible, and finding ids here 
 |---|---|
 | `A-stability-engine.md` | A: top-ups, pay-backs, the stability tick |
 | `B-trades.md` | B: trades, rejections, response retry, fee refunds |
+| `D-channel-lifecycle.md` | D: channel ready, splices, closes, startup reconcile, operator edits |
 | `F-api-auth-push.md` | F: REST surface, HMAC, TLS, push, secrets, Umbrel |
