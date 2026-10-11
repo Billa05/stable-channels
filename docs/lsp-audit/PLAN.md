@@ -1,6 +1,6 @@
 # LSP Audit: Plan
 
-Status: **in progress**. Findings land in [`FINDINGS.md`](./FINDINGS.md) as they are confirmed, so you can follow along commit by commit.
+Status: **complete**. Results are in [`FINDINGS.md`](./FINDINGS.md).
 
 | | |
 |---|---|
@@ -124,3 +124,4 @@ Each subsystem is reviewed against the goal questions. Reviewers trace realistic
 | 2026-10-11 | Review E merged: LSP-041 to LSP-047 and a crash-window table; LSP-010 raised to High. |
 | 2026-10-11 | Review G/H merged: LSP-048 to LSP-052, protocol message table; LSP-025 and LSP-026 raised to Medium. |
 | 2026-10-11 | Review C merged: LSP-053 to LSP-055; phase 3 complete. |
+| 2026-10-11 | Phases 4 and 5 done: summary, root causes, fix plan. Audit complete: 55 findings (12 High, 27 Medium, 16 Low). |
