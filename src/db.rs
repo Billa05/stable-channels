@@ -360,6 +360,15 @@ pub struct RevenueLedgerRow {
     pub detail_json: String,
 }
 
+/// A ledger row found through one of its references.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LedgerDetailRow {
+    pub id: i64,
+    pub event_type: String,
+    pub occurred_at_ms: i64,
+    pub detail_json: String,
+}
+
 fn trade_decision_summary_row(row: &rusqlite::Row<'_>) -> SqliteResult<TradeDecisionSummary> {
     Ok(TradeDecisionSummary {
         inbound_payment_id: row.get(0)?,
@@ -1166,6 +1175,23 @@ impl Database {
         )?;
         let rows = stmt.query_map(params![after_id, up_to_id], |row| {
             Ok(RevenueLedgerRow { id: row.get(0)?, event_type: row.get(1)?, occurred_at_ms: row.get(2)?, detail_json: row.get(3)? })
+        })?;
+        rows.collect()
+    }
+
+    /// Ledger rows of the given event types that reference `value` under `role`, oldest first.
+    pub fn ledger_rows_by_ref(&self, role: &str, value: &str, event_types: &[&str]) -> SqliteResult<Vec<LedgerDetailRow>> {
+        let conn = self.conn.lock().unwrap();
+        let types = vec!["?"; event_types.len()].join(", ");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT e.id, e.event_type, e.occurred_at_ms, e.detail_json
+             FROM ledger_event_refs r JOIN ledger_events e ON e.id = r.event_id
+             WHERE r.value = ? AND r.role = ? AND e.event_type IN ({types})
+             ORDER BY e.occurred_at_ms, e.id"
+        ))?;
+        let values = [value, role].into_iter().chain(event_types.iter().copied());
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+            Ok(LedgerDetailRow { id: row.get(0)?, event_type: row.get(1)?, occurred_at_ms: row.get(2)?, detail_json: row.get(3)? })
         })?;
         rows.collect()
     }
@@ -5319,6 +5345,27 @@ mod tests {
         assert_eq!(all[0].occurred_at_ms, 5_000);
         let middle = db.revenue_ledger_rows_between(all[0].id, all[1].id).unwrap();
         assert_eq!(middle.iter().map(|r| r.event_type.as_str()).collect::<Vec<_>>(), ["CHANNEL_READY_SPLICE"], "the range is (after, up_to]");
+    }
+
+    #[test]
+    fn ledger_rows_by_ref_match_the_role_value_and_type_in_time_order() {
+        use crate::ledger::LedgerEventDraft;
+        let db = Database::open_in_memory().unwrap();
+        let alice = "025a29399255108f82a158c7740053fb19933e3b874c68556deed6dd574da1c0f0";
+        let bob = "0380ba01cf1f8232298198ce1c6da12a7bd159656e79cbc22a5dfbea62ab1aef4b";
+        for (event, detail) in [
+            ("CHANNEL_PENDING", serde_json::json!({"counterparty_node_id": alice, "user_channel_id": "5293213951182344713304712262222632001", "occurred_at_ms": 3_000})),
+            ("PAYMENT_FORWARDED", serde_json::json!({"prev_node_id": alice, "next_node_id": bob, "occurred_at_ms": 2_000})),
+            ("SPLICE_NEGOTIATED", serde_json::json!({"counterparty_node_id": alice, "user_channel_id": "5293213951182344713304712262222632001", "occurred_at_ms": 1_000})),
+            ("CHANNEL_PENDING", serde_json::json!({"counterparty_node_id": bob, "user_channel_id": "281056294790600824049085389430669369069", "occurred_at_ms": 4_000})),
+        ] {
+            db.append_ledger_event(&LedgerEventDraft::from_audit_event(event, detail)).unwrap();
+        }
+        let rows = db.ledger_rows_by_ref("node_id", alice, &["CHANNEL_PENDING", "SPLICE_NEGOTIATED"]).unwrap();
+        assert_eq!(rows.iter().map(|r| r.event_type.as_str()).collect::<Vec<_>>(), ["SPLICE_NEGOTIATED", "CHANNEL_PENDING"], "oldest first, other types and other nodes left out");
+        assert_eq!(rows[1].occurred_at_ms, 3_000);
+        assert!(rows[1].detail_json.contains("5293213951182344713304712262222632001"));
+        assert!(db.ledger_rows_by_ref("user_channel_id", alice, &["CHANNEL_PENDING"]).unwrap().is_empty(), "a value under another role does not match");
     }
 
     #[test]
