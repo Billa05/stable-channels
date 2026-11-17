@@ -292,6 +292,7 @@ fn reason_words(code: &str) -> String {
 		"client_cancelled" => "cancelled by the wallet".to_owned(),
 		"invalid_confirmation" => "the confirmation was invalid".to_owned(),
 		"stale_request" => "the request expired".to_owned(),
+		"legacy_format" => "the wallet must update before it can trade".to_owned(),
 		other => other.replace('_', " "),
 	}
 }
@@ -315,7 +316,7 @@ fn entry(events: Vec<ChannelLedgerEvent>, channel: &str) -> HistoryEntry {
 
 fn describe(events: &[ChannelLedgerEvent], channel: &str, amount: Option<u64>, target: Option<f64>) -> (EntryKind, String) {
 	let amt = amount.map(sats).unwrap_or_default();
-	if has(events, &["TRADE_REJECTION_QUEUED", "TRADE_REJECTED_BY_LSP", "TRADE_FAILED"]) {
+	if has(events, &["TRADE_REJECTION_QUEUED", "TRADE_REJECTED_BY_LSP", "TRADE_FAILED", "TRADE_LEGACY_REFUSED"]) {
 		let reason = first_str(events, "reason_code")
 			.map(|code| reason_words(&code))
 			.unwrap_or_else(|| "unknown reason".to_owned());
@@ -489,6 +490,17 @@ mod tests {
 		let rejected = build_entries(&[ev(1, "TRADE_REJECTION_QUEUED", serde_json::json!({"reason_code": "insufficient_capacity"}), &[("trade_id", "t")])], "uid");
 		assert_eq!(rejected[0].kind, EntryKind::TradeRejected);
 		assert_eq!(rejected[0].summary, "Trade rejected: not enough channel capacity");
+	}
+
+	#[test]
+	fn a_refused_old_format_trade_reads_as_a_rejection() {
+		let entries = build_entries(&[
+			ev(1, "PAYMENT_CLAIMABLE", serde_json::json!({"amount_msat": 1_000_000}), &[("payment_id", "p")]),
+			ev(2, "TRADE_LEGACY_REFUSED", serde_json::json!({"reason_code": "legacy_format"}), &[("payment_id", "p")]),
+		], "uid");
+		assert_eq!(entries.len(), 1);
+		assert_eq!(entries[0].kind, EntryKind::TradeRejected);
+		assert_eq!(entries[0].summary, "Trade rejected: the wallet must update before it can trade");
 	}
 
 	#[test]
