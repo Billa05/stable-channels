@@ -690,6 +690,7 @@ fn resubscribe_delay(read_an_event: bool, lived: Duration, backoff: &mut Duratio
 async fn run(state: AppState) {
     let mut backoff = Duration::from_secs(1);
     let inbox = start_inbox(&state.data_dir).await;
+    state.stable_manager.lock().await.attach_event_inbox(inbox.clone());
     // Reload the durable boundary, including unresolved gaps surviving earlier processes. The
     // compatibility AppState timestamp is never used as a substitute for a failed database read.
     let mut health = StreamHealth::new(begin_gap_with_retry(state.db.as_ref()).await);
@@ -1095,6 +1096,7 @@ pub(crate) async fn dispatch_event(
                 e.outbound_amount_forwarded_msat,
                 e.total_fee_earned_msat.unwrap_or(0),
                 e.skimmed_fee_msat,
+                e.prev_htlcs.len() == 1 && e.next_htlcs.len() == 1 && e.total_fee_earned_msat.is_some(),
                 ldk,
                 btc_price,
             )
@@ -1166,6 +1168,8 @@ pub(crate) async fn dispatch_event(
                         return DispatchOutcome::Reconcile;
                     },
                 }
+                // Raises the user's books by what arrived; a top-up was already booked by its claim above.
+                mgr.book_lsp_payment(payment_id, amount_msat);
             }
             if !settlement_handled {
                 stable_channels::audit::audit_event(

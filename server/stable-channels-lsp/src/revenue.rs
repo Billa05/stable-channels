@@ -726,7 +726,7 @@ pub async fn refund_trade_fee(
             return Err(RefundError::OutcomeUnknown);
         },
     };
-    db.record_trade_fee_refund_payment(trade_payment_id, &refund_payment_id).map_err(db_error)?;
+    db.record_trade_fee_refund_payment(trade_payment_id, &refund_payment_id, &decision.user_channel_id).map_err(db_error)?;
     stable_channels::audit::audit_event(
         "TRADE_FEE_REFUND_SENT",
         serde_json::json!({

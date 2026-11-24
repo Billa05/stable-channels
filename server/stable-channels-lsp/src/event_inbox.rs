@@ -1,11 +1,13 @@
 //! The daemon's durable event inbox: each event read from LDK Server is saved here before it is handled and deleted once handled, in its own SQLite file so saving never waits on the main database.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 use ldk_server_client::ldk_server_grpc::events::EventEnvelope;
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use stable_channels::db::ForwardCursor;
 use tracing::warn;
 
 /// Kept next to the main database; transient, so it must not be restored from a backup.
@@ -163,6 +165,26 @@ impl Inbox {
         tx.execute("DELETE FROM events WHERE started != 0", [])?;
         tx.commit()?;
         Ok(rows)
+    }
+
+    /// Forwards in events not yet started, per channel, counted the way LDK counts them (one prev HTLC, one next HTLC, a fee).
+    pub(crate) fn queued_forwards(&self) -> rusqlite::Result<HashMap<String, ForwardCursor>> {
+        use ldk_server_client::ldk_server_grpc::events::event_envelope::Event as EventVariant;
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT id, kind, payload, dropped, received_ms, started FROM events WHERE kind = 'event' AND started = 0 ORDER BY id")?;
+        let rows = stmt.query_map([], read_row)?;
+        let mut totals: HashMap<String, ForwardCursor> = HashMap::new();
+        for row in rows {
+            let Entry::Event(EventEnvelope { event: Some(EventVariant::PaymentForwarded(e)) }) = row?.entry else { continue };
+            let ([prev], [next], Some(fee)) = (e.prev_htlcs.as_slice(), e.next_htlcs.as_slice(), e.total_fee_earned_msat) else { continue };
+            let spent = totals.entry(prev.channel_id.clone()).or_default();
+            spent.spent_msat += e.outbound_amount_forwarded_msat + fee;
+            spent.spent_count += 1;
+            let received = totals.entry(next.channel_id.clone()).or_default();
+            received.received_msat += e.outbound_amount_forwarded_msat;
+            received.received_count += 1;
+        }
+        Ok(totals)
     }
 
     /// Saved events and their payload bytes, markers excluded.
@@ -365,5 +387,52 @@ mod tests {
         conn.execute("UPDATE events SET payload = x'ff' WHERE id = ?1", [id]).unwrap();
         let row = inbox.oldest().unwrap().unwrap();
         assert_eq!((row.id, row.entry, row.received_ms), (id, Entry::Unreadable, 7));
+    }
+
+    fn forwarded(prev: &[&str], next: &[&str], outbound: u64, fee: Option<u64>) -> Entry {
+        use ldk_server_client::ldk_server_grpc::events::PaymentForwarded;
+        use ldk_server_client::ldk_server_grpc::types::HtlcLocator;
+        let locators = |ids: &[&str]| ids.iter().map(|id| HtlcLocator { channel_id: (*id).to_owned(), ..Default::default() }).collect();
+        Entry::Event(EventEnvelope {
+            event: Some(EventVariant::PaymentForwarded(PaymentForwarded {
+                prev_htlcs: locators(prev),
+                next_htlcs: locators(next),
+                outbound_amount_forwarded_msat: outbound,
+                total_fee_earned_msat: fee,
+                ..Default::default()
+            })),
+        })
+    }
+
+    #[test]
+    fn queued_forwards_sums_waiting_forward_events_per_channel() {
+        let inbox = Inbox::in_memory();
+        inbox
+            .save(&[
+                (forwarded(&["aa"], &["cc"], 10_000, Some(100)), 0),
+                (forwarded(&["aa"], &["cc"], 5_000, Some(0)), 0),
+                (forwarded(&["dd"], &["bb"], 7_000, Some(0)), 0),
+            ])
+            .unwrap();
+        let totals = inbox.queued_forwards().unwrap();
+        let aa = &totals["aa"];
+        assert_eq!((aa.spent_msat, aa.spent_count, aa.received_msat, aa.received_count), (15_100, 2, 0, 0));
+        let bb = &totals["bb"];
+        assert_eq!((bb.spent_msat, bb.spent_count, bb.received_msat, bb.received_count), (0, 0, 7_000, 1));
+    }
+
+    #[test]
+    fn started_and_uncounted_rows_are_left_out() {
+        let inbox = Inbox::in_memory();
+        inbox
+            .save(&[
+                (forwarded(&["aa"], &["bb"], 1_000, Some(10)), 0),
+                (forwarded(&["aa", "ee"], &["bb"], 2_000, Some(10)), 0),
+                (forwarded(&["aa"], &["bb"], 3_000, None), 0),
+            ])
+            .unwrap();
+        let id = inbox.oldest().unwrap().unwrap().id;
+        inbox.set_started(id, true).unwrap();
+        assert!(inbox.queued_forwards().unwrap().is_empty());
     }
 }

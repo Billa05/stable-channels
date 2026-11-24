@@ -1113,6 +1113,11 @@ const DIRECT_STATE_EVENTS: &[&str] = &[
     "STABILITY_PAYMENT_ROLLED_BACK",
     "SPLICE_RECONCILED",
     "TRADE_RESERVED",
+    "BOOKED_BALANCE_ANCHORED",
+    "BOOKED_BALANCE_CHANGED",
+    "BOOKED_BALANCE_CLOSED",
+    "BOOKED_BALANCE_MISMATCH",
+    "BOOKED_BALANCE_MISMATCH_CLEARED",
 ];
 
 /// Events that are deliberately JSONL-only: high-volume or transport noise whose durable signal
@@ -1133,6 +1138,10 @@ pub const OPERATIONAL_EVENTS: &[&str] = &[
     "EVENT_BUFFER_FULL",
     // Price-feed transport.
     "WEBSOCKET_DISCONNECTED",
+    // The books' shadow log, one line each time what disagrees changes; BOOKED_BALANCE_MISMATCH is the durable record.
+    "BOOKED_BALANCE_DISAGREES",
+    // Native from the books against today's stored native, one line each time the difference changes; it moves no money in PR 1.
+    "BOOKED_BALANCE_NATIVE_DIFFERS",
     // Per-tick and per-attempt traces whose outcome is recorded elsewhere, transport, and UI.
     "STABILITY_CHECK", "STABILITY_COOLDOWN", "STABILITY_PAY_COOLDOWN_CHECK", "RECONCILE_FORWARDED_COOLDOWN_SET",
     "TRADE_PROTOCOL_PATH", "CHANNEL_EXISTS_CHECK", "REGISTER_PUSH_OK", "REGISTER_PUSH_LEGACY_OK",

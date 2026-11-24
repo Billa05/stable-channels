@@ -6,7 +6,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ldk_server_client::error::{LdkServerError, LdkServerErrorCode};
 use ldk_server_client::ldk_server_grpc::api::{
-    GetBalancesRequest, GetBalancesResponse, GetForwardedPaymentTrackingModeRequest,
+    GetChannelForwardingStatsRequest, GetChannelForwardingStatsResponse, ListChannelForwardingStatsRequest,
+    ListChannelForwardingStatsResponse, GetBalancesRequest, GetBalancesResponse, GetForwardedPaymentTrackingModeRequest,
     GetForwardedPaymentTrackingModeResponse, GetNodeInfoRequest, GetNodeInfoResponse,
     GetPaymentDetailsRequest, GetPaymentDetailsResponse,
     ListChannelsRequest, ListChannelsResponse, ListForwardedPaymentsRequest,
@@ -21,7 +22,9 @@ use stable_channels::constants::{
     MAX_TRADE_QUOTE_DEVIATION_PERCENT, SIGNED_STABILITY_TLV_TYPE,
     STABILITY_PAYMENT_AUTH_TTL_SECS,
 };
-use stable_channels::db::{Database, InboundStabilityRegistration, PendingTradeResponse};
+use stable_channels::db::{
+    BookChange, BookOutcome, BookReason, Database, ForwardCursor, InboundStabilityRegistration, PendingTradeResponse,
+};
 use stable_channels::stable::StabilityPaymentDirection;
 use stable_channels::trade::TradeRejectionReason;
 use stable_channels::types::{Bitcoin, StableChannel, USD};
@@ -108,6 +111,21 @@ fn max_stabilization_rejected(
         );
     }
     enforced && exceeds
+}
+
+/// A books read or write that failed in the tick; the key changes once a day, so a lasting failure keeps one record a day.
+fn books_db_failed(read: bool, op: &str, uid: u128, channel_id: &str, error: &rusqlite::Error) {
+    tracing::error!("[stable] books: {} failed for {}: {}", op, uid, error);
+    let day = StableChannelManager::unix_time_secs() / STABILITY_TOP_UP_ALARM_REPEAT_SECS;
+    let detail = serde_json::json!({
+        "op": op, "context": "books", "user_channel_id": uid.to_string(), "channel_id": channel_id,
+        "error": error.to_string(), "dedup_key": format!("lsp:books-db:{op}:{uid}:{day}"),
+    });
+    if read {
+        stable_channels::audit::audit_event("DB_READ_FAILED", detail);
+    } else {
+        stable_channels::audit::audit_event("DB_WRITE_FAILED", detail);
+    }
 }
 
 fn splice_balance_change(before_sats: u64, after_sats: u64) -> (&'static str, u64) {
@@ -251,6 +269,18 @@ pub trait LdkServerCalls: Send + Sync {
     ) -> Result<SpliceInResponse, LdkServerError> {
         Err(LdkServerError::new(LdkServerErrorCode::InternalError, "splice_in is not available on this node client"))
     }
+    async fn get_channel_forwarding_stats(
+        &self,
+        _req: GetChannelForwardingStatsRequest,
+    ) -> Result<GetChannelForwardingStatsResponse, LdkServerError> {
+        Err(LdkServerError::new(LdkServerErrorCode::InternalError, "get_channel_forwarding_stats is not available on this node client"))
+    }
+    async fn list_channel_forwarding_stats(
+        &self,
+        _req: ListChannelForwardingStatsRequest,
+    ) -> Result<ListChannelForwardingStatsResponse, LdkServerError> {
+        Err(LdkServerError::new(LdkServerErrorCode::InternalError, "list_channel_forwarding_stats is not available on this node client"))
+    }
 }
 
 #[async_trait]
@@ -323,6 +353,18 @@ impl LdkServerCalls for crate::ldk_client::LdkClient {
     }
     async fn splice_in(&self, req: SpliceInRequest) -> Result<SpliceInResponse, LdkServerError> {
         crate::ldk_client::LdkClient::splice_in(self, req).await
+    }
+    async fn get_channel_forwarding_stats(
+        &self,
+        req: GetChannelForwardingStatsRequest,
+    ) -> Result<GetChannelForwardingStatsResponse, LdkServerError> {
+        crate::ldk_client::LdkClient::get_channel_forwarding_stats(self, req).await
+    }
+    async fn list_channel_forwarding_stats(
+        &self,
+        req: ListChannelForwardingStatsRequest,
+    ) -> Result<ListChannelForwardingStatsResponse, LdkServerError> {
+        crate::ldk_client::LdkClient::list_channel_forwarding_stats(self, req).await
     }
 }
 
@@ -437,6 +479,8 @@ pub struct StableChannelManager {
     pub enforce_max_stabilization: bool,
     db: Arc<Database>,
     data_dir: PathBuf,
+    /// The durable event inbox, for forwards still waiting in it.
+    event_inbox: Option<Arc<crate::event_inbox::Inbox>>,
     /// Splice events still awaiting a usable snapshot or a committed correction.
     pending_splices: std::collections::HashMap<u128, Option<String>>,
     /// Daily counts of records of channels that never became usable, and of connection changes.
@@ -446,6 +490,12 @@ pub struct StableChannelManager {
     pending_book_updates: std::collections::HashMap<u128, PendingBookUpdate>,
     /// Per-channel last logged stability outcome + value, so run_tick only audits on state-change.
     stability_throttle: std::collections::HashMap<u128, (String, f64)>,
+    /// Per-channel categories the books pass last logged, so a disagreement is logged once until it changes.
+    books_log_throttle: std::collections::HashMap<u128, String>,
+    /// Per-channel sats by which native from the books last differed from the stored native, so it is logged once until it changes.
+    books_native_throttle: std::collections::HashMap<u128, u64>,
+    /// The settled reading each channel without books had on the last books pass; the next pass anchors only if it reads the same.
+    books_anchor_candidates: std::collections::HashMap<u128, (u64, ForwardCursor)>,
     /// Per-channel open balance check for the balance-truth backstop debounce (ignores transient in-flight HTLCs).
     spend_debounce: std::collections::HashMap<u128, SpendCheck>,
     /// When each alarm for a top-up that keeps waiting was last raised, by (payment id, alarm), so it repeats daily and not every tick.
@@ -1181,11 +1231,15 @@ impl StableChannelManager {
             enforce_max_stabilization: false,
             db,
             data_dir,
+            event_inbox: None,
             pending_splices: std::collections::HashMap::new(),
             record_limits: crate::record_limits::RecordLimits::default(),
             openings_on_record: std::collections::HashSet::new(),
             pending_book_updates: std::collections::HashMap::new(),
             stability_throttle: std::collections::HashMap::new(),
+            books_log_throttle: std::collections::HashMap::new(),
+            books_native_throttle: std::collections::HashMap::new(),
+            books_anchor_candidates: std::collections::HashMap::new(),
             spend_debounce: std::collections::HashMap::new(),
             top_up_alarms: std::collections::HashMap::new(),
             top_up_lookup_failed: false,
@@ -1198,6 +1252,10 @@ impl StableChannelManager {
             hydrated: false,
             reconcile_wanted: false,
         }
+    }
+
+    pub(crate) fn attach_event_inbox(&mut self, inbox: Arc<crate::event_inbox::Inbox>) {
+        self.event_inbox = Some(inbox);
     }
 
     /// Whether the channel list has been loaded since start.
@@ -1744,9 +1802,9 @@ impl StableChannelManager {
                 // forensics survive a transient gRPC blip. If the channel
                 // comes back on a future reconcile or save_channel call,
                 // closed_at is cleared automatically.
-                if let Err(e) = self.db.mark_channel_closed(&record.user_channel_id) {
+                if let Err(e) = self.db.mark_unlisted_channel_closed(&record.user_channel_id) {
                     tracing::error!(
-                        "[stable] reconcile: db.mark_channel_closed({}) failed: {}",
+                        "[stable] reconcile: db.mark_unlisted_channel_closed({}) failed: {}",
                         record.user_channel_id, e
                     );
                     stable_channels::audit::audit_event(
@@ -2421,6 +2479,11 @@ impl StableChannelManager {
                     "received_at": received_at,
                 }),
             );
+            // Refused, but the money arrived: it is booked once its channel and signature are proven.
+            if let Some(uid) = Self::signed_pay_back_channel(ldk, &envelope, &payload.channel_id, payment_id).await {
+                let detail = serde_json::json!({ "amount_msat": received_msat, "settlement_id": payload.settlement_id });
+                self.book_paid_to_lsp(uid, &payload.channel_id, BookReason::SignedPayBack, payment_id, received_msat, detail);
+            }
             return;
         }
 
@@ -2529,6 +2592,9 @@ impl StableChannelManager {
             );
             return;
         }
+        // The money arrived whatever the checks below decide, so it is booked now that the signature proves its channel.
+        let detail = serde_json::json!({ "amount_msat": received_msat, "settlement_id": payload.settlement_id });
+        self.book_paid_to_lsp(user_channel_id, &channel.channel_id, BookReason::SignedPayBack, payment_id, received_msat, detail);
         if payload.expected_usd.to_bits()
             != self.stable_channels[idx].expected_usd.0.to_bits()
         {
@@ -2879,11 +2945,21 @@ impl StableChannelManager {
                 "DB_WRITE_FAILED",
                 serde_json::json!({ "op": "save_channel", "context": "reconcile_incoming", "user_channel_id": format!("{}", uid), "channel_id": channel_id, "error": e.to_string() }),
             );
-        } else if let Err(e) = self.db.offset_stability_top_up_on_the_way(&format!("{}", uid), unabsorbed_sats) {
-            stable_channels::audit::audit_event(
-                "DB_WRITE_FAILED",
-                serde_json::json!({ "op": "offset_stability_top_up", "context": "reconcile_incoming", "user_channel_id": format!("{}", uid), "channel_id": channel_id, "error": e.to_string() }),
+        } else {
+            if let Err(e) = self.db.offset_stability_top_up_on_the_way(&format!("{}", uid), unabsorbed_sats) {
+                stable_channels::audit::audit_event(
+                    "DB_WRITE_FAILED",
+                    serde_json::json!({ "op": "offset_stability_top_up", "context": "reconcile_incoming", "user_channel_id": format!("{}", uid), "channel_id": channel_id, "error": e.to_string() }),
+                );
+            }
+            // Settled on this channel by its amount match alone, so the row says the channel was inferred.
+            let evidence = payment_id.map_or_else(
+                || format!("unsigned:{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()),
+                str::to_owned,
             );
+            let paid_msat = amount_msat.unwrap_or(0);
+            let detail = serde_json::json!({ "amount_msat": paid_msat, "inferred": true });
+            self.book_paid_to_lsp(uid, &channel_id, BookReason::InferredPayBack, &evidence, paid_msat, detail);
         }
         stable_channels::audit::audit_event(
             "STABILITY_RECEIVED_RECONCILED",
@@ -2935,6 +3011,16 @@ impl StableChannelManager {
         if btc_price <= 0.0 {
             return plan;
         }
+        // LDK's forwarding totals before the channel reads, so the books are anchored only where no forward landed between them; only a channel still to anchor needs them.
+        let totals_before = match scope {
+            TickScope::All if self.books_to_anchor() => Some(
+                crate::books::forwarding_totals(ldk)
+                    .await
+                    .inspect_err(|e| tracing::warn!("[stable] run_tick: forwarding totals failed: {}", e))
+                    .ok(),
+            ),
+            _ => None,
+        };
         let channels = match ldk.list_channels(ListChannelsRequest {}).await {
             Ok(r) => r.channels,
             Err(e) => {
@@ -2958,6 +3044,9 @@ impl StableChannelManager {
                 None
             }
         };
+        if matches!(scope, TickScope::All) {
+            self.run_books_pass(ldk, totals_before.as_ref().map(Option::as_ref), &by_user_channel_id, held_msat.as_ref(), top_ups_in_flight.as_ref()).await;
+        }
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3468,6 +3557,224 @@ impl StableChannelManager {
         plan
     }
 
+    /// Whether the books pass may anchor a channel this tick: the event inbox is attached and a tracked channel has no open books, or the books cannot be read.
+    fn books_to_anchor(&self) -> bool {
+        if self.event_inbox.is_none() {
+            return false;
+        }
+        match self.db.booked_balances() {
+            Ok(open) => self.stable_channels.iter().any(|sc| open.iter().all(|books| books.user_channel_id != sc.user_channel_id)),
+            Err(_) => true,
+        }
+    }
+
+    /// Anchors, catches up and checks each stable channel's books against this tick's reads and logs where they disagree; it writes books rows and log lines only, never a channel. `totals_before` is None when no channel was still to anchor and Some(None) when that read failed.
+    async fn run_books_pass(
+        &mut self,
+        ldk: &dyn LdkServerCalls,
+        totals_before: Option<Option<&std::collections::HashMap<String, ForwardCursor>>>,
+        channels: &std::collections::HashMap<u128, Channel>,
+        held_msat: Option<&std::collections::HashMap<String, u64>>,
+        top_ups_in_flight: Option<&std::collections::HashSet<u128>>,
+    ) {
+        // A candidate only counts on the next pass, so one this pass does not record again is dropped.
+        let candidates = std::mem::take(&mut self.books_anchor_candidates);
+        // The key changes once a day, so the ledger keeps one record a day and not one per tick.
+        let unread = |error: String| {
+            stable_channels::audit::audit_event(
+                "LDK_CALL_FAILED",
+                serde_json::json!({
+                    "op": "list_channel_forwarding_stats", "context": "books", "error": error,
+                    "dedup_key": format!("lsp:books-stats:{}", Self::unix_time_secs() / STABILITY_TOP_UP_ALARM_REPEAT_SECS),
+                }),
+            )
+        };
+        let totals_before = match totals_before {
+            Some(None) => return unread("read_failed".to_owned()),
+            Some(Some(totals)) => Some(totals),
+            None => None,
+        };
+        // Without a readable inbox a forward still waiting in it cannot be told apart from one the books missed, so nothing is anchored, caught up or checked.
+        let inbox = self.event_inbox.as_ref().and_then(|inbox| match (inbox.queued_forwards(), inbox.is_empty()) {
+            (Ok(queued), Ok(empty)) => Some((queued, empty)),
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::warn!("[stable] books: event inbox unreadable: {}", e);
+                None
+            }
+        });
+        let Some((queued_forwards, inbox_empty)) = inbox else { return };
+        let totals_after = match crate::books::forwarding_totals(ldk).await {
+            Ok(totals) => totals,
+            Err(e) => return unread(e.to_string()),
+        };
+        // A pay-back still to be applied is already out of the balance, and applying it books it.
+        let settling: Option<std::collections::HashSet<String>> = match self.db.pending_inbound_stability_settlements(usize::MAX) {
+            Ok(pending) => Some(pending.into_iter().map(|settlement| settlement.channel_id.to_ascii_lowercase()).collect()),
+            Err(e) => {
+                tracing::warn!("[stable] books: pending stability settlements unreadable: {}", e);
+                None
+            }
+        };
+        // A payment to the user whose outcome is still to come books money the anchor may already hold; after the hour a SYNC is given up in, a row no longer counts.
+        let paying = match self.db.channels_awaiting_lsp_payment(Self::unix_time_secs().saturating_sub(SYNC_PENDING_TIMEOUT_SECS as i64)) {
+            Ok(paying) => Some(paying),
+            Err(e) => {
+                tracing::warn!("[stable] books: pending LSP payments unreadable: {}", e);
+                None
+            }
+        };
+        let events_waiting = !inbox_empty;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let tracked: Vec<(u128, u64, u64)> =
+            self.stable_channels.iter().map(|sc| (sc.user_channel_id, sc.backing_sats, sc.native_sats)).collect();
+        for (uid, backing_sats, native_sats) in tracked {
+            let Some(c) = channels.get(&uid) else { continue };
+            let books = match self.db.booked_balance(uid) {
+                Ok(Some(books)) if books.closed_at.is_some() => continue,
+                Ok(books) => books,
+                Err(e) => {
+                    books_db_failed(true, "booked_balance", uid, &c.channel_id, &e);
+                    continue;
+                }
+            };
+            let totals = totals_after.get(&c.channel_id).copied();
+            let Some(books) = books else {
+                // Anchor only from a balance with nothing on the way into or out of it, and no forward between the reads.
+                let settled = inbox_empty
+                    && top_ups_in_flight.is_some_and(|in_flight| !in_flight.contains(&uid))
+                    && settling.as_ref().is_some_and(|settling| !settling.contains(&c.channel_id.to_ascii_lowercase()))
+                    && paying.as_ref().is_some_and(|paying| !paying.contains(&uid))
+                    && held_msat.and_then(|held| held.get(&c.channel_id)) == Some(&0)
+                    && c.inbound_capacity_msat > 0
+                    && !crate::books::splice_suspected(c, 0)
+                    && totals_before.is_some_and(|before| before.get(&c.channel_id) == totals.as_ref());
+                if !settled {
+                    continue;
+                }
+                let user_msat = c.inbound_capacity_msat.saturating_add(c.counterparty_unspendable_punishment_reserve.saturating_mul(1000));
+                let reading = (user_msat, totals.unwrap_or_default());
+                // A payment still landing can leave one reading settled but not the next, so the books start from two in a row.
+                if candidates.get(&uid) != Some(&reading) {
+                    self.books_anchor_candidates.insert(uid, reading);
+                    continue;
+                }
+                let detail = serde_json::json!({ "source": "tick" });
+                if let Err(e) = self.db.anchor_booked_balance(uid, &c.channel_id, user_msat, c.channel_value_sats, reading.1, detail) {
+                    books_db_failed(false, "anchor_booked_balance", uid, &c.channel_id, &e);
+                    self.books_anchor_candidates.insert(uid, reading);
+                }
+                continue;
+            };
+            let mut booked_msat = books.booked_user_msat;
+            let queued = queued_forwards.get(&c.channel_id).copied().unwrap_or_default();
+            if let Some(caught) = crate::books::catch_up(books.cursor, totals.unwrap_or(books.cursor), queued) {
+                let next = caught.cursor;
+                let change = BookChange {
+                    user_channel_id: uid,
+                    delta_msat: caught.net_msat,
+                    reason: BookReason::ForwardCatchUp,
+                    evidence: format!("{}:{}:{}:{}", next.spent_count, next.received_count, next.spent_msat, next.received_msat),
+                    cursor: Some(caught.cursor),
+                    channel_value_sats: None,
+                    detail: serde_json::json!({ "spent_msat": caught.spent_msat, "received_msat": caught.received_msat }),
+                };
+                match self.db.book(&change) {
+                    Ok(BookOutcome::Applied { after_msat, .. }) => booked_msat = after_msat,
+                    Ok(_) => {}
+                    Err(e) => {
+                        // Books behind the live balance by a write that failed are no evidence of a gap.
+                        books_db_failed(false, "book", uid, &c.channel_id, &e);
+                        continue;
+                    }
+                }
+            }
+            // A balance read that failed is no evidence, so the books are not checked against it.
+            let Some(held_msat) = held_msat else { continue };
+            let held = held_msat.get(&c.channel_id).copied().unwrap_or(0);
+            let splice_suspected = crate::books::splice_suspected(c, held);
+            // A splice that locked while the daemon was away has no Ready event to book it, so the listed value does, once no waiting event could.
+            if c.channel_value_sats != books.channel_value_sats && !splice_suspected && !events_waiting {
+                match self.book_splice(uid, None, c) {
+                    Some(BookOutcome::Applied { after_msat, .. }) => booked_msat = after_msat,
+                    Some(_) => {}
+                    // Books left on the old value by a read or write that failed are no evidence of a gap.
+                    None => continue,
+                }
+            }
+            let live = crate::books::live_user_balance(c, held);
+            let checked_msat = crate::books::booked_with_queued(booked_msat, queued);
+            let (check, transition) = crate::books::check_books(checked_msat, live, &books.check, now_ms);
+            let figures = serde_json::json!({
+                "booked_msat": booked_msat, "queued_spent_msat": queued.spent_msat, "queued_received_msat": queued.received_msat,
+                "live_low_msat": live.low_msat, "live_high_msat": live.high_msat,
+            });
+            // A splice-out waiting to confirm has left the live balance but not yet the books, which move at the lock.
+            let held_for_splice = splice_suspected && check.direction == Some(stable_channels::db::GapDirection::Below);
+            // A check that changed nothing but its time is not written again, so a channel that agrees costs no write a tick.
+            let unchanged = transition.is_none()
+                && books.check.checked_at_ms.is_some()
+                && stable_channels::db::BooksCheck { checked_at_ms: books.check.checked_at_ms, ..check.clone() } == books.check;
+            if !held_for_splice && !unchanged {
+                if let Err(e) = self.db.save_books_check(uid, &check, crate::books::transition_row(transition, &check, &figures)) {
+                    books_db_failed(false, "save_books_check", uid, &c.channel_id, &e);
+                }
+            }
+            let settlement_pending = settling.as_ref().is_some_and(|settling| settling.contains(&c.channel_id.to_ascii_lowercase()));
+            // Today's stored native lags receipts and the splices it covers, so it has its own line, logged when the difference changes.
+            match crate::books::native_difference(booked_msat, backing_sats, native_sats) {
+                Some((booked_native_sats, difference_sats)) => {
+                    if self.books_native_throttle.insert(uid, difference_sats) != Some(difference_sats) {
+                        stable_channels::audit::audit_event(
+                            "BOOKED_BALANCE_NATIVE_DIFFERS",
+                            serde_json::json!({
+                                "channel_id": c.channel_id, "user_channel_id": uid.to_string(), "booked_native_sats": booked_native_sats,
+                                "native_sats": native_sats, "backing_sats": backing_sats, "difference_sats": difference_sats,
+                                "splice_suspected": splice_suspected, "settlement_pending": settlement_pending, "events_waiting": events_waiting,
+                            }),
+                        );
+                    }
+                }
+                None => {
+                    self.books_native_throttle.remove(&uid);
+                }
+            }
+            if held_for_splice {
+                continue;
+            }
+            let seen = crate::books::DisagreementContext {
+                top_up_on_the_way: top_ups_in_flight.is_some_and(|in_flight| in_flight.contains(&uid)),
+                splice_suspected,
+                settlement_pending,
+                events_waiting,
+                totals_behind_cursor: crate::books::totals_behind_cursor(books.cursor, totals),
+            };
+            let categories = crate::books::disagreement_categories(&check, c, held, &seen);
+            if categories.is_empty() {
+                self.books_log_throttle.remove(&uid);
+                continue;
+            }
+            let logged = categories.join(",");
+            if self.books_log_throttle.get(&uid) == Some(&logged) {
+                continue;
+            }
+            stable_channels::audit::audit_event(
+                "BOOKED_BALANCE_DISAGREES",
+                crate::books::with_figures(
+                    serde_json::json!({
+                        "channel_id": c.channel_id, "user_channel_id": uid.to_string(), "categories": categories,
+                        "held_msat": held, "backing_sats": backing_sats, "native_sats": native_sats,
+                    }),
+                    &figures,
+                ),
+            );
+            self.books_log_throttle.insert(uid, logged);
+        }
+    }
+
     /// Sign a SYNC_V1 payload and keysend it (1 msat) to the counterparty in custom TLV 13377331.
     /// Returns true only after the accepted payment ID and version are saved for outcome tracking.
     /// Acceptance is not delivery: later failures are retried from the latest committed books.
@@ -3583,8 +3890,263 @@ impl StableChannelManager {
         }
     }
 
-    /// On a forward out of a stable channel, reconcile the spend: native BTC first, overflow reduces `expected_usd`.
+    /// Books one side of a forward from its own amounts, capped by LDK's totals so a handled event books nothing new.
+    async fn book_forward(
+        &mut self,
+        ldk: &dyn LdkServerCalls,
+        user_channel_id: &str,
+        channel_id: &str,
+        side: crate::books::ForwardSide,
+        amount_msat: u64,
+        counted_by_ldk: bool,
+    ) -> Option<BookOutcome> {
+        let uid = parse_user_channel_id(user_channel_id)?;
+        let books = match self.db.booked_balance(uid) {
+            Ok(Some(books)) if books.closed_at.is_none() => books,
+            Ok(_) => return None,
+            Err(e) => {
+                books_db_failed(true, "booked_balance", uid, channel_id, &e);
+                return None;
+            }
+        };
+        let totals = if counted_by_ldk {
+            match ldk.get_channel_forwarding_stats(GetChannelForwardingStatsRequest { channel_id: books.channel_id.clone() }).await {
+                Ok(r) => r.stats.as_ref().map(crate::books::cursor_from_stats),
+                Err(e) => {
+                    stable_channels::audit::audit_event(
+                        "LDK_CALL_FAILED",
+                        serde_json::json!({ "op": "get_channel_forwarding_stats", "context": "book_forward", "user_channel_id": user_channel_id, "error": e.to_string() }),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let (booked_msat, cursor) = crate::books::book_forward_event(books.cursor, totals, side, amount_msat, counted_by_ldk);
+        if booked_msat == 0 && cursor == books.cursor {
+            return None;
+        }
+        let (reason, delta_msat) = match side {
+            crate::books::ForwardSide::OutOfUser => (BookReason::ForwardOut, -(booked_msat.min(i64::MAX as u64) as i64)),
+            crate::books::ForwardSide::IntoUser => (BookReason::ForwardIn, booked_msat.min(i64::MAX as u64) as i64),
+        };
+        let evidence = if counted_by_ldk {
+            format!("{}:{}:{}:{}", cursor.spent_count, cursor.received_count, cursor.spent_msat, cursor.received_msat)
+        } else {
+            let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+            format!("uncounted:{}:{}", now_ms, amount_msat)
+        };
+        let change = BookChange {
+            user_channel_id: uid,
+            delta_msat,
+            reason,
+            evidence,
+            cursor: Some(cursor),
+            channel_value_sats: None,
+            detail: serde_json::json!({ "amount_msat": amount_msat, "counted_by_ldk": counted_by_ldk }),
+        };
+        match self.db.book(&change) {
+            Ok(outcome) => Some(outcome),
+            Err(e) => {
+                books_db_failed(false, "book", uid, &books.channel_id, &e);
+                None
+            }
+        }
+    }
+
+    /// Books a payment the LSP sent to a stable user once it succeeded, on the channel the LSP's own record of the send names.
+    pub(crate) fn book_lsp_payment(&mut self, payment_id: &str, amount_msat: Option<u64>) {
+        // The key changes once a day, so the ledger keeps one record a day and not one per payment.
+        let unread = |op: &str, error: &rusqlite::Error| {
+            tracing::error!("[stable] books: {} failed for payment {}: {}", op, payment_id, error);
+            let day = Self::unix_time_secs() / STABILITY_TOP_UP_ALARM_REPEAT_SECS;
+            stable_channels::audit::audit_event(
+                "DB_READ_FAILED",
+                serde_json::json!({
+                    "op": op, "context": "books", "payment_id": payment_id, "error": error.to_string(),
+                    "dedup_key": format!("lsp:books-db:{op}:{day}"),
+                }),
+            );
+        };
+        let uid = match self.db.lsp_payment_channel(payment_id) {
+            Ok(Some(uid)) => uid,
+            Ok(None) => return,
+            Err(e) => return unread("lsp_payment_channel", &e),
+        };
+        let books = match self.db.booked_balance(uid) {
+            Ok(Some(books)) if books.closed_at.is_none() => books,
+            Ok(_) => return,
+            Err(e) => return unread("booked_balance", &e),
+        };
+        let Some(amount_msat) = amount_msat else {
+            stable_channels::audit::audit_event(
+                "BOOKED_BALANCE_DISAGREES",
+                serde_json::json!({
+                    "channel_id": books.channel_id, "user_channel_id": uid.to_string(), "payment_id": payment_id,
+                    "categories": ["lsp_payment_amount_unknown"],
+                }),
+            );
+            return;
+        };
+        let change = BookChange {
+            user_channel_id: uid,
+            delta_msat: amount_msat.min(i64::MAX as u64) as i64,
+            reason: BookReason::LspPayment,
+            evidence: payment_id.to_owned(),
+            cursor: None,
+            channel_value_sats: None,
+            detail: serde_json::json!({ "amount_msat": amount_msat }),
+        };
+        if let Err(e) = self.db.book(&change) {
+            books_db_failed(false, "book", uid, &books.channel_id, &e);
+        }
+    }
+
+    /// Books money a stable user paid the LSP over their channel; a channel without open books books nothing.
+    fn book_paid_to_lsp(&self, uid: u128, channel_id: &str, reason: BookReason, evidence: &str, amount_msat: u64, detail: serde_json::Value) {
+        let change = BookChange {
+            user_channel_id: uid,
+            delta_msat: -(amount_msat.min(i64::MAX as u64) as i64),
+            reason,
+            evidence: evidence.to_owned(),
+            cursor: None,
+            channel_value_sats: None,
+            detail,
+        };
+        if let Err(e) = self.db.book(&change) {
+            books_db_failed(false, "book", uid, channel_id, &e);
+        }
+    }
+
+    /// Books a locked splice on the user's side: the whole change in channel value when the user made it, nothing when the LSP did; None when there is nothing to book or a read or write failed.
+    fn book_splice(&self, uid: u128, funding_txo: Option<&str>, c: &Channel) -> Option<BookOutcome> {
+        let books = match self.db.booked_balance(uid) {
+            Ok(Some(books)) if books.closed_at.is_none() => books,
+            Ok(_) => return None,
+            Err(e) => {
+                books_db_failed(true, "booked_balance", uid, &c.channel_id, &e);
+                return None;
+            }
+        };
+        let (before, after) = (books.channel_value_sats, c.channel_value_sats);
+        if before == after {
+            return None;
+        }
+        // The listing shows the new funding too once the splice has locked.
+        let funding = funding_txo
+            .map(str::to_owned)
+            .or_else(|| c.funding_txo.as_ref().map(|outpoint| format!("{}:{}", outpoint.txid, outpoint.vout)))
+            .unwrap_or_default();
+        let lsp_made = match self.db.lsp_made_splice(uid, &funding, before, after) {
+            Ok(lsp_made) => lsp_made,
+            Err(e) => {
+                books_db_failed(true, "lsp_made_splice", uid, &c.channel_id, &e);
+                return None;
+            }
+        };
+        let delta_msat = if lsp_made {
+            0
+        } else {
+            ((i128::from(after) - i128::from(before)) * 1000).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+        };
+        let evidence = if funding.is_empty() { format!("value:{after}") } else { funding };
+        let change = BookChange {
+            user_channel_id: uid,
+            delta_msat,
+            reason: BookReason::Splice,
+            evidence,
+            cursor: None,
+            channel_value_sats: Some(after),
+            detail: serde_json::json!({ "made_by": if lsp_made { "lsp" } else { "user" }, "value_before": before, "value_after": after }),
+        };
+        match self.db.book(&change) {
+            Ok(outcome) => Some(outcome),
+            Err(e) => {
+                books_db_failed(false, "book", uid, &c.channel_id, &e);
+                None
+            }
+        }
+    }
+
+    /// The user channel a signed pay-back names, once LDK lists that channel and confirms its peer signed the payload.
+    async fn signed_pay_back_channel(
+        ldk: &dyn LdkServerCalls,
+        envelope: &stable_channels::stable::StabilitySignedEnvelope,
+        channel_id: &str,
+        payment_id: &str,
+    ) -> Option<u128> {
+        let failed = |op: &str, error: &LdkServerError| {
+            stable_channels::audit::audit_event(
+                "LDK_CALL_FAILED",
+                serde_json::json!({ "op": op, "context": "book_pay_back", "channel_id": channel_id, "payment_id": payment_id, "error": error.to_string() }),
+            );
+        };
+        let channels = match ldk.list_channels(ListChannelsRequest {}).await {
+            Ok(response) => response.channels,
+            Err(e) => {
+                failed("list_channels", &e);
+                return None;
+            }
+        };
+        let channel = channels.into_iter().find(|c| c.channel_id.eq_ignore_ascii_case(channel_id))?;
+        let uid = parse_user_channel_id(&channel.user_channel_id)?;
+        let verified = ldk
+            .verify_signature(VerifySignatureRequest {
+                message: envelope.payload.as_bytes().to_vec().into(),
+                signature: envelope.signature.clone(),
+                public_key: channel.counterparty_node_id,
+            })
+            .await;
+        match verified {
+            Ok(response) => response.valid.then_some(uid),
+            Err(e) => {
+                failed("verify_signature", &e);
+                None
+            }
+        }
+    }
+
+    /// On a forward, reconcile a spend out of a stable channel, then book both sides of it.
     pub async fn handle_payment_forwarded(
+        &mut self,
+        prev_user_channel_id: String,
+        next_user_channel_id: Option<String>,
+        prev_channel_id: String,
+        next_channel_id: String,
+        prev_node_id: String,
+        next_node_id: String,
+        outbound_amount_forwarded_msat: u64,
+        fee_msat: u64,
+        skimmed_fee_msat: Option<u64>,
+        counted_by_ldk: bool,
+        ldk: &dyn LdkServerCalls,
+        btc_price: f64,
+    ) {
+        // The spend check reads the live balance first, as it did before the books, so booking never delays it.
+        self.deduct_forwarded_spend(
+            prev_user_channel_id.clone(),
+            next_user_channel_id.clone(),
+            prev_channel_id.clone(),
+            next_channel_id.clone(),
+            prev_node_id,
+            next_node_id,
+            outbound_amount_forwarded_msat,
+            fee_msat,
+            skimmed_fee_msat,
+            ldk,
+            btc_price,
+        )
+        .await;
+        let total_msat = outbound_amount_forwarded_msat.saturating_add(fee_msat);
+        self.book_forward(ldk, &prev_user_channel_id, &prev_channel_id, crate::books::ForwardSide::OutOfUser, total_msat, counted_by_ldk).await;
+        if let Some(next_user_channel_id) = next_user_channel_id.as_deref() {
+            self.book_forward(ldk, next_user_channel_id, &next_channel_id, crate::books::ForwardSide::IntoUser, outbound_amount_forwarded_msat, counted_by_ldk).await;
+        }
+    }
+
+    /// On a forward out of a stable channel, reconcile the spend: native BTC first, overflow reduces `expected_usd`.
+    async fn deduct_forwarded_spend(
         &mut self,
         prev_user_channel_id: String,
         next_user_channel_id: Option<String>,
@@ -3828,6 +4390,7 @@ impl StableChannelManager {
         else {
             return;
         };
+        self.book_splice(uid, funding_txo, &c);
         let (our_sats, their_sats) = channel_peer_balances(&c);
         let channel_id_hex = c.channel_id.clone();
         let new_channel_id_bytes = parse_channel_id_hex(&c.channel_id);
@@ -4016,6 +4579,15 @@ impl StableChannelManager {
                     serde_json::json!({ "op": "record_settlement", "kind": "trade", "payment_id": pid, "error": e.to_string() }),
                 );
             }
+        }
+        // The fee arrived whatever the trade's decision, old format included, so it is booked now that the signature proves its channel.
+        if let (Some(uid), Some(payment_id), Some(fee_msat)) = (
+            parse_user_channel_id(&chan.user_channel_id),
+            inbound_payment_id.filter(|payment_id| stable_channels::trade::is_payment_id(payment_id)),
+            amount_msat,
+        ) {
+            let detail = serde_json::json!({ "amount_msat": fee_msat, "trade_id": payload.trade_id });
+            self.book_paid_to_lsp(uid, &chan.channel_id, BookReason::TradeFee, payment_id, fee_msat, detail);
         }
 
         if payload.trade_id.is_none() {
@@ -4539,6 +5111,16 @@ pub(crate) mod tests {
         pub lightning_balances: StdMutex<Vec<GrpcLightningBalance>>,
         /// Whether reading balances fails.
         pub balances_fail: std::sync::atomic::AtomicBool,
+        /// What the node's per-channel forwarding totals report.
+        pub forwarding_stats: StdMutex<Vec<ldk_server_client::ldk_server_grpc::types::ChannelForwardingStats>>,
+        /// How many totals one page holds; all of them when unset.
+        pub stats_page_size: StdMutex<Option<usize>>,
+        /// Whether reading forwarding totals fails.
+        pub stats_fail: std::sync::atomic::AtomicBool,
+        /// The next page token every totals page answers with, given the token it was asked with, in place of the real one.
+        pub stats_next_token: StdMutex<Option<fn(usize) -> String>>,
+        /// How many totals pages were asked for.
+        pub stats_calls: AtomicUsize,
         /// Whether the report leaves out a channel no entry was set for, which a real node never does to an open channel.
         pub balances_incomplete: std::sync::atomic::AtomicBool,
         /// Every send asked of the node, including ones that fail.
@@ -4561,6 +5143,8 @@ pub(crate) mod tests {
         pub spendable_onchain_sats: std::sync::atomic::AtomicU64,
         /// Runs once inside the next balance read: something that happens while a caller is away from its tables.
         pub balances_hook: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// Channel listings and per-channel totals reads, in the order they were asked for.
+        pub calls: StdMutex<Vec<&'static str>>,
     }
 
     /// Use up one of a counter's remaining failures; false once none are left.
@@ -4595,6 +5179,11 @@ pub(crate) mod tests {
                 payments_page_size: StdMutex::new(None),
                 lightning_balances: StdMutex::new(Vec::new()),
                 balances_fail: std::sync::atomic::AtomicBool::new(false),
+                forwarding_stats: StdMutex::new(Vec::new()),
+                stats_page_size: StdMutex::new(None),
+                stats_fail: std::sync::atomic::AtomicBool::new(false),
+                stats_next_token: StdMutex::new(None),
+                stats_calls: AtomicUsize::new(0),
                 balances_incomplete: std::sync::atomic::AtomicBool::new(false),
                 send_calls: AtomicUsize::new(0),
                 like_ldk_node: false,
@@ -4606,6 +5195,7 @@ pub(crate) mod tests {
                 splice_in_error: StdMutex::new(None),
                 spendable_onchain_sats: std::sync::atomic::AtomicU64::new(0),
                 balances_hook: StdMutex::new(None),
+                calls: StdMutex::new(Vec::new()),
             }
         }
         pub fn like_ldk_node(mut self) -> Self {
@@ -4632,6 +5222,8 @@ pub(crate) mod tests {
             *self.tracking_mode.lock().unwrap() = mode as i32;
             self
         }
+        pub fn with_forwarding_stats(self, s: Vec<ldk_server_client::ldk_server_grpc::types::ChannelForwardingStats>) -> Self { *self.forwarding_stats.lock().unwrap() = s; self }
+        pub fn with_stats_page_size(self, size: usize) -> Self { *self.stats_page_size.lock().unwrap() = Some(size); self }
         pub fn with_payments_page_size(self, size: usize) -> Self { *self.payments_page_size.lock().unwrap() = Some(size); self }
     }
 
@@ -4641,6 +5233,7 @@ pub(crate) mod tests {
             &self,
             _req: ListChannelsRequest,
         ) -> Result<ListChannelsResponse, LdkServerError> {
+            self.calls.lock().unwrap().push("list_channels");
             if self.list_channels_fails.load(Ordering::SeqCst) {
                 return Err(LdkServerError::new(self.failure_code.lock().unwrap().clone(), "node unavailable"));
             }
@@ -4649,6 +5242,36 @@ pub(crate) mod tests {
                 *self.channels.lock().unwrap() = next;
             }
             Ok(ListChannelsResponse { channels: listed })
+        }
+        async fn get_channel_forwarding_stats(
+            &self,
+            req: GetChannelForwardingStatsRequest,
+        ) -> Result<GetChannelForwardingStatsResponse, LdkServerError> {
+            self.calls.lock().unwrap().push("get_channel_forwarding_stats");
+            if self.stats_fail.load(Ordering::SeqCst) {
+                return Err(LdkServerError::new(self.failure_code.lock().unwrap().clone(), "node unavailable"));
+            }
+            let stats = self.forwarding_stats.lock().unwrap().iter().find(|s| s.channel_id == req.channel_id).cloned();
+            Ok(GetChannelForwardingStatsResponse { stats })
+        }
+        async fn list_channel_forwarding_stats(
+            &self,
+            req: ListChannelForwardingStatsRequest,
+        ) -> Result<ListChannelForwardingStatsResponse, LdkServerError> {
+            if self.stats_fail.load(Ordering::SeqCst) {
+                return Err(LdkServerError::new(self.failure_code.lock().unwrap().clone(), "node unavailable"));
+            }
+            self.stats_calls.fetch_add(1, Ordering::SeqCst);
+            let all = self.forwarding_stats.lock().unwrap().clone();
+            let requested: usize = req.page_token.as_deref().map(|t| t.parse().unwrap()).unwrap_or(0);
+            let start = requested.min(all.len());
+            let size = self.stats_page_size.lock().unwrap().unwrap_or(all.len().max(1));
+            let end = (start + size).min(all.len());
+            let next_page_token = match *self.stats_next_token.lock().unwrap() {
+                Some(token) => Some(token(requested)),
+                None => (end < all.len()).then(|| end.to_string()),
+            };
+            Ok(ListChannelForwardingStatsResponse { stats: all[start..end].to_vec(), next_page_token })
         }
         async fn splice_in(&self, req: SpliceInRequest) -> Result<SpliceInResponse, LdkServerError> {
             if let Some((code, message)) = self.splice_in_error.lock().unwrap().clone() {
@@ -5681,6 +6304,7 @@ pub(crate) mod tests {
             45_000_000, // outbound_amount_forwarded_msat
             0,          // fee_msat
             None,       // skimmed_fee_msat
+            true,
             &fake as &dyn LdkServerCalls,
             100_000.0,
         ).await;
@@ -5735,6 +6359,7 @@ pub(crate) mod tests {
             7_578_000,
             0,
             None,
+            true,
             &fake as &dyn LdkServerCalls,
             66_000.96,
         )
@@ -5765,6 +6390,7 @@ pub(crate) mod tests {
             20_000_000,
             0,
             None,
+            true,
             &fake as &dyn LdkServerCalls,
             100_000.0,
         ).await;
@@ -5799,6 +6425,7 @@ pub(crate) mod tests {
             45_000_000,
             0,
             None,
+            true,
             &fake as &dyn LdkServerCalls,
             100_000.0,
         ).await;
@@ -5826,6 +6453,7 @@ pub(crate) mod tests {
             45_000_000, // outbound_amount_forwarded_msat
             0,          // fee_msat
             None,       // skimmed_fee_msat
+            true,
             &fake as &dyn LdkServerCalls,
             100_000.0,
         )
@@ -5859,7 +6487,7 @@ pub(crate) mod tests {
             USER_CHANNEL_ID_DECIMAL.to_string(), Some("next-ucid".to_string()),
             CHANNEL_ID_HEX.to_string(), "next-channel".to_string(),
             COUNTERPARTY_HEX.to_string(), "next-node".to_string(),
-            msat, 0, None, fake as &dyn LdkServerCalls, 100_000.0,
+            msat, 0, None, true, fake as &dyn LdkServerCalls, 100_000.0,
         ).await;
     }
 
@@ -6018,7 +6646,7 @@ pub(crate) mod tests {
             USER_CHANNEL_ID_DECIMAL.to_string(), Some("next-ucid".to_string()),
             CHANNEL_ID_HEX.to_string(), "next-channel".to_string(),
             COUNTERPARTY_HEX.to_string(), "next-node".to_string(),
-            9_990_000, 10_000, None, &fake as &dyn LdkServerCalls, 100_000.0,
+            9_990_000, 10_000, None, true, &fake as &dyn LdkServerCalls, 100_000.0,
         ).await;
         assert_books(&mgr, 40.0, 40_000, 0);
     }
@@ -6050,7 +6678,7 @@ pub(crate) mod tests {
         mgr.handle_payment_forwarded(
             USER_CHANNEL_ID_DECIMAL.into(), Some("next-ucid".into()),
             CHANNEL_ID_HEX.into(), "next-channel".into(), COUNTERPARTY_HEX.into(),
-            "next-peer".into(), 10_000_000, 0, None, &fake, 80_000.0,
+            "next-peer".into(), 10_000_000, 0, None, true, &fake, 80_000.0,
         ).await;
         assert_books(&mgr, 42.0, 52_500, 0);
         (mgr, fake, push)
@@ -6121,6 +6749,7 @@ pub(crate) mod tests {
             45_000_000,
             9,
             Some(7),
+            true,
             &fake as &dyn LdkServerCalls,
             100_000.0,
         ).await;
@@ -6647,7 +7276,7 @@ pub(crate) mod tests {
         mgr.handle_payment_forwarded(
             USER_CHANNEL_ID_DECIMAL.into(), Some("next-ucid".into()),
             CHANNEL_ID_HEX.into(), "next-channel".into(), COUNTERPARTY_HEX.into(),
-            "next-peer".into(), 10_000_000, 0, None, &ldk, 80_000.0,
+            "next-peer".into(), 10_000_000, 0, None, true, &ldk, 80_000.0,
         ).await;
         assert!((mgr.stable_channels[0].expected_usd.0 - 50.0).abs() < 1e-6, "the forward was read as spare sats");
 
@@ -6722,7 +7351,7 @@ pub(crate) mod tests {
             mgr.handle_payment_forwarded(
                 USER_CHANNEL_ID_DECIMAL.into(), Some("next-ucid".into()),
                 CHANNEL_ID_HEX.into(), "next-channel".into(), COUNTERPARTY_HEX.into(),
-                "next-peer".into(), 10_000_000, 0, None, &ldk, 80_000.0,
+                "next-peer".into(), 10_000_000, 0, None, true, &ldk, 80_000.0,
             ).await;
             assert_channel_books(&mgr, 42.0, 40_000);
 
@@ -6907,7 +7536,7 @@ pub(crate) mod tests {
         mgr.handle_payment_forwarded(
             USER_CHANNEL_ID_DECIMAL.into(), Some("next-ucid".into()),
             CHANNEL_ID_HEX.into(), "next-channel".into(), COUNTERPARTY_HEX.into(),
-            "next-peer".into(), 10_000_000, 0, None, &ldk, 80_000.0,
+            "next-peer".into(), 10_000_000, 0, None, true, &ldk, 80_000.0,
         ).await;
 
         // The top-up is booked first, so the forward is charged to stable.
@@ -8453,6 +9082,7 @@ pub(crate) mod tests {
                 2_000_000,
                 0,
                 None,
+                true,
                 &fake,
                 100_000.0,
             )
@@ -9316,7 +9946,7 @@ pub(crate) mod tests {
             "77162951604739255617201343530838311422".to_string(), Some(USER_CHANNEL_ID_DECIMAL.to_string()),
             ROUTING_CHANNEL_HEX.to_string(), CHANNEL_ID_HEX.to_string(),
             ROUTING_PEER_HEX.to_string(), COUNTERPARTY_HEX.to_string(),
-            msat, 0, None, fake as &dyn LdkServerCalls, 100_000.0,
+            msat, 0, None, true, fake as &dyn LdkServerCalls, 100_000.0,
         ).await;
     }
 
@@ -12877,7 +13507,7 @@ pub(crate) mod tests {
             history.clone(), GrpcForwardedPayment { id: "history-two".into(), ..history },
         ]);
         for _ in 0..2 {
-            mgr.handle_payment_forwarded("10".into(), Some("20".into()), "same-prev".into(), "same-next".into(), "02aa".into(), "02bb".into(), 1_000, 7, None, &fake, 80_000.0).await;
+            mgr.handle_payment_forwarded("10".into(), Some("20".into()), "same-prev".into(), "same-next".into(), "02aa".into(), "02bb".into(), 1_000, 7, None, true, &fake, 80_000.0).await;
         }
         assert_eq!(ledger_for(&db, "same-prev").len(), 2, "equal live occurrences are not replays");
         assert_eq!(crate::backfill::backfill_forwards(&fake, &db, None).await.emitted, 2);
@@ -12899,7 +13529,7 @@ pub(crate) mod tests {
         };
         let fake = FakeLdkServer::new(vec![]).with_forwarded(vec![history]);
         assert_eq!(crate::backfill::backfill_forwards(&fake, &db, None).await.emitted, 1);
-        mgr.handle_payment_forwarded("10".into(), Some("20".into()), "buffered-prev".into(), "buffered-next".into(), "02aa".into(), "02bb".into(), 1_000, 7, None, &fake, 80_000.0).await;
+        mgr.handle_payment_forwarded("10".into(), Some("20".into()), "buffered-prev".into(), "buffered-next".into(), "02aa".into(), "02bb".into(), 1_000, 7, None, true, &fake, 80_000.0).await;
         let rows = ledger_for(&db, "buffered-prev");
         assert_eq!(rows.len(), 2);
         let live = rows.iter().find(|row| row.event_type == "PAYMENT_FORWARDED").unwrap();
@@ -13145,5 +13775,1333 @@ pub(crate) mod tests {
         statuses.sort();
         assert_eq!(statuses, vec!["completed", "pending"]);
         assert!(pending.is_empty());
+    }
+
+    mod books_pass {
+        use super::*;
+        use crate::event_inbox::{Entry, Inbox};
+        use ldk_server_client::ldk_server_grpc::types::ChannelForwardingStats;
+        use stable_channels::db::{BookedBalance, CheckState, ForwardCursor};
+
+        const UID: u128 = 189476124653200987495269098788434301048;
+        const RESERVE_SATS: u64 = 1_000;
+
+        fn totals(channel_id: &str, spent_msat: u64, spent_count: u64, received_msat: u64, received_count: u64) -> ChannelForwardingStats {
+            ChannelForwardingStats {
+                channel_id: channel_id.to_owned(),
+                total_inbound_amount_msat: spent_msat,
+                inbound_payments_forwarded: spent_count,
+                total_outbound_amount_msat: received_msat,
+                outbound_payments_forwarded: received_count,
+                ..Default::default()
+            }
+        }
+
+        // What LDK has counted so far: three forwards out of the user and two into them, through the routing channel.
+        fn totals_so_far() -> Vec<ChannelForwardingStats> {
+            vec![totals(CHANNEL_ID_HEX, 7_350_000, 3, 4_125_500, 2), totals(ROUTING_CHANNEL_HEX, 4_127_100, 2, 7_342_650, 3)]
+        }
+
+        // The same after one more forward out of the user, of 10,000 msat with a 500 msat fee.
+        fn totals_after_a_forward_out() -> Vec<ChannelForwardingStats> {
+            vec![totals(CHANNEL_ID_HEX, 7_360_500, 4, 4_125_500, 2), totals(ROUTING_CHANNEL_HEX, 4_127_100, 2, 7_352_650, 4)]
+        }
+
+        fn cursor_so_far() -> ForwardCursor {
+            ForwardCursor { spent_msat: 7_350_000, spent_count: 3, received_msat: 4_125_500, received_count: 2 }
+        }
+
+        /// Sets the user's side of the 100k channel, the reserve LDK holds for them included.
+        fn user_holds(fake: &FakeLdkServer, user_msat: u64) {
+            let mut channels = fake.channels.lock().unwrap();
+            let channel = &mut channels[0];
+            channel.inbound_capacity_msat = user_msat.saturating_sub(channel.counterparty_unspendable_punishment_reserve * 1000);
+            channel.outbound_capacity_msat = 100_000_000 - user_msat;
+            channel.next_outbound_htlc_limit_msat = channel.outbound_capacity_msat;
+        }
+
+        /// A channel with `target_usd` at $100k on the user's 50,000 sats, with LDK's totals and an event inbox attached.
+        async fn fixture(target_usd: f64) -> (StableChannelManager, FakeLdkServer, std::sync::Arc<Inbox>) {
+            let mut channel = make_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 100_000, 50_000_000, true);
+            channel.counterparty_unspendable_punishment_reserve = RESERVE_SATS;
+            channel.inbound_capacity_msat -= RESERVE_SATS * 1000;
+            let fake = FakeLdkServer::new(vec![channel]).with_forwarding_stats(totals_so_far());
+            let mut mgr = make_manager();
+            assert!(mgr.edit_stable_channel(CHANNEL_ID_HEX, Some(target_usd), None, &fake as &dyn LdkServerCalls, 100_000.0).await.ok);
+            let inbox = std::sync::Arc::new(Inbox::in_memory());
+            mgr.attach_event_inbox(inbox.clone());
+            (mgr, fake, inbox)
+        }
+
+        async fn ticks(mgr: &mut StableChannelManager, fake: &FakeLdkServer, count: usize) {
+            for _ in 0..count {
+                mgr.run_tick_plan(fake as &dyn LdkServerCalls, 100_000.0, TickScope::All).await;
+            }
+        }
+
+        /// The node reports every SYNC the LSP sent so far as delivered, as it does within seconds for a wallet that is online.
+        async fn syncs_delivered(mgr: &mut StableChannelManager, fake: &FakeLdkServer) {
+            let sent = fake.sends.lock().unwrap().len();
+            for n in 1..=sent {
+                let payment_id = if n == 1 { "fake-payment-id".to_owned() } else { format!("fake-payment-id-{n}") };
+                outcome(mgr, fake, &payment_id, Some(1), true).await;
+            }
+        }
+
+        /// The two ticks anchoring takes: a settled reading, then the same reading again.
+        async fn anchor(mgr: &mut StableChannelManager, fake: &FakeLdkServer) {
+            ticks(mgr, fake, 2).await;
+            assert!(booked(mgr).is_some(), "anchored on the second matching reading");
+        }
+
+        fn booked(mgr: &StableChannelManager) -> Option<BookedBalance> {
+            mgr.db.booked_balance(UID).unwrap()
+        }
+
+        fn ledger_rows(mgr: &StableChannelManager, event_type: &str) -> Vec<serde_json::Value> {
+            let conn = save_test_connection(mgr);
+            let mut stmt = conn.prepare("SELECT detail_json FROM ledger_events WHERE event_type = ?1 ORDER BY id").unwrap();
+            let rows = stmt.query_map([event_type], |row| row.get::<_, String>(0)).unwrap();
+            rows.map(|row| serde_json::from_str(&row.unwrap()).unwrap()).collect()
+        }
+
+        fn forward_out_of_the_user(outbound_msat: u64, fee_msat: u64) -> Entry {
+            use ldk_server_client::ldk_server_grpc::events::{event_envelope::Event, EventEnvelope, PaymentForwarded};
+            let locator = |channel_id: &str| vec![HtlcLocator { channel_id: channel_id.to_owned(), ..Default::default() }];
+            Entry::Event(EventEnvelope {
+                event: Some(Event::PaymentForwarded(PaymentForwarded {
+                    prev_htlcs: locator(CHANNEL_ID_HEX),
+                    next_htlcs: locator(ROUTING_CHANNEL_HEX),
+                    outbound_amount_forwarded_msat: outbound_msat,
+                    total_fee_earned_msat: Some(fee_msat),
+                    ..Default::default()
+                })),
+            })
+        }
+
+        #[tokio::test]
+        async fn an_existing_channel_is_anchored_once_its_reading_repeats() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            ticks(&mut mgr, &fake, 1).await;
+            assert!(booked(&mgr).is_none(), "one reading is not enough");
+            ticks(&mut mgr, &fake, 1).await;
+            let books = booked(&mgr).expect("anchored at the second tick");
+            assert_eq!(books.channel_id, CHANNEL_ID_HEX);
+            assert_eq!(books.booked_user_msat, 49_000_000 + RESERVE_SATS * 1000, "the user's spendable balance and the reserve LDK holds for them");
+            assert_eq!(books.channel_value_sats, 100_000);
+            assert_eq!(books.cursor, cursor_so_far(), "the cursor starts at LDK's totals for this channel");
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_ANCHORED").len(), 1);
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty());
+            let books = booked(&mgr).unwrap();
+            assert_eq!(books.check.state, CheckState::Ok);
+            assert!(books.check.checked_at_ms.is_some(), "the ticks after the anchor check the books");
+        }
+
+        #[tokio::test]
+        async fn a_forward_counted_between_the_reads_waits_for_the_next_tick_to_anchor() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            let fake: &'static FakeLdkServer = Box::leak(Box::new(fake));
+            // LDK counts a forward while the channel and balance reads are under way.
+            *fake.balances_hook.lock().unwrap() = Some(Box::new(move || *fake.forwarding_stats.lock().unwrap() = totals_after_a_forward_out()));
+            ticks(&mut mgr, fake, 1).await;
+            assert!(booked(&mgr).is_none(), "the balance read may or may not show it");
+            ticks(&mut mgr, fake, 1).await;
+            assert!(booked(&mgr).is_none(), "the unsettled reading is not one of the two");
+            ticks(&mut mgr, fake, 1).await;
+            assert_eq!(booked(&mgr).expect("anchored once the totals hold still").cursor, ForwardCursor { spent_msat: 7_360_500, spent_count: 4, ..cursor_so_far() });
+        }
+
+        #[tokio::test]
+        async fn an_anchor_waits_for_a_second_matching_reading() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            ticks(&mut mgr, &fake, 1).await;
+            // The balance moves before the second reading, with no forward counted.
+            user_holds(&fake, 49_000_000);
+            ticks(&mut mgr, &fake, 1).await;
+            assert!(booked(&mgr).is_none(), "two different readings");
+            ticks(&mut mgr, &fake, 1).await;
+            assert_eq!(booked(&mgr).expect("anchored on the second matching reading").booked_user_msat, 49_000_000);
+        }
+
+        #[tokio::test]
+        async fn a_forward_counted_after_the_first_reading_restarts_the_anchor_wait() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            // The forward has left the balance but LDK has not counted it yet.
+            user_holds(&fake, 50_000_000 - 10_500);
+            ticks(&mut mgr, &fake, 1).await;
+            *fake.forwarding_stats.lock().unwrap() = totals_after_a_forward_out();
+            ticks(&mut mgr, &fake, 1).await;
+            assert!(booked(&mgr).is_none(), "the totals moved since the first reading");
+            // The existing check published the drop with a SYNC, which the wallet takes.
+            syncs_delivered(&mut mgr, &fake).await;
+            ticks(&mut mgr, &fake, 1).await;
+            let books = booked(&mgr).expect("anchored once the reading repeats");
+            assert_eq!(books.booked_user_msat, 50_000_000 - 10_500);
+            assert_eq!(books.cursor, ForwardCursor { spent_msat: 7_360_500, spent_count: 4, ..cursor_so_far() });
+            ticks(&mut mgr, &fake, 2).await;
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty(), "the anchor and its cursor both hold the forward, so it is not booked again");
+        }
+
+        #[tokio::test]
+        async fn a_pending_stability_settlement_holds_the_anchor() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            // A pay-back registered but not yet applied: its sats have left the balance and a retry books it.
+            let (settlement_id, payment_id) = ("5e".repeat(32), "9c".repeat(32));
+            mgr.db.register_inbound_stability_settlement(&settlement_id, &payment_id, &CHANNEL_ID_HEX.to_uppercase(), 1_250_000, "user_to_lsp", "{}").unwrap();
+            ticks(&mut mgr, &fake, 3).await;
+            assert!(booked(&mgr).is_none());
+
+            save_test_connection(&mgr).execute("UPDATE inbound_stability_settlements SET state = 'applied'", []).unwrap();
+            anchor(&mut mgr, &fake).await;
+        }
+
+        #[tokio::test]
+        async fn a_catch_up_that_cannot_be_saved_is_not_read_as_a_gap() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // Book changes cannot be written while the forward has already left the balance.
+            save_test_connection(&mgr)
+                .execute_batch("CREATE TRIGGER refuse_book_changes BEFORE INSERT ON ledger_events WHEN NEW.event_type = 'BOOKED_BALANCE_CHANGED' BEGIN SELECT RAISE(ABORT, 'refused'); END;")
+                .unwrap();
+            *fake.forwarding_stats.lock().unwrap() = totals_after_a_forward_out();
+            user_holds(&fake, 50_000_000 - 10_500);
+            ticks(&mut mgr, &fake, 3).await;
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.check.checked_at_ms), (50_000_000, None), "not checked against books it could not bring up to date");
+
+            save_test_connection(&mgr).execute_batch("DROP TRIGGER refuse_book_changes;").unwrap();
+            ticks(&mut mgr, &fake, 1).await;
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").len(), 1);
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.check.state), (50_000_000 - 10_500, CheckState::Ok));
+        }
+
+        #[tokio::test]
+        async fn a_channel_below_the_reserve_waits_to_be_anchored() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap();
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            // The user holds less than the reserve, so LDK lists no spendable balance to read the books from.
+            user_holds(&fake, 600_000);
+            stable_channels::audit::enable_test_capture();
+            ticks(&mut mgr, &fake, 3).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert!(booked(&mgr).is_none());
+            assert_eq!(count_events(&events, "BOOKED_BALANCE_DISAGREES"), 0);
+
+            user_holds(&fake, 20_000_000 + RESERVE_SATS * 1000);
+            // The existing check published the drop with a SYNC, which the wallet takes.
+            syncs_delivered(&mut mgr, &fake).await;
+            ticks(&mut mgr, &fake, 2).await;
+            let books = booked(&mgr).expect("anchored once the balance can be read");
+            assert_eq!(books.booked_user_msat, 20_000_000 + RESERVE_SATS * 1000);
+        }
+
+        #[tokio::test]
+        async fn a_channel_with_a_top_up_on_the_way_is_not_anchored() {
+            let (mut mgr, ldk, push) = top_up_in_flight().await;
+            *ldk.forwarding_stats.lock().unwrap() = totals_so_far();
+            mgr.attach_event_inbox(std::sync::Arc::new(Inbox::in_memory()));
+            // The node still lists the top-up as pending, so its claim is not in the balance yet.
+            node_reports(&ldk, "fake-payment-id", PaymentStatus::Pending);
+            tick_past_cooldown(&mut mgr, &ldk, &push, 3).await;
+            assert!(booked(&mgr).is_none());
+
+            set_receiver_sats(&ldk, 62_500);
+            node_reports(&ldk, "fake-payment-id", PaymentStatus::Succeeded);
+            tick_past_cooldown(&mut mgr, &ldk, &push, 2).await;
+            let books = booked(&mgr).expect("anchored once the top-up is claimed");
+            assert_eq!(books.booked_user_msat, 62_500_000);
+        }
+
+        #[tokio::test]
+        async fn stats_unavailable_skips_the_books_pass_quietly() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap();
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            fake.stats_fail.store(true, Ordering::SeqCst);
+            ticks(&mut mgr, &fake, 3).await;
+            assert!(booked(&mgr).is_none(), "nothing is anchored without LDK's totals");
+
+            // Once anchored, a gap seen while the totals cannot be read is not checked.
+            fake.stats_fail.store(false, Ordering::SeqCst);
+            anchor(&mut mgr, &fake).await;
+            fake.stats_fail.store(true, Ordering::SeqCst);
+            user_holds(&fake, 30_000_000);
+            ticks(&mut mgr, &fake, 3).await;
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.check.state, books.check.checked_at_ms), (CheckState::Ok, None));
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+
+            let failed: Vec<_> = ledger_rows(&mgr, "LDK_CALL_FAILED").into_iter().filter(|row| row["context"] == "books").collect();
+            assert_eq!(failed.len(), 1, "one record a day, not one a tick");
+            assert_eq!(failed[0]["op"], "list_channel_forwarding_stats");
+            let day = StableChannelManager::unix_time_secs() / STABILITY_TOP_UP_ALARM_REPEAT_SECS;
+            assert_eq!(failed[0]["dedup_key"], format!("lsp:books-stats:{day}"));
+        }
+
+        async fn forwarded(mgr: &mut StableChannelManager, fake: &FakeLdkServer, prev_ucid: &str, prev_chan: &str, next_ucid: Option<&str>, next_chan: &str, outbound_msat: u64, fee_msat: u64) {
+            mgr.handle_payment_forwarded(
+                prev_ucid.to_string(), next_ucid.map(str::to_string), prev_chan.to_string(), next_chan.to_string(),
+                "02aa".to_string(), "02bb".to_string(), outbound_msat, fee_msat, None, true, fake as &dyn LdkServerCalls, 100_000.0,
+            ).await;
+        }
+
+        #[tokio::test]
+        async fn a_forward_out_of_a_user_is_booked_from_its_own_amounts() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            *fake.forwarding_stats.lock().unwrap() = totals_after_a_forward_out();
+            forwarded(&mut mgr, &fake, USER_CHANNEL_ID_DECIMAL, CHANNEL_ID_HEX, Some(OTHER_USER_CHANNEL_ID_DECIMAL), ROUTING_CHANNEL_HEX, 10_000, 100).await;
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0]["reason"], "forward_out");
+            assert_eq!(changes[0]["delta_msat"], -10_100);
+            assert_eq!(changes[0]["evidence"], "4:2:7360100:4125500");
+            let books = booked(&mgr).unwrap();
+            assert_eq!(books.booked_user_msat, 50_000_000 - 10_100);
+            assert_eq!(books.cursor, ForwardCursor { spent_msat: 7_360_100, spent_count: 4, ..cursor_so_far() });
+        }
+
+        #[tokio::test]
+        async fn a_forward_into_a_user_is_booked() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            *fake.forwarding_stats.lock().unwrap() =
+                vec![totals(CHANNEL_ID_HEX, 7_350_000, 3, 4_132_500, 3), totals(ROUTING_CHANNEL_HEX, 4_134_000, 3, 7_342_650, 3)];
+            forwarded(&mut mgr, &fake, OTHER_USER_CHANNEL_ID_DECIMAL, ROUTING_CHANNEL_HEX, Some(USER_CHANNEL_ID_DECIMAL), CHANNEL_ID_HEX, 7_000, 0).await;
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0]["reason"], "forward_in");
+            assert_eq!(changes[0]["delta_msat"], 7_000);
+            let books = booked(&mgr).unwrap();
+            assert_eq!(books.booked_user_msat, 50_000_000 + 7_000);
+            assert_eq!(books.cursor, ForwardCursor { received_msat: 4_132_500, received_count: 3, ..cursor_so_far() });
+        }
+
+        #[tokio::test]
+        async fn a_forward_event_handled_twice_is_booked_once() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            *fake.forwarding_stats.lock().unwrap() = totals_after_a_forward_out();
+            for _ in 0..2 {
+                forwarded(&mut mgr, &fake, USER_CHANNEL_ID_DECIMAL, CHANNEL_ID_HEX, Some(OTHER_USER_CHANNEL_ID_DECIMAL), ROUTING_CHANNEL_HEX, 10_000, 500).await;
+            }
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").len(), 1);
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000 - 10_500);
+        }
+
+        #[tokio::test]
+        async fn the_existing_deduction_is_unchanged_by_booking() {
+            let (mut mgr, fake) = seed_forwarded_fixture().await;
+            *fake.channels.lock().unwrap() = vec![make_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 100_000, 95_000_000, true)];
+            mgr.db.anchor_booked_balance(UID, CHANNEL_ID_HEX, 50_000_000, 100_000, ForwardCursor::default(), serde_json::json!({})).unwrap();
+            mgr.handle_payment_forwarded(
+                USER_CHANNEL_ID_DECIMAL.to_string(), Some("next-ucid-1".to_string()), "prev-chan-1".to_string(), "next-chan-1".to_string(),
+                "prev-node-1".to_string(), "next-node-1".to_string(), 45_000_000, 0, None, false, &fake as &dyn LdkServerCalls, 100_000.0,
+            ).await;
+            assert!((mgr.stable_channels[0].expected_usd.0 - 5.0).abs() < 0.01);
+            assert_eq!(mgr.stable_channels[0].backing_sats, 5_000);
+            assert_eq!(mgr.stable_channels[0].native_sats, 0);
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000 - 45_000_000);
+        }
+
+        #[tokio::test]
+        async fn a_missed_forward_is_caught_up_once() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // The forward's event never reached the daemon.
+            *fake.forwarding_stats.lock().unwrap() = totals_after_a_forward_out();
+            user_holds(&fake, 50_000_000 - 10_500);
+            ticks(&mut mgr, &fake, 1).await;
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0]["reason"], "forward_catch_up");
+            assert_eq!(changes[0]["delta_msat"], -10_500);
+            assert_eq!(changes[0]["evidence"], "4:2:7360500:4125500");
+            assert_eq!((changes[0]["spent_msat"].as_u64(), changes[0]["received_msat"].as_u64()), (Some(10_500), Some(0)));
+            let books = booked(&mgr).unwrap();
+            assert_eq!(books.booked_user_msat, 50_000_000 - 10_500);
+            assert_eq!(books.cursor, ForwardCursor { spent_msat: 7_360_500, spent_count: 4, ..cursor_so_far() });
+            assert_eq!(books.check.state, CheckState::Ok);
+
+            ticks(&mut mgr, &fake, 1).await;
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").len(), 1, "the cursor already covers it");
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000 - 10_500);
+        }
+
+        #[tokio::test]
+        async fn catch_up_leaves_forwards_still_in_the_inbox_to_their_events() {
+            let (mut mgr, fake, inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // LDK counts a forward before it emits the event, which is saved but not handled yet.
+            *fake.forwarding_stats.lock().unwrap() = totals_after_a_forward_out();
+            user_holds(&fake, 50_000_000 - 10_500);
+            inbox.save(&[(forward_out_of_the_user(10_000, 500), 0)]).unwrap();
+            ticks(&mut mgr, &fake, 1).await;
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty(), "its own event books it");
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.cursor), (50_000_000, cursor_so_far()));
+
+            // An event deleted unhandled, as an interrupted one is, leaves its forward to the catch-up.
+            let id = inbox.oldest().unwrap().unwrap().id;
+            inbox.finish(id).unwrap();
+            ticks(&mut mgr, &fake, 1).await;
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0]["delta_msat"], -10_500);
+        }
+
+        #[tokio::test]
+        async fn a_catch_up_that_moves_only_amounts_is_booked_once() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            *fake.forwarding_stats.lock().unwrap() = totals_after_a_forward_out();
+            user_holds(&fake, 50_000_000 - 10_500);
+            ticks(&mut mgr, &fake, 1).await;
+            // LDK's totals move by 6,000 msat with the counts unchanged.
+            *fake.forwarding_stats.lock().unwrap() = vec![totals(CHANNEL_ID_HEX, 7_366_500, 4, 4_125_500, 2), totals(ROUTING_CHANNEL_HEX, 4_127_100, 2, 7_358_650, 4)];
+            user_holds(&fake, 50_000_000 - 16_500);
+            ticks(&mut mgr, &fake, 1).await;
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!(changes.len(), 2, "same counts, new amounts: a new catch-up");
+            assert_eq!((&changes[1]["delta_msat"], &changes[1]["evidence"]), (&serde_json::json!(-6_000), &serde_json::json!("4:2:7366500:4125500")));
+            let books = booked(&mgr).unwrap();
+            assert_eq!(books.booked_user_msat, 50_000_000 - 16_500);
+            assert_eq!(books.cursor, ForwardCursor { spent_msat: 7_366_500, spent_count: 4, ..cursor_so_far() });
+
+            ticks(&mut mgr, &fake, 1).await;
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").len(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_forward_waiting_in_the_inbox_is_counted_in_the_check() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap();
+            // $10 on 10,000 sats of backing, so the existing check leaves the drop alone.
+            let (mut mgr, fake, inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            // A forward out of the user whose event is saved but not handled, already gone from the live balance; LDK's totals here do not hold it, so nothing else books it.
+            inbox.save(&[(forward_out_of_the_user(2_000_000, 500), 0)]).unwrap();
+            user_holds(&fake, 50_000_000 - 2_000_500);
+            stable_channels::audit::enable_test_capture();
+            ticks(&mut mgr, &fake, 3).await;
+            let events = stable_channels::audit::drain_test_capture();
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty(), "the waiting event explains the drop");
+            assert_eq!(count_events(&events, "BOOKED_BALANCE_DISAGREES"), 0);
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+
+            // The event is gone without being booked: the drop is now a gap.
+            let id = inbox.oldest().unwrap().unwrap().id;
+            inbox.finish(id).unwrap();
+            ticks(&mut mgr, &fake, 2).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty());
+            let mismatches = ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH");
+            assert_eq!(mismatches.len(), 1);
+            assert_eq!((&mismatches[0]["direction"], &mismatches[0]["gap_msat"]), (&serde_json::json!("below"), &serde_json::json!(2_000_500)));
+            assert_eq!(count_events(&events, "BOOKED_BALANCE_DISAGREES"), 1);
+        }
+
+        type MoneyFigures = ((f64, u64, u64), (f64, u64, u64), usize);
+
+        /// The two anchor ticks, then two ticks with 20,000 sats gone from the user's side and nothing to explain it.
+        async fn lasting_gap(stats_fail: bool) -> (StableChannelManager, MoneyFigures) {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            fake.stats_fail.store(stats_fail, Ordering::SeqCst);
+            ticks(&mut mgr, &fake, 2).await;
+            user_holds(&fake, 30_000_000);
+            ticks(&mut mgr, &fake, 2).await;
+            let sc = &mgr.stable_channels[0];
+            let in_memory = (sc.expected_usd.0, sc.backing_sats, sc.native_sats);
+            let saved = mgr.db.load_channel(USER_CHANNEL_ID_DECIMAL).unwrap().unwrap();
+            let saved = (saved.expected_usd, saved.backing_sats, saved.native_sats);
+            let sends = fake.sends.lock().unwrap().len();
+            (mgr, (in_memory, saved, sends))
+        }
+
+        #[tokio::test]
+        async fn a_lasting_gap_is_logged_as_a_pause_that_did_not_happen() {
+            let (with_books, figures) = lasting_gap(false).await;
+            let mismatches = ledger_rows(&with_books, "BOOKED_BALANCE_MISMATCH");
+            assert_eq!(mismatches.len(), 1);
+            assert_eq!(mismatches[0]["effect"], "log_only");
+            assert_eq!(mismatches[0]["direction"], "below");
+            assert_eq!(mismatches[0]["gap_msat"], 20_000_000);
+            assert_eq!(booked(&with_books).unwrap().check.state, CheckState::Paused);
+
+            let (without_books, figures_without) = lasting_gap(true).await;
+            assert!(booked(&without_books).is_none());
+            assert_eq!(figures, figures_without, "the books pass changes no money");
+            assert_eq!(figures.1, (30.0, 30_000, 0), "the existing balance check deducted the gap in both runs");
+            assert_eq!(figures.2, 1, "and published it with one SYNC");
+        }
+
+        #[tokio::test]
+        async fn a_disagreement_is_logged_once_until_it_changes() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap();
+            // $10 on 10,000 sats of backing, so a 20,000-sat gap leaves the user above backing and the existing check leaves it alone.
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            assert_eq!((mgr.stable_channels[0].backing_sats, mgr.stable_channels[0].native_sats), (10_000, 40_000));
+            anchor(&mut mgr, &fake).await;
+            stable_channels::audit::enable_test_capture();
+            user_holds(&fake, 30_000_000);
+            ticks(&mut mgr, &fake, 3).await;
+            let events = stable_channels::audit::drain_test_capture();
+            let logged: Vec<_> = events.iter().filter(|(name, _)| name == "BOOKED_BALANCE_DISAGREES").map(|(_, data)| data.clone()).collect();
+            assert_eq!(logged.len(), 1, "the same disagreement is logged once");
+            let line = &logged[0];
+            assert_eq!(line["categories"], serde_json::json!(["books_above_live"]));
+            assert_eq!(line["user_channel_id"], USER_CHANNEL_ID_DECIMAL);
+            assert_eq!(line["channel_id"], CHANNEL_ID_HEX);
+            let figures = ["booked_msat", "live_low_msat", "live_high_msat", "held_msat", "backing_sats", "native_sats"].map(|name| line[name].as_u64());
+            assert_eq!(figures, [Some(50_000_000), Some(30_000_000), Some(30_000_000), Some(0), Some(10_000), Some(40_000)]);
+
+            // The gap closes, then opens again: that is a new disagreement.
+            user_holds(&fake, 50_000_000);
+            ticks(&mut mgr, &fake, 1).await;
+            user_holds(&fake, 30_000_000);
+            ticks(&mut mgr, &fake, 1).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert_eq!(count_events(&events, "BOOKED_BALANCE_DISAGREES"), 1);
+            assert_eq!((mgr.stable_channels[0].backing_sats, mgr.stable_channels[0].native_sats), (10_000, 40_000));
+        }
+
+        /// The id the fake gave its latest send.
+        fn latest_send_id(fake: &FakeLdkServer) -> String {
+            match fake.sends.lock().unwrap().len() {
+                1 => "fake-payment-id".to_owned(),
+                sent => format!("fake-payment-id-{sent}"),
+            }
+        }
+
+        /// The outcome LDK Server reports for a payment the LSP sent, handled as the event loop does.
+        async fn outcome(mgr: &mut StableChannelManager, fake: &FakeLdkServer, payment_id: &str, amount_msat: Option<u64>, succeeded: bool) {
+            use ldk_server_client::ldk_server_grpc::events::{event_envelope::Event, PaymentFailed, PaymentSuccessful};
+            let status = if succeeded { PaymentStatus::Succeeded } else { PaymentStatus::Failed };
+            let payment = Some(GrpcPayment { payment_id: payment_id.into(), amount_msat, direction: 1, status: status as i32, ..Default::default() });
+            let event = if succeeded {
+                Event::PaymentSuccessful(PaymentSuccessful { payment_id: payment_id.into(), payment, ..Default::default() })
+            } else {
+                Event::PaymentFailed(PaymentFailed { payment_id: payment_id.into(), payment, reason: None })
+            };
+            let db = mgr.db.clone();
+            assert_eq!(crate::event_loop::dispatch_event(Some(event), mgr, &db, fake, 100_000.0).await, crate::event_loop::DispatchOutcome::Continue);
+        }
+
+        /// A rejected trade whose fee the operator refunds; returns the refund's payment id.
+        async fn refund_a_rejected_trade_fee(mgr: &StableChannelManager, fake: &FakeLdkServer, fee_msat: u64) -> String {
+            let trade_payment_id = "3f9a6c1e8b2d7f4a0c5e9b3d1f6a8c2e4b7d0f9a3c6e1b8d5f2a7c4e0b9d6f13";
+            mgr.db.record_settlement(trade_payment_id, "trade").unwrap();
+            assert!(mgr.db.persist_trade_rejection(trade_payment_id, "trade-1", "hash", CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, "quote_expired", 100, "{}").unwrap());
+            fake.payments.lock().unwrap().push(GrpcPayment {
+                payment_id: trade_payment_id.into(),
+                amount_msat: Some(fee_msat),
+                direction: ldk_server_client::ldk_server_grpc::types::PaymentDirection::Inbound as i32,
+                status: PaymentStatus::Succeeded as i32,
+                ..Default::default()
+            });
+            let (refund_payment_id, amount_msat) = crate::revenue::refund_trade_fee(&mgr.db, fake, trade_payment_id, 200).await.unwrap();
+            assert_eq!(amount_msat, fee_msat);
+            refund_payment_id
+        }
+
+        #[tokio::test]
+        async fn a_sync_and_a_fee_refund_that_arrive_are_booked() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            assert!(mgr.send_sync_message(&fake, UID, CHANNEL_ID_HEX, 50.0, 50_000, COUNTERPARTY_HEX).await);
+            let sync_id = latest_send_id(&fake);
+            let refund_id = refund_a_rejected_trade_fee(&mgr, &fake, 2_150_000).await;
+            assert_ne!(sync_id, refund_id);
+            // The second round is the same events replayed.
+            for _ in 0..2 {
+                outcome(&mut mgr, &fake, &sync_id, Some(1), true).await;
+                outcome(&mut mgr, &fake, &refund_id, Some(2_150_000), true).await;
+            }
+            let booked_as: Vec<_> = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED")
+                .into_iter()
+                .map(|change| (change["reason"].clone(), change["evidence"].clone(), change["delta_msat"].clone()))
+                .collect();
+            assert_eq!(booked_as, vec![
+                (serde_json::json!("lsp_payment"), serde_json::json!(sync_id), serde_json::json!(1)),
+                (serde_json::json!("lsp_payment"), serde_json::json!(refund_id), serde_json::json!(2_150_000)),
+            ]);
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000 + 1 + 2_150_000);
+        }
+
+        #[tokio::test]
+        async fn a_refund_whose_outcome_arrives_before_it_is_recorded_is_booked_once() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            let trade_payment_id = "3f9a6c1e8b2d7f4a0c5e9b3d1f6a8c2e4b7d0f9a3c6e1b8d5f2a7c4e0b9d6f13";
+            assert!(mgr.db.persist_trade_rejection(trade_payment_id, "trade-1", "hash", CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, "quote_expired", 100, "{}").unwrap());
+            // As the refund does: the claim with its payment id is saved before anything is sent.
+            let (_, refund_id) = stable_channels::trade::trade_fee_refund_preimage(trade_payment_id);
+            assert!(mgr.db.claim_trade_fee_refund(trade_payment_id, 2_150_000, COUNTERPARTY_HEX, 200, Some(&refund_id)).unwrap().is_none());
+            outcome(&mut mgr, &fake, &refund_id, Some(2_150_000), true).await;
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!(changes.len(), 1);
+            assert_eq!((&changes[0]["reason"], &changes[0]["evidence"], &changes[0]["delta_msat"]), (&serde_json::json!("lsp_payment"), &serde_json::json!(refund_id), &serde_json::json!(2_150_000)));
+
+            mgr.db.record_trade_fee_refund_payment(trade_payment_id, &refund_id, USER_CHANNEL_ID_DECIMAL).unwrap();
+            outcome(&mut mgr, &fake, &refund_id, Some(2_150_000), true).await;
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").len(), 1, "recording it afterwards books nothing more");
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000 + 2_150_000);
+        }
+
+        #[tokio::test]
+        async fn a_payment_the_lsp_did_not_send_to_a_user_books_nothing() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // The operator's own payment, and a pay-back the user sent, recorded with the user's channel.
+            mgr.db.record_settlement_with_channel("pay-back", "stability", USER_CHANNEL_ID_DECIMAL).unwrap();
+            outcome(&mut mgr, &fake, "operator-invoice-payment", Some(7_000_000), true).await;
+            outcome(&mut mgr, &fake, "pay-back", Some(3_000_000), true).await;
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty());
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000);
+        }
+
+        #[tokio::test]
+        async fn a_claimed_top_up_is_booked_by_its_claim_alone() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            let (expected_usd, backing_sats, native_sats) = (mgr.stable_channels[0].expected_usd.0, mgr.stable_channels[0].backing_sats, mgr.stable_channels[0].native_sats);
+            assert!(mgr.db.record_stability_top_up_in_flight("top-up-to-the-user", USER_CHANNEL_ID_DECIMAL, CHANNEL_ID_HEX, 2_500, expected_usd, backing_sats, native_sats, 2_500_000, "lsp_to_user", COUNTERPARTY_HEX).unwrap());
+            outcome(&mut mgr, &fake, "top-up-to-the-user", Some(2_500_000), true).await;
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!(changes.len(), 1);
+            assert_eq!((&changes[0]["reason"], &changes[0]["delta_msat"]), (&serde_json::json!("top_up_claimed"), &serde_json::json!(2_500_000)));
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000 + 2_500_000);
+        }
+
+        #[tokio::test]
+        async fn a_payment_of_unknown_amount_is_logged_and_not_booked() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap();
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            assert!(mgr.send_sync_message(&fake, UID, CHANNEL_ID_HEX, 50.0, 50_000, COUNTERPARTY_HEX).await);
+            let sync_id = latest_send_id(&fake);
+            stable_channels::audit::enable_test_capture();
+            outcome(&mut mgr, &fake, &sync_id, None, true).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            let logged: Vec<_> = events.iter().filter(|(name, _)| name == "BOOKED_BALANCE_DISAGREES").map(|(_, data)| data.clone()).collect();
+            assert_eq!(logged.len(), 1);
+            assert_eq!(logged[0]["categories"], serde_json::json!(["lsp_payment_amount_unknown"]));
+            assert_eq!((&logged[0]["payment_id"], &logged[0]["user_channel_id"]), (&serde_json::json!(sync_id), &serde_json::json!(USER_CHANNEL_ID_DECIMAL)));
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_failed_refund_is_still_logged_without_a_channel() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap();
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            let refund_id = refund_a_rejected_trade_fee(&mgr, &fake, 2_150_000).await;
+            stable_channels::audit::enable_test_capture();
+            outcome(&mut mgr, &fake, &refund_id, Some(2_150_000), false).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            let logged: Vec<_> = events.iter().filter(|(name, _)| name == "PAYMENT_FAILED").map(|(_, data)| data.clone()).collect();
+            assert_eq!(logged.len(), 1);
+            assert_eq!(logged[0]["user_channel_id"], serde_json::Value::Null);
+            assert_eq!(logged[0]["stability_rollback_applied"], serde_json::Value::Null);
+            assert!(mgr.db.list_failed_sync_channels().unwrap().is_empty(), "a refund is no SYNC to retry");
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty());
+        }
+
+        /// The $10 channel at par on the user's 50,000 sats, its books anchored there.
+        async fn anchored_at_par() -> StableChannelManager {
+            let mgr = manager_at_par_for_signed_stability().await;
+            assert!(mgr.db.anchor_booked_balance(UID, CHANNEL_ID_HEX, 50_000_000, 100_000, ForwardCursor::default(), serde_json::json!({})).unwrap());
+            mgr
+        }
+
+        /// The node once the user has paid the LSP `paid_sats` of their 50,000.
+        fn user_paid_lsp(paid_sats: u64) -> FakeLdkServer {
+            FakeLdkServer::new(vec![make_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 100_000, (50_000 + paid_sats) * 1000, true)])
+        }
+
+        fn signed_pay_back(settlement_id: &str, channel_id: &str, amount_msat: u64) -> CustomTlvRecord {
+            signed_stability_record(settlement_id, channel_id, amount_msat, stable_channels::stable::StabilityPaymentDirection::UserToLsp, 10.0)
+        }
+
+        /// A signed pay-back whose authorisation ran out before it arrived.
+        fn expired_signed_pay_back(settlement_id: &str, amount_msat: u64) -> CustomTlvRecord {
+            let now = test_unix_now();
+            let payload = stable_channels::stable::build_stability_payment_payload(
+                settlement_id, CHANNEL_ID_HEX, amount_msat, stable_channels::stable::StabilityPaymentDirection::UserToLsp, 10.0,
+                now - 2 * STABILITY_PAYMENT_AUTH_TTL_SECS, now - STABILITY_PAYMENT_AUTH_TTL_SECS,
+            ).unwrap();
+            let envelope = stable_channels::stable::build_stability_signed_envelope(payload, "signed-by-test-peer".to_owned()).unwrap();
+            CustomTlvRecord { type_num: stable_channels::constants::SIGNED_STABILITY_TLV_TYPE, value: envelope.into_bytes().into() }
+        }
+
+        fn settlement_state(mgr: &StableChannelManager, settlement_id: &str) -> Option<String> {
+            mgr.db.inbound_stability_settlement_state(settlement_id).unwrap()
+        }
+
+        fn booked_as(mgr: &StableChannelManager) -> Vec<(serde_json::Value, serde_json::Value, serde_json::Value)> {
+            ledger_rows(mgr, "BOOKED_BALANCE_CHANGED")
+                .into_iter()
+                .map(|change| (change["reason"].clone(), change["evidence"].clone(), change["delta_msat"].clone()))
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn a_signed_pay_back_is_booked_once_even_when_retried() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut mgr = anchored_at_par().await;
+            let settlement_id = "584dc56477948146729de26d87873b5376c2056c8a63d6a5fa728be9c5ae65cc";
+            let payment_id = "3b297c98f39d8d2d0b3821368e469bdcdf89278612fdbbeeec6de31d5babd64b";
+            let record = signed_pay_back(settlement_id, CHANNEL_ID_HEX, 909_000);
+            let fake = user_paid_lsp(909);
+            // Without a price the payment is registered and left for the tick to finish.
+            mgr.handle_payment_received(vec![record.clone()], Some(payment_id.to_owned()), Some(909_000), &fake, 0.0).await;
+            assert_eq!(settlement_state(&mgr, settlement_id).as_deref(), Some("pending"));
+            mgr.retry_pending_signed_stability(&fake, 110_000.0).await;
+            assert_eq!(settlement_state(&mgr, settlement_id).as_deref(), Some("applied"));
+            assert_eq!(mgr.stable_channels[0].backing_sats, 9_091);
+            // The same event handled again.
+            mgr.handle_payment_received(vec![record], Some(payment_id.to_owned()), Some(909_000), &fake, 110_000.0).await;
+
+            assert_eq!(booked_as(&mgr), vec![(serde_json::json!("signed_pay_back"), serde_json::json!(payment_id), serde_json::json!(-909_000))]);
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED")[0]["settlement_id"], settlement_id);
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000 - 909_000);
+        }
+
+        #[tokio::test]
+        async fn an_expired_signed_pay_back_is_still_booked() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut mgr = anchored_at_par().await;
+            let settlement_id = "ccd5fc9f009a4d4ab5b7efa845f3b9d905677be3b61a902160b513fadb6bb494";
+            let payment_id = "62458b6e1d526aaab2e1a664be7847b8d7da3fe6283ae526a877bdd2ee7f4c57";
+            let record = expired_signed_pay_back(settlement_id, 909_000);
+            let fake = user_paid_lsp(909);
+            for _ in 0..2 {
+                mgr.handle_payment_received(vec![record.clone()], Some(payment_id.to_owned()), Some(909_000), &fake, 110_000.0).await;
+            }
+            // Refused as before, with the allocation untouched.
+            assert_eq!(settlement_state(&mgr, settlement_id).as_deref(), Some("invalid"));
+            let reason: Option<String> = save_test_connection(&mgr)
+                .query_row("SELECT reason FROM inbound_stability_settlements WHERE settlement_id = ?1", [settlement_id], |row| row.get(0))
+                .unwrap();
+            assert_eq!(reason.as_deref(), Some("expired"));
+            assert_eq!(mgr.stable_channels[0].backing_sats, 10_000);
+
+            assert_eq!(booked_as(&mgr), vec![(serde_json::json!("signed_pay_back"), serde_json::json!(payment_id), serde_json::json!(-909_000))]);
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000 - 909_000);
+            assert_eq!(fake.verify_calls.lock().unwrap().len(), 1, "the replay is refused before its signature is checked again");
+        }
+
+        #[tokio::test]
+        async fn an_old_unsigned_pay_back_is_booked_as_inferred() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut mgr = anchored_at_par().await;
+            let payment_id = "86689912fa7fc7d1e7dff0700f4ae521c1938254f3037ff4b472813588008791";
+            mgr.handle_payment_received(vec![stability_marker()], Some(payment_id.to_owned()), Some(909_000), &user_paid_lsp(909), 110_000.0).await;
+            assert_eq!(mgr.stable_channels[0].backing_sats, 9_091, "settled as before");
+            // A second one whose event carries no payment id.
+            mgr.handle_payment_received(vec![stability_marker()], None, Some(1_000_000), &user_paid_lsp(1_909), 110_000.0).await;
+
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!(changes.len(), 2);
+            assert_eq!((&changes[0]["reason"], &changes[0]["evidence"], &changes[0]["delta_msat"]), (&serde_json::json!("inferred_pay_back"), &serde_json::json!(payment_id), &serde_json::json!(-909_000)));
+            assert_eq!((&changes[1]["reason"], &changes[1]["delta_msat"]), (&serde_json::json!("inferred_pay_back"), &serde_json::json!(-1_000_000)));
+            assert!(changes[1]["evidence"].as_str().unwrap().starts_with("unsigned:"));
+            assert!(changes.iter().all(|change| change["inferred"] == true));
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000 - 1_909_000);
+        }
+
+        #[tokio::test]
+        async fn an_unproven_pay_back_books_nothing() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut mgr = anchored_at_par().await;
+            let fake = user_paid_lsp(909);
+            let forged = user_paid_lsp(909).with_verify_failure();
+            // A signature the user's node did not make, fresh or expired, and a payload naming a channel the LSP does not have.
+            mgr.handle_payment_received(
+                vec![signed_pay_back("7999bf55292241781288b416745a41f08379823a381b9b8fc58660d41e04f0b1", CHANNEL_ID_HEX, 909_000)],
+                Some("03819affffec9e820fa8801651f87857f05efd7aeaebcfe1c8957b3335cd10b4".to_owned()), Some(909_000), &forged, 110_000.0,
+            ).await;
+            mgr.handle_payment_received(
+                vec![expired_signed_pay_back("f83a783279acb43266dda68b20954800ec1e663c878f33aedc4532807753eedc", 909_000)],
+                Some("32da3cbf0f80132cdfa3d04e003bce2dcc84f1212aec6ee4e8452a783034df1c".to_owned()), Some(909_000), &forged, 110_000.0,
+            ).await;
+            mgr.handle_payment_received(
+                vec![signed_pay_back("167b0380f57964485923bd9f795e9dcdb8cc3818f676cab8654d6f50a6155494", "3754781c4f9d3e917a1beec883577e60f2151b9052b9ebef4a50b7961ec53239", 909_000)],
+                Some("ee3ce3a2db0511dcc1bdc6b141b82c8aba050d77258d3d69636b7a1ee29369a9".to_owned()), Some(909_000), &fake, 110_000.0,
+            ).await;
+            // An unsigned one that no channel's drop matches, and a payment with no stable record.
+            mgr.handle_payment_received(
+                vec![stability_marker()], Some("31927d8c51f9610a5d0508a15a7303e47fbec0af56cfe8fd91858ac5d3ec0602".to_owned()), Some(909_000), &user_paid_lsp(0), 110_000.0,
+            ).await;
+            mgr.handle_payment_received(Vec::new(), Some("2e4e77ff85be8b6ac397cfec9782010063daa7c40307dc1ce26ea7d9c702dd50".to_owned()), Some(909_000), &fake, 110_000.0).await;
+
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty());
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000);
+            assert_eq!(mgr.stable_channels[0].backing_sats, 10_000);
+        }
+
+        #[tokio::test]
+        async fn a_pay_back_that_cannot_be_booked_is_still_applied() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut mgr = anchored_at_par().await;
+            save_test_connection(&mgr)
+                .execute_batch("CREATE TRIGGER refuse_book_changes BEFORE INSERT ON ledger_events WHEN NEW.event_type = 'BOOKED_BALANCE_CHANGED' BEGIN SELECT RAISE(ABORT, 'refused'); END;")
+                .unwrap();
+            let settlement_id = "0a436061da607ba76c07edd4b381b7f6860a1feb829a493984dbc0bfb7b80d42";
+            stable_channels::audit::enable_test_capture();
+            mgr.handle_payment_received(
+                vec![signed_pay_back(settlement_id, CHANNEL_ID_HEX, 909_000)],
+                Some("d30a55c48e255c5510f06c5721522c64fbbcdf0fad16317a32b84088aa36ae18".to_owned()), Some(909_000), &user_paid_lsp(909), 110_000.0,
+            ).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+
+            assert_eq!(settlement_state(&mgr, settlement_id).as_deref(), Some("applied"));
+            assert_eq!(mgr.stable_channels[0].backing_sats, 9_091);
+            assert_eq!(count_events(&events, "STABILITY_PAYMENT_V1_APPLIED"), 1);
+            let failed: Vec<_> = events.iter().filter(|(name, data)| name == "DB_WRITE_FAILED" && data["op"] == "book").collect();
+            assert_eq!(failed.len(), 1);
+            assert_eq!((&failed[0].1["context"], &failed[0].1["user_channel_id"]), (&serde_json::json!("books"), &serde_json::json!(USER_CHANNEL_ID_DECIMAL)));
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000);
+        }
+
+        #[tokio::test]
+        async fn a_trade_fee_is_booked_whether_the_trade_is_accepted_or_refused() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut mgr = make_manager();
+            let (fake, request, fee) = trade_request(&mut mgr);
+            assert!(mgr.db.anchor_booked_balance(UID, CHANNEL_ID_HEX, 299_900_000, 300_000, ForwardCursor::default(), serde_json::json!({})).unwrap());
+            let (accepted_id, rejected_id, old_format_id) = (
+                "332f3c7e507ec90431a498583309b006899dae4924a7ebcb3b0f05933fc8191c",
+                "478ec47d6998433873811e41787098489bc9d70bace35bd27383a8516dc10083",
+                "7304f24398ec2b45cd05421212934113ccd1d19de4a24393aee542d790e97ae0",
+            );
+            stable_channels::audit::enable_test_capture();
+            // The acceptance's signing gets no answer, so the request is handled again.
+            fake.sign_failures.store(1, Ordering::SeqCst);
+            assert_eq!(mgr.handle_trade_payment(&request, Some(accepted_id), Some(fee), &fake, 100_000.0).await, Handled::Retry);
+            assert_eq!(mgr.handle_trade_payment(&request, Some(accepted_id), Some(fee), &fake, 100_000.0).await, Handled::Done);
+            // The same event once it is decided.
+            mgr.handle_trade_payment(&request, Some(accepted_id), Some(fee), &fake, 100_000.0).await;
+            // A request that underpays its fee, and one in the old format.
+            let underpaid = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, "14068e4015eeb9a3d91f9907146c7c0a88ede091a95773d995a9dcdb9c14a0b4", 70.0, 100_000.0);
+            mgr.handle_trade_payment(&underpaid, Some(rejected_id), Some(1), &fake, 100_000.0).await;
+            let old_format = legacy_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, 70.0, None);
+            mgr.handle_trade_payment(&old_format, Some(old_format_id), Some(fee), &fake, 100_000.0).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+
+            // Each decided as before.
+            assert_eq!(["TRADE_ACCEPTED", "TRADE_REJECTION_QUEUED", "TRADE_LEGACY_REFUSED"].map(|name| count_events(&events, name)), [1, 1, 1]);
+            assert_eq!(mgr.stable_channels[0].expected_usd.0, 60.0);
+            let trade_fee = |id: &str, msat: u64| (serde_json::json!("trade_fee"), serde_json::json!(id), serde_json::json!(-(msat as i64)));
+            assert_eq!(booked_as(&mgr), vec![trade_fee(accepted_id, fee), trade_fee(rejected_id, 1), trade_fee(old_format_id, fee)]);
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 299_900_000 - 2 * fee - 1);
+        }
+
+        #[tokio::test]
+        async fn an_unverified_trade_payment_books_nothing() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut mgr = make_manager();
+            let (fake, request, fee) = trade_request(&mut mgr);
+            assert!(mgr.db.anchor_booked_balance(UID, CHANNEL_ID_HEX, 299_900_000, 300_000, ForwardCursor::default(), serde_json::json!({})).unwrap());
+            let forged = fake.with_verify_failure();
+            let old_format = legacy_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, 70.0, None);
+            stable_channels::audit::enable_test_capture();
+            mgr.handle_trade_payment(&request, Some("024425bf657cac38cae86c96464793687b5868da79d2d9ec16244588f81f704b"), Some(fee), &forged, 100_000.0).await;
+            mgr.handle_trade_payment(&old_format, Some("c8fe05c7610f103f9e8455458b5fdf42be0038c255674b9da5d4556e8b1e4785"), Some(fee), &forged, 100_000.0).await;
+            // A verified request whose payment cannot be named, or whose amount is unknown.
+            let fake = FakeLdkServer::new(vec![make_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 300_000, 100_000, true)]);
+            mgr.handle_trade_payment(&request, None, Some(fee), &fake, 100_000.0).await;
+            mgr.handle_trade_payment(&request, Some("3754781c4f9d3e917a1beec883577e60f2151b9052b9ebef4a50b7961ec53239"), None, &fake, 100_000.0).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+
+            assert_eq!(count_events(&events, "TRADE_SIGNATURE_INVALID"), 2);
+            assert_eq!(count_events(&events, "TRADE_PAYMENT_UNATTRIBUTABLE"), 2);
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty());
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 299_900_000);
+            assert_eq!(mgr.stable_channels[0].expected_usd.0, 50.0);
+        }
+
+        const SPLICE_OUT_TXID: &str = "31fac423e15c091bf4bbe85a1f976ed40c357933af6f78a8758ed486442d0c33";
+        const SPLICE_IN_TXID: &str = "18421e773d8d839b83196331d7687fb2681939520af61de5cb65fb39b04a8ff3";
+        const FUNDING_TXID: &str = "be859468d6051544a13110383786b959c4d88a602c99dbc870ce9ffaa855e5e0";
+
+        /// The channel as LDK lists it once a splice locked it at `value_sats` on `txid`, the user holding `user_msat` with LDK's 1% reserve.
+        fn spliced(fake: &FakeLdkServer, value_sats: u64, user_msat: u64, txid: &str) {
+            let mut channels = fake.channels.lock().unwrap();
+            let channel = &mut channels[0];
+            channel.channel_value_sats = value_sats;
+            channel.counterparty_unspendable_punishment_reserve = value_sats / 100;
+            channel.inbound_capacity_msat = user_msat - channel.counterparty_unspendable_punishment_reserve * 1000;
+            channel.outbound_capacity_msat = value_sats * 1000 - user_msat;
+            channel.next_outbound_htlc_limit_msat = channel.outbound_capacity_msat;
+            channel.funding_txo = Some(ldk_server_client::ldk_server_grpc::types::OutPoint { txid: txid.to_owned(), vout: 1 });
+        }
+
+        async fn splice_locked(mgr: &mut StableChannelManager, fake: &FakeLdkServer, funding_txo: &str) {
+            mgr.handle_channel_ready(CHANNEL_ID_HEX.into(), USER_CHANNEL_ID_DECIMAL.into(), Some(funding_txo.to_owned()), fake as &dyn LdkServerCalls, 100_000.0).await;
+        }
+
+        #[tokio::test]
+        async fn a_user_splice_out_is_booked_from_the_channel_value() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // The user takes 20,000 sats of their 50,000 out of the 100,000-sat channel on chain.
+            spliced(&fake, 80_000, 30_000_000, SPLICE_OUT_TXID);
+            let funding = format!("{SPLICE_OUT_TXID}:1");
+            // The second is the same lock handled again, as the retry path does.
+            for _ in 0..2 {
+                splice_locked(&mut mgr, &fake, &funding).await;
+            }
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!(changes.len(), 1);
+            assert_eq!((&changes[0]["reason"], &changes[0]["evidence"], &changes[0]["delta_msat"]), (&serde_json::json!("splice"), &serde_json::json!(funding), &serde_json::json!(-20_000_000)));
+            assert_eq!((&changes[0]["made_by"], &changes[0]["value_before"], &changes[0]["value_after"]), (&serde_json::json!("user"), &serde_json::json!(100_000), &serde_json::json!(80_000)));
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.channel_value_sats), (30_000_000, 80_000));
+            assert!((mgr.stable_channels[0].expected_usd.0 - 30.0).abs() < 1e-6, "the existing splice-out deduction is unchanged");
+
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_lsp_splice_in_leaves_the_user_books() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // A queued 50,000-sat splice-in the node has negotiated; its Ready event can arrive before the job sees the lock.
+            let stable_channels::db::QueueSpliceOutcome::Queued(row) = mgr.db.queue_splice_in(USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 50_000, 100, 0, "", None).unwrap() else {
+                panic!("queued")
+            };
+            mgr.db.mark_queued_splice_splicing(USER_CHANNEL_ID_DECIMAL, row.request_id, Some(&format!("{FUNDING_TXID}:0")), 100_000, 50_000, 101).unwrap().unwrap();
+            let funding = format!("{SPLICE_IN_TXID}:1");
+            mgr.db.note_queued_splice_negotiated(USER_CHANNEL_ID_DECIMAL, row.request_id, &funding, 102).unwrap().unwrap();
+            spliced(&fake, 150_000, 50_000_000, SPLICE_IN_TXID);
+            splice_locked(&mut mgr, &fake, &funding).await;
+
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!(changes.len(), 1, "written to move the channel value");
+            assert_eq!((&changes[0]["delta_msat"], &changes[0]["made_by"], &changes[0]["evidence"]), (&serde_json::json!(0), &serde_json::json!("lsp"), &serde_json::json!(funding)));
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.channel_value_sats), (50_000_000, 150_000));
+
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+        }
+
+        /// A splice-out of `out_sats` the node has negotiated: LDK already holds the user to their side after it, while the value stays on the old funding.
+        fn splice_out_confirming(fake: &FakeLdkServer, out_sats: u64) {
+            fake.channels.lock().unwrap()[0].inbound_capacity_msat -= out_sats * 1000;
+        }
+
+        #[tokio::test]
+        async fn anchoring_waits_while_a_splice_out_confirms() {
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            splice_out_confirming(&fake, 20_000);
+            ticks(&mut mgr, &fake, 3).await;
+            assert!(booked(&mgr).is_none(), "the user's side already left the old value");
+
+            // The splice locks, and the listing moves to the new funding before its Ready event is handled.
+            spliced(&fake, 80_000, 30_000_000, SPLICE_OUT_TXID);
+            anchor(&mut mgr, &fake).await;
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.channel_value_sats), (30_000_000, 80_000));
+            splice_locked(&mut mgr, &fake, &format!("{SPLICE_OUT_TXID}:1")).await;
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty(), "the anchor already holds the new value");
+            ticks(&mut mgr, &fake, 2).await;
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.check.state), (30_000_000, CheckState::Ok));
+        }
+
+        #[tokio::test]
+        async fn an_anchored_channel_is_not_flagged_while_its_splice_out_confirms() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            ticks(&mut mgr, &fake, 1).await;
+            let checked = booked(&mgr).unwrap().check;
+            stable_channels::audit::enable_test_capture();
+            splice_out_confirming(&fake, 20_000);
+            ticks(&mut mgr, &fake, 3).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert_eq!(count_events(&events, "BOOKED_BALANCE_DISAGREES"), 0);
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+            assert_eq!(booked(&mgr).unwrap().check, checked, "the stored check is left as it was");
+
+            spliced(&fake, 80_000, 30_000_000, SPLICE_OUT_TXID);
+            splice_locked(&mut mgr, &fake, &format!("{SPLICE_OUT_TXID}:1")).await;
+            ticks(&mut mgr, &fake, 2).await;
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!((changes.len(), &changes[0]["delta_msat"]), (1, &serde_json::json!(-20_000_000)));
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.check.state), (30_000_000, CheckState::Ok));
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_operator_splice_out_leaves_the_user_books() {
+            use ldk_server_client::ldk_server_grpc::events::{event_envelope::Event, SpliceNegotiated};
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            let db = mgr.db.clone();
+            stable_channels::audit::set_audit_ledger((*db).clone());
+            // The operator takes 20,000 sats of the LSP's side out by hand: no note and no queued row, but the node reports the negotiation it contributed to.
+            let funding = format!("{SPLICE_OUT_TXID}:1");
+            let negotiated = Event::SpliceNegotiated(SpliceNegotiated {
+                channel_id: CHANNEL_ID_HEX.into(),
+                user_channel_id: USER_CHANNEL_ID_DECIMAL.into(),
+                counterparty_node_id: COUNTERPARTY_HEX.into(),
+                new_funding_txo: funding.clone(),
+            });
+            assert_eq!(crate::event_loop::dispatch_event(Some(negotiated), &mut mgr, &db, &fake, 100_000.0).await, crate::event_loop::DispatchOutcome::Continue);
+            spliced(&fake, 80_000, 50_000_000, SPLICE_OUT_TXID);
+            splice_locked(&mut mgr, &fake, &funding).await;
+
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!(changes.len(), 1);
+            assert_eq!((&changes[0]["delta_msat"], &changes[0]["made_by"]), (&serde_json::json!(0), &serde_json::json!("lsp")));
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.channel_value_sats), (50_000_000, 80_000));
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+        }
+
+        #[tokio::test]
+        async fn a_user_splice_out_inside_a_hand_made_notes_window_is_the_users() {
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            // The operator noted a splice-in by hand on the current funding, and the user's own splice-out locks first.
+            let now = StableChannelManager::unix_time_secs();
+            mgr.db.note_manual_splice_unless(USER_CHANNEL_ID_DECIMAL, &format!("{FUNDING_TXID}:0"), now, |_| false).unwrap();
+            spliced(&fake, 80_000, 30_000_000, SPLICE_OUT_TXID);
+            splice_locked(&mut mgr, &fake, &format!("{SPLICE_OUT_TXID}:1")).await;
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!((&changes[0]["delta_msat"], &changes[0]["made_by"]), (&serde_json::json!(-20_000_000), &serde_json::json!("user")));
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 30_000_000);
+        }
+
+        #[tokio::test]
+        async fn a_splice_whose_event_names_no_funding_is_keyed_by_the_listed_funding() {
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            spliced(&fake, 80_000, 30_000_000, SPLICE_OUT_TXID);
+            mgr.handle_channel_ready(CHANNEL_ID_HEX.into(), USER_CHANNEL_ID_DECIMAL.into(), None, &fake as &dyn LdkServerCalls, 100_000.0).await;
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!(changes.len(), 1);
+            assert_eq!((&changes[0]["evidence"], &changes[0]["delta_msat"]), (&serde_json::json!(format!("{SPLICE_OUT_TXID}:1")), &serde_json::json!(-20_000_000)));
+        }
+
+        #[tokio::test]
+        async fn a_healthy_channel_never_disagrees_through_a_day_of_activity() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // $10 at $100k on the user's 50,000 sats.
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            stable_channels::audit::enable_test_capture();
+            anchor(&mut mgr, &fake).await;
+            let mut user_msat = 50_000_000;
+
+            // A forward out of the user: 10,000 msat and a 500 msat fee, counted by LDK before its event.
+            *fake.forwarding_stats.lock().unwrap() = totals_after_a_forward_out();
+            user_msat -= 10_500;
+            user_holds(&fake, user_msat);
+            forwarded(&mut mgr, &fake, USER_CHANNEL_ID_DECIMAL, CHANNEL_ID_HEX, Some(OTHER_USER_CHANNEL_ID_DECIMAL), ROUTING_CHANNEL_HEX, 10_000, 500).await;
+            ticks(&mut mgr, &fake, 2).await;
+
+            // A forward of 7,000 msat into the user, with a 150 msat fee taken on the way.
+            *fake.forwarding_stats.lock().unwrap() =
+                vec![totals(CHANNEL_ID_HEX, 7_360_500, 4, 4_132_500, 3), totals(ROUTING_CHANNEL_HEX, 4_134_250, 3, 7_352_650, 4)];
+            user_msat += 7_000;
+            user_holds(&fake, user_msat);
+            forwarded(&mut mgr, &fake, OTHER_USER_CHANNEL_ID_DECIMAL, ROUTING_CHANNEL_HEX, Some(USER_CHANNEL_ID_DECIMAL), CHANNEL_ID_HEX, 7_000, 150).await;
+            ticks(&mut mgr, &fake, 2).await;
+            // Today's stored native does not take in what the user receives, so native from the books runs 7 sats ahead of it.
+            let mut events = stable_channels::audit::drain_test_capture();
+            let native_lines = |events: &[(String, serde_json::Value)]| -> Vec<serde_json::Value> {
+                events.iter().filter(|(name, _)| name == "BOOKED_BALANCE_NATIVE_DIFFERS").map(|(_, data)| data.clone()).collect()
+            };
+            let after_forward_in = native_lines(&events);
+            assert_eq!(after_forward_in.len(), 1);
+            let figures = ["booked_native_sats", "native_sats", "backing_sats", "difference_sats"].map(|name| after_forward_in[0][name].as_u64());
+            assert_eq!(figures, [Some(39_996), Some(39_989), Some(10_000), Some(7)]);
+
+            // The price falls to $80k, the tick tops the user up, and the user claims it.
+            mgr.stable_channels[0].last_stability_payment = 0;
+            mgr.run_tick_plan(&fake as &dyn LdkServerCalls, 80_000.0, TickScope::All).await;
+            assert_eq!(top_up_sats_sent(&fake), [2_500]);
+            user_msat += 2_500_000;
+            user_holds(&fake, user_msat);
+            outcome(&mut mgr, &fake, &latest_send_id(&fake), Some(2_500_000), true).await;
+            assert_eq!(mgr.stable_channels[0].backing_sats, 12_500);
+            ticks(&mut mgr, &fake, 2).await;
+
+            // Back at $100k the user buys $1 more of stable value with a signed trade, paying its fee.
+            let fee = expected_trade_fee_msat(10.0, 11.0, 100_000.0).unwrap();
+            user_msat -= fee;
+            user_holds(&fake, user_msat);
+            let trade = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, "d0e2adf6ac016eb74d47839504f138ec99e17a370cbbd994cb5fb48ebe557180", 11.0, 100_000.0);
+            let trade = CustomTlvRecord { type_num: stable_channels::constants::STABLE_CHANNEL_TLV_TYPE, value: trade.into_bytes().into() };
+            let trade_payment_id = "450879b257ffb1a2c958806eeedecfcd89408f70af4ab6add101443314c9752c";
+            mgr.handle_payment_received(vec![trade], Some(trade_payment_id.to_owned()), Some(fee), &fake, 100_000.0).await;
+            assert_eq!((mgr.stable_channels[0].expected_usd.0, mgr.stable_channels[0].backing_sats), (11.0, 13_500));
+            ticks(&mut mgr, &fake, 2).await;
+
+            // The user pays back the 2,500 sats they hold above par, signed.
+            user_msat -= 2_500_000;
+            user_holds(&fake, user_msat);
+            let pay_back = signed_stability_record(
+                "45c4410db7da209a30ae6df44122e905f36f3445822fe900c04cfa008e4019bd", CHANNEL_ID_HEX, 2_500_000, StabilityPaymentDirection::UserToLsp, 11.0,
+            );
+            let pay_back_id = "874b5d4eb024928e59a01e3ec00a59293a1c8307fb6551e3884045e144c0d93a";
+            mgr.handle_payment_received(vec![stability_marker(), pay_back], Some(pay_back_id.to_owned()), Some(2_500_000), &fake, 100_000.0).await;
+            assert_eq!(mgr.stable_channels[0].backing_sats, 11_000);
+            ticks(&mut mgr, &fake, 2).await;
+
+            // The user takes 20,000 sats out on chain, and the channel shrinks to 80,000 sats.
+            user_msat -= 20_000_000;
+            spliced(&fake, 80_000, user_msat, SPLICE_OUT_TXID);
+            splice_locked(&mut mgr, &fake, &format!("{SPLICE_OUT_TXID}:1")).await;
+            ticks(&mut mgr, &fake, 2).await;
+            events.extend(stable_channels::audit::drain_test_capture());
+            stable_channels::audit::disable_test_capture();
+
+            let booked_as: Vec<_> = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").into_iter().map(|change| (change["reason"].clone(), change["delta_msat"].clone())).collect();
+            let expected: Vec<(&str, i64)> = vec![
+                ("forward_out", -10_500), ("forward_in", 7_000), ("top_up_claimed", 2_500_000),
+                ("trade_fee", -(fee as i64)), ("signed_pay_back", -2_500_000), ("splice", -20_000_000),
+            ];
+            assert_eq!(booked_as, expected.into_iter().map(|(reason, delta)| (serde_json::json!(reason), serde_json::json!(delta))).collect::<Vec<_>>());
+            let books = booked(&mgr).unwrap();
+            let live = crate::books::live_user_balance(&fake.channels.lock().unwrap()[0], 0);
+            assert_eq!((books.booked_user_msat, live.low_msat, live.high_msat), (user_msat, user_msat, user_msat));
+            assert_eq!((books.channel_value_sats, books.check.state), (80_000, CheckState::Ok));
+            assert_eq!(count_events(&events, "BOOKED_BALANCE_DISAGREES"), 0);
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+            // The trade rewrote the stored native, and the splice-out it covered left it 20,000 sats behind again.
+            let differences: Vec<_> = native_lines(&events).iter().map(|line| line["difference_sats"].as_u64()).collect();
+            assert_eq!(differences, [Some(7), Some(20_000)]);
+        }
+
+        #[tokio::test]
+        async fn a_forward_lists_the_channels_for_the_spend_check_before_the_books_read_totals() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            *fake.forwarding_stats.lock().unwrap() = totals_after_a_forward_out();
+            user_holds(&fake, 50_000_000 - 10_500);
+            fake.calls.lock().unwrap().clear();
+            forwarded(&mut mgr, &fake, USER_CHANNEL_ID_DECIMAL, CHANNEL_ID_HEX, Some(OTHER_USER_CHANNEL_ID_DECIMAL), ROUTING_CHANNEL_HEX, 10_000, 500).await;
+            let calls = fake.calls.lock().unwrap().clone();
+            let first = |name: &str| calls.iter().position(|call| *call == name);
+            let (listed, read_totals) = (first("list_channels"), first("get_channel_forwarding_stats"));
+            assert!(listed.is_some() && read_totals.is_some(), "{calls:?}");
+            assert!(listed < read_totals, "the spend check reads the balance before the books read LDK's totals: {calls:?}");
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000 - 10_500);
+        }
+
+        #[tokio::test]
+        async fn a_forward_is_booked_when_the_spend_check_cannot_list_the_channels() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            *fake.forwarding_stats.lock().unwrap() = totals_after_a_forward_out();
+            fake.list_channels_fails.store(true, Ordering::SeqCst);
+            forwarded(&mut mgr, &fake, USER_CHANNEL_ID_DECIMAL, CHANNEL_ID_HEX, Some(OTHER_USER_CHANNEL_ID_DECIMAL), ROUTING_CHANNEL_HEX, 10_000, 500).await;
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000 - 10_500);
+        }
+
+        fn books_updated_at_ms(mgr: &StableChannelManager) -> i64 {
+            save_test_connection(mgr).query_row("SELECT updated_at_ms FROM booked_balances", [], |row| row.get(0)).unwrap()
+        }
+
+        #[tokio::test]
+        async fn a_check_that_changes_nothing_is_not_written_again() {
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            ticks(&mut mgr, &fake, 1).await;
+            let first = booked(&mgr).unwrap().check;
+            assert!(first.checked_at_ms.is_some(), "the first check is written");
+            let written_at = books_updated_at_ms(&mgr);
+            for _ in 0..2 {
+                std::thread::sleep(std::time::Duration::from_millis(3));
+                ticks(&mut mgr, &fake, 1).await;
+            }
+            assert_eq!((booked(&mgr).unwrap().check, books_updated_at_ms(&mgr)), (first, written_at));
+            // A gap is a change, so it is written.
+            user_holds(&fake, 30_000_000);
+            ticks(&mut mgr, &fake, 1).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Watching);
+        }
+
+        /// An event that is no forward, still waiting in the inbox.
+        fn unrelated_event() -> Entry {
+            use ldk_server_client::ldk_server_grpc::events::{event_envelope::Event, EventEnvelope, PaymentSuccessful};
+            Entry::Event(EventEnvelope {
+                event: Some(Event::PaymentSuccessful(PaymentSuccessful {
+                    payment_id: "e3a1c5f7b9d2e4a6c8f0b2d4e6a8c1e3f5b7d9a2c4e6f8b0d3a5c7e9f1b4d6a8".into(),
+                    ..Default::default()
+                })),
+            })
+        }
+
+        #[tokio::test]
+        async fn a_splice_lock_the_daemon_missed_is_booked_by_the_tick() {
+            let (mut mgr, fake, inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            // The user's splice-out locked while the daemon was down: the listing is on the new funding and no Ready event is coming.
+            spliced(&fake, 80_000, 30_000_000, SPLICE_OUT_TXID);
+            // An event still waiting could be the splice's own, so the tick leaves it to the event until the inbox drains.
+            inbox.save(&[(unrelated_event(), 0)]).unwrap();
+            ticks(&mut mgr, &fake, 1).await;
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty());
+            let id = inbox.oldest().unwrap().unwrap().id;
+            inbox.finish(id).unwrap();
+            ticks(&mut mgr, &fake, 1).await;
+            let funding = format!("{SPLICE_OUT_TXID}:1");
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!(changes.len(), 1);
+            assert_eq!((&changes[0]["reason"], &changes[0]["evidence"], &changes[0]["delta_msat"]), (&serde_json::json!("splice"), &serde_json::json!(funding), &serde_json::json!(-20_000_000)));
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.channel_value_sats), (30_000_000, 80_000));
+            // A second tick, and a Ready event that does arrive after all, book nothing more.
+            ticks(&mut mgr, &fake, 1).await;
+            splice_locked(&mut mgr, &fake, &funding).await;
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").len(), 1, "booked once");
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_disagreement_names_a_pay_back_and_events_still_waiting() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            // A pay-back registered but not applied yet has left the balance, and an event is still waiting to be handled.
+            let settlement_id = "b7e0c3a6d9f2b5e8c1a4d7f0b3e6c9a2d5f8b1e4c7a0d3f6b9e2c5a8d1f4b7e0";
+            let payment_id = "f1c4a7d0b3e6f9c2a5d8b1e4f7c0a3d6b9e2f5c8a1d4b7e0c3f6a9d2b5e8c1f4";
+            mgr.db.register_inbound_stability_settlement(settlement_id, payment_id, &CHANNEL_ID_HEX.to_uppercase(), 1_250_000, "user_to_lsp", "{}").unwrap();
+            inbox.save(&[(unrelated_event(), 0)]).unwrap();
+            user_holds(&fake, 50_000_000 - 1_250_000);
+            mgr.stable_channels[0].native_sats = 38_750;
+            stable_channels::audit::enable_test_capture();
+            ticks(&mut mgr, &fake, 1).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            let named = |event: &str| -> Vec<serde_json::Value> { events.iter().filter(|(name, _)| name == event).map(|(_, data)| data.clone()).collect() };
+            let disagrees = named("BOOKED_BALANCE_DISAGREES");
+            assert_eq!(disagrees.len(), 1);
+            assert_eq!(disagrees[0]["categories"], serde_json::json!(["books_above_live", "events_waiting", "settlement_pending"]));
+            let native = named("BOOKED_BALANCE_NATIVE_DIFFERS");
+            assert_eq!(native.len(), 1);
+            assert_eq!((&native[0]["settlement_pending"], &native[0]["events_waiting"]), (&serde_json::json!(true), &serde_json::json!(true)));
+        }
+
+        #[tokio::test]
+        async fn totals_behind_the_books_are_logged_once_while_the_books_agree() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            // LDK's store was restored from a copy older than the books' cursor.
+            *fake.forwarding_stats.lock().unwrap() =
+                vec![totals(CHANNEL_ID_HEX, 7_339_500, 2, 4_125_500, 2), totals(ROUTING_CHANNEL_HEX, 4_127_100, 2, 7_332_150, 2)];
+            let lines = |events: Vec<(String, serde_json::Value)>| -> Vec<serde_json::Value> {
+                events.into_iter().filter(|(name, _)| name == "BOOKED_BALANCE_DISAGREES").map(|(_, data)| data).collect()
+            };
+            stable_channels::audit::enable_test_capture();
+            ticks(&mut mgr, &fake, 3).await;
+            let logged = lines(stable_channels::audit::drain_test_capture());
+            assert_eq!(logged.len(), 1, "once, not once a tick");
+            assert_eq!(logged[0]["categories"], serde_json::json!(["totals_behind_cursor"]));
+            // A gap that opens meanwhile is logged with it.
+            user_holds(&fake, 30_000_000);
+            ticks(&mut mgr, &fake, 1).await;
+            let logged = lines(stable_channels::audit::drain_test_capture());
+            stable_channels::audit::disable_test_capture();
+            assert_eq!(logged.len(), 1);
+            assert_eq!(logged[0]["categories"], serde_json::json!(["books_above_live", "totals_behind_cursor"]));
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty(), "totals behind the books catch nothing up");
+        }
+
+        #[tokio::test]
+        async fn a_channel_missing_from_one_listing_keeps_its_books() {
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            // One listing leaves the channel out, so reconcile soft-closes its row.
+            let blip = FakeLdkServer::new(vec![]);
+            mgr.reconcile_from_grpc(&blip as &dyn LdkServerCalls, 100_000.0).await;
+            assert!(mgr.stable_channels.is_empty());
+            assert_eq!(booked(&mgr).unwrap().closed_at, None, "the books stay open");
+            // Saved again once it is listed, the channel is checked against the same books.
+            assert!(mgr.edit_stable_channel(CHANNEL_ID_HEX, Some(10.0), None, &fake as &dyn LdkServerCalls, 100_000.0).await.ok);
+            user_holds(&fake, 30_000_000);
+            ticks(&mut mgr, &fake, 2).await;
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.check.state), (50_000_000, CheckState::Paused));
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_ANCHORED").len(), 1, "not anchored again");
+            // A real close closes them, even when another soft-close got to the row first.
+            mgr.reconcile_from_grpc(&blip as &dyn LdkServerCalls, 100_000.0).await;
+            mgr.handle_channel_closed(CHANNEL_ID_HEX.into(), USER_CHANNEL_ID_DECIMAL.into(), Some(COUNTERPARTY_HEX.into()), None, 0, None);
+            assert!(booked(&mgr).unwrap().closed_at.is_some());
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_CLOSED").len(), 1);
+        }
+
+        #[tokio::test]
+        async fn the_books_are_not_checked_until_the_event_inbox_is_attached() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            // A tick can run before the event loop attaches the inbox.
+            mgr.event_inbox = None;
+            user_holds(&fake, 30_000_000);
+            stable_channels::audit::enable_test_capture();
+            ticks(&mut mgr, &fake, 3).await;
+            let events = stable_channels::audit::drain_test_capture();
+            assert_eq!(count_events(&events, "BOOKED_BALANCE_DISAGREES"), 0);
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+            assert_eq!(booked(&mgr).unwrap().check.checked_at_ms, None);
+
+            mgr.attach_event_inbox(inbox);
+            ticks(&mut mgr, &fake, 2).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert_eq!(count_events(&events, "BOOKED_BALANCE_DISAGREES"), 1);
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").len(), 1);
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+        }
+
+        #[tokio::test]
+        async fn with_every_channel_anchored_a_tick_reads_the_totals_once() {
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            ticks(&mut mgr, &fake, 1).await;
+            fake.stats_calls.store(0, Ordering::SeqCst);
+            ticks(&mut mgr, &fake, 1).await;
+            assert!(booked(&mgr).is_some());
+            assert_eq!(fake.stats_calls.load(Ordering::SeqCst), 2, "before and after the channel reads while a channel waits to be anchored");
+            fake.stats_calls.store(0, Ordering::SeqCst);
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(fake.stats_calls.load(Ordering::SeqCst), 2, "one a tick");
+        }
+
+        #[tokio::test]
+        async fn a_payment_to_the_user_still_pending_holds_the_anchor() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            assert!(mgr.send_sync_message(&fake, UID, CHANNEL_ID_HEX, 50.0, 50_000, COUNTERPARTY_HEX).await);
+            let sync_id = latest_send_id(&fake);
+            ticks(&mut mgr, &fake, 3).await;
+            assert!(booked(&mgr).is_none(), "its outcome could book what an anchor already holds");
+            outcome(&mut mgr, &fake, &sync_id, Some(1), true).await;
+            anchor(&mut mgr, &fake).await;
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty());
+        }
     }
 }

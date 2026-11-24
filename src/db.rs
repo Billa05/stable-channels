@@ -16,10 +16,14 @@ use crate::ledger::{
     LedgerQuery, LedgerRef, LegacyImportReport,
 };
 
+mod booked_balance;
 mod forward_history;
 mod onchain_audit;
 mod stream_checkpoint;
 
+pub use booked_balance::{
+    BookChange, BookOutcome, BookReason, BookedBalance, BooksCheck, CheckState, ForwardCursor, GapDirection,
+};
 pub use forward_history::fingerprint as forward_detail_fingerprint;
 
 /// Outcome of `record_payment_and_maybe_update_backing`.
@@ -47,6 +51,8 @@ pub enum InboundStabilityRegistration {
 pub struct PendingInboundStabilitySettlement {
     pub settlement_id: String,
     pub payment_id: String,
+    /// The channel id the signed payload names, as the wallet wrote it.
+    pub channel_id: String,
     pub amount_msat: u64,
     pub envelope: String,
 }
@@ -1278,8 +1284,8 @@ impl Database {
         Ok(updated == 1)
     }
 
-    /// Records the refund keysend's payment id and labels that payment `refund`.
-    pub fn record_trade_fee_refund_payment(&self, trade_payment_id: &str, refund_payment_id: &str) -> SqliteResult<()> {
+    /// Records the refund keysend's payment id and labels that payment `refund`, with the channel of the refunded trade.
+    pub fn record_trade_fee_refund_payment(&self, trade_payment_id: &str, refund_payment_id: &str, user_channel_id: &str) -> SqliteResult<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
@@ -1287,8 +1293,8 @@ impl Database {
             params![trade_payment_id, refund_payment_id],
         )?;
         tx.execute(
-            "INSERT OR IGNORE INTO settlement_payments (payment_id, kind) VALUES (?1, 'refund')",
-            params![refund_payment_id],
+            "INSERT OR IGNORE INTO settlement_payments (payment_id, kind, user_channel_id) VALUES (?1, 'refund', ?2)",
+            params![refund_payment_id, user_channel_id],
         )?;
         tx.commit()
     }
@@ -1449,6 +1455,36 @@ impl Database {
     pub fn clear_manual_splice(&self, user_channel_id: &str) -> SqliteResult<bool> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute("DELETE FROM manual_splices WHERE user_channel_id = ?1", params![user_channel_id])? > 0)
+    }
+
+    /// Whether the LSP made the splice that moved the channel from `value_before_sats` onto `funding_txo`: the node reported negotiating it, the channel's queued splice-in names that funding, or a splice-in made by hand is newer than the channel's books and their last splice.
+    pub fn lsp_made_splice(&self, uid: u128, funding_txo: &str, value_before_sats: u64, value_after_sats: u64) -> SqliteResult<bool> {
+        let conn = self.conn.lock().unwrap();
+        let key = uid.to_string();
+        if !funding_txo.is_empty() {
+            // LDK reports a negotiated splice only to a node that put inputs or outputs of its own into it, and the audit keeps one row per funding.
+            let negotiated = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM ledger_events WHERE dedup_key = ?1)",
+                params![format!("lsp:splice-negotiated:{key}:{funding_txo}")],
+                |row| row.get::<_, bool>(0),
+            )?;
+            // The node's negotiation writes the funding on the row before the job sees the lock, and the lock writes it again.
+            let queued = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM queued_splices WHERE user_channel_id = ?1 AND funding_txo = ?2)",
+                params![key, funding_txo],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if negotiated || queued {
+                return Ok(true);
+            }
+        }
+        // A note outlives its lock until a later request, a close or a cancel clears it, so one the books have moved past is spent.
+        match Self::manual_splice_on(&conn, &key)? {
+            Some(manual) if value_after_sats > value_before_sats && manual.channel_funding_txo != funding_txo => {
+                booked_balance::noted_since_books(&conn, &key, manual.made_at)
+            }
+            _ => Ok(false),
+        }
     }
 
     /// Apply one update and return the row when it changed; None when the row is missing or not in a state the update applies to.
@@ -2482,13 +2518,24 @@ impl Database {
         Ok(())
     }
 
+    /// Closes a channel for good: soft-closes its row and closes its books, even when a listing blip soft-closed the row first.
+    pub fn mark_channel_closed(&self, user_channel_id: &str) -> SqliteResult<()> {
+        self.soft_close_channel(user_channel_id, true)
+    }
+
+    /// Soft-closes a channel one listing left out; its books stay open, as the channel may be listed and saved again.
+    pub fn mark_unlisted_channel_closed(&self, user_channel_id: &str) -> SqliteResult<()> {
+        self.soft_close_channel(user_channel_id, false)
+    }
+
     /// Soft-close a channel row: set `closed_at` to now if not already set.
     /// Idempotent — preserves the original close time on subsequent calls so
     /// the audit trail stays meaningful.
-    pub fn mark_channel_closed(&self, user_channel_id: &str) -> SqliteResult<()> {
+    fn soft_close_channel(&self, user_channel_id: &str, close_books: bool) -> SqliteResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let mut mirror = None;
+        let mut closed_books = None;
         let result: SqliteResult<()> = (|| {
             let before: Option<(String, f64, i64, i64)> = conn
                 .query_row(
@@ -2505,6 +2552,9 @@ impl Database {
                  WHERE user_channel_id = ?1 AND closed_at IS NULL",
                 params![user_channel_id],
             )?;
+            if close_books {
+                closed_books = booked_balance::close_and_capture(&conn, user_channel_id, Utc::now().timestamp_millis())?;
+            }
             if updated == 0 {
                 return Ok(());
             }
@@ -2551,6 +2601,7 @@ impl Database {
             if let Some((draft, event_id)) = mirror {
                 crate::audit::mirror_committed_ledger_event(&draft, event_id);
             }
+            booked_balance::mirror(closed_books);
         }
         committed
     }
@@ -4875,7 +4926,7 @@ impl Database {
         let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
         let conn = self.conn.lock().unwrap();
         let mut statement = conn.prepare(
-            "SELECT settlement_id, payment_id, amount_msat, envelope
+            "SELECT settlement_id, payment_id, amount_msat, envelope, channel_id
              FROM inbound_stability_settlements
              WHERE state = 'pending'
              ORDER BY created_at ASC, settlement_id ASC
@@ -4890,6 +4941,7 @@ impl Database {
                 Ok(PendingInboundStabilitySettlement {
                     settlement_id: row.get(0)?,
                     payment_id: row.get(1)?,
+                    channel_id: row.get(4)?,
                     amount_msat,
                     envelope: row.get(3)?,
                 })
@@ -5106,10 +5158,27 @@ impl Database {
             refs,
         };
         let ledger_outcome = ledger::append_on_connection(&tx, &draft)?;
+        // The user's side gets the whole top-up; a pay-back of part of it is booked as its own payment.
+        let books = match user_channel_id_value(&user_channel_id) {
+            Some(uid) => {
+                let change = BookChange {
+                    user_channel_id: uid,
+                    delta_msat: top_up_sats.saturating_mul(1000),
+                    reason: BookReason::TopUpClaimed,
+                    evidence: payment_id.to_owned(),
+                    cursor: None,
+                    channel_value_sats: None,
+                    detail: serde_json::json!({ "top_up_sats": top_up_sats, "amount_msat": amount_msat }),
+                };
+                booked_balance::book_and_capture(&tx, &change, Utc::now().timestamp_millis())?.1
+            }
+            None => None,
+        };
         tx.commit()?;
         if ledger_outcome.inserted {
             crate::audit::mirror_committed_ledger_event(&draft, ledger_outcome.event_id);
         }
+        booked_balance::mirror(books);
         Ok(Some(StabilityTopUpClaim {
             user_channel_id,
             top_up_sats: top_up_sats as u64,
@@ -5640,11 +5709,11 @@ impl Database {
         rows.collect()
     }
 
-    /// Return the stored `user_channel_id` for a payment_id, or None if absent/NULL/not found.
+    /// Return the stored `user_channel_id` for a payment_id, or None if absent/NULL/not found. A refund's channel is kept for its booking only, so it is not returned.
     pub fn get_settlement_channel(&self, payment_id: &str) -> SqliteResult<Option<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT user_channel_id FROM settlement_payments WHERE payment_id = ?1",
+            "SELECT user_channel_id FROM settlement_payments WHERE payment_id = ?1 AND kind <> 'refund'",
         )?;
         let mut rows = stmt.query(params![payment_id])?;
         if let Some(row) = rows.next()? {
@@ -5652,6 +5721,60 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    /// The channel of a SYNC, fee refund, trade response or send-time top-up the LSP sent to a user; a top-up booked on claim is left to its claim.
+    pub fn lsp_payment_channel(&self, payment_id: &str) -> SqliteResult<Option<u128>> {
+        const REFUND_CLAIM: &str = "SELECT d.user_channel_id FROM trade_fee_refunds r
+             JOIN trade_decisions d ON d.inbound_payment_id = r.trade_payment_id WHERE r.refund_payment_id = ?1";
+        let conn = self.conn.lock().unwrap();
+        // Only a top-up sent the old way carries a backing transition; a pay-back the user sent never does.
+        let settlement: Option<Option<String>> = conn
+            .query_row(
+                "SELECT user_channel_id FROM settlement_payments
+                 WHERE payment_id = ?1 AND (kind IN ('sync', 'refund')
+                    OR (kind = 'stability' AND top_up_sats IS NULL AND backing_sats_after IS NOT NULL))",
+                params![payment_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut user_channel_id = match settlement.flatten() {
+            Some(user_channel_id) => Some(user_channel_id),
+            None => conn
+                .query_row(
+                    "SELECT user_channel_id FROM trade_decisions WHERE response_payment_id = ?1",
+                    params![payment_id],
+                    |row| row.get(0),
+                )
+                .optional()?,
+        };
+        if user_channel_id.is_none() {
+            // A refund's claim holds its payment id from before the send, so an outcome that beats its settlement row still finds the channel.
+            user_channel_id = conn.query_row(REFUND_CLAIM, params![payment_id], |row| row.get(0)).optional()?;
+        }
+        Ok(user_channel_id.as_deref().and_then(user_channel_id_value))
+    }
+
+    /// Channels with a payment from the LSP whose outcome is not known yet: a SYNC, a top-up sent the old way, a fee refund claimed or sent, or a trade response; rows from before `since` (unix seconds) do not count, as a failed refund's row is never marked.
+    pub fn channels_awaiting_lsp_payment(&self, since: i64) -> SqliteResult<HashSet<u128>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT user_channel_id FROM settlement_payments
+             WHERE outcome = 'pending' AND user_channel_id IS NOT NULL AND recorded_at >= ?1
+               AND (kind IN ('sync', 'refund') OR (kind = 'stability' AND top_up_sats IS NULL AND backing_sats_after IS NOT NULL))
+             UNION
+             SELECT d.user_channel_id FROM trade_fee_refunds r JOIN trade_decisions d ON d.inbound_payment_id = r.trade_payment_id
+             WHERE r.created_at >= ?1
+               AND (r.refund_payment_id IS NULL OR NOT EXISTS (SELECT 1 FROM settlement_payments s WHERE s.payment_id = r.refund_payment_id))
+             UNION
+             SELECT user_channel_id FROM trade_decisions WHERE response_status = 'in_flight'",
+        )?;
+        let rows = stmt.query_map(params![since], |row| row.get::<_, String>(0))?;
+        let mut channels = HashSet::new();
+        for row in rows {
+            channels.extend(user_channel_id_value(&row?));
+        }
+        Ok(channels)
     }
 
     /// List recorded settlements as (payment_id, kind) pairs, oldest first.
@@ -5786,7 +5909,7 @@ mod tests {
         assert_eq!(db.claim_trade_fee_refund("trade-1", 1_000_000, "02ab", 100, None).unwrap(), None, "first claim wins");
         let existing = db.claim_trade_fee_refund("trade-1", 1_000_000, "02ab", 101, Some("ignored")).unwrap().expect("second claim sees the row");
         assert_eq!(existing.refund_payment_id, None);
-        db.record_trade_fee_refund_payment("trade-1", "refund-1").unwrap();
+        db.record_trade_fee_refund_payment("trade-1", "refund-1", "7").unwrap();
         assert!(!db.retake_failed_trade_fee_refund("trade-1", "other", 102).unwrap(), "only the recorded payment can be retaken");
         assert!(db.retake_failed_trade_fee_refund("trade-1", "refund-1", 103).unwrap());
         assert!(!db.retake_failed_trade_fee_refund("trade-1", "refund-1", 104).unwrap(), "a retake happens once");
@@ -5795,7 +5918,7 @@ mod tests {
         db.claim_trade_fee_refund("trade-2", 5_000, "02cd", 200, Some("expected-2")).unwrap();
         db.release_trade_fee_refund("trade-2", Some("other")).unwrap();
         assert_eq!(db.list_trade_fee_refunds().unwrap().len(), 1, "a claim with a different id is not released");
-        db.record_trade_fee_refund_payment("trade-2", "refund-2").unwrap();
+        db.record_trade_fee_refund_payment("trade-2", "refund-2", "7").unwrap();
         db.release_trade_fee_refund("trade-2", Some("expected-2")).unwrap();
         let rows = db.list_trade_fee_refunds().unwrap();
         assert_eq!(rows.len(), 1, "a sent refund is never released");
@@ -8551,6 +8674,130 @@ mod tests {
         assert_eq!(settlement_outcome(&db), "pending");
     }
 
+    const BOOKED_UID: u128 = 189_476_124_653_200_987_495_269_098_788_434_301_048;
+
+    fn booked_changes(db: &Database) -> Vec<serde_json::Value> {
+        let conn = db.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT detail_json FROM ledger_events WHERE event_type = 'BOOKED_BALANCE_CHANGED' ORDER BY id").unwrap();
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+        rows.map(|row| serde_json::from_str(&row.unwrap()).unwrap()).collect()
+    }
+
+    #[test]
+    fn a_claimed_top_up_is_booked_in_the_same_transaction() {
+        let db = Database::open_in_memory().unwrap();
+        let uid = BOOKED_UID.to_string();
+        db.save_channel("physical", &uid, 10.0, 10_000, 5_000, None).unwrap();
+        assert!(db.anchor_booked_balance(BOOKED_UID, "physical", 15_000_000, 100_000, ForwardCursor::default(), serde_json::json!({})).unwrap());
+        top_up_in_flight(&db, &uid);
+        // The wallet paid 500 sats back while it was on the way: backing takes the rest, the user's side still gets all of it.
+        assert_eq!(db.offset_stability_top_up_on_the_way(&uid, 500).unwrap(), 500);
+        db.conn.lock().unwrap().execute_batch(
+            "CREATE TRIGGER inject_books_failure BEFORE INSERT ON ledger_events WHEN NEW.event_type = 'BOOKED_BALANCE_CHANGED'
+             BEGIN SELECT RAISE(ABORT, 'injected books failure'); END;",
+        ).unwrap();
+        assert!(db.claim_stability_top_up("top-up", Some(2_500_000), None).is_err(), "the books are part of the claim");
+        assert_eq!(settlement_outcome(&db), "pending");
+        assert_eq!(db.load_channel(&uid).unwrap().unwrap().backing_sats, 10_000);
+        assert_eq!(db.booked_balance(BOOKED_UID).unwrap().unwrap().booked_user_msat, 15_000_000);
+        db.conn.lock().unwrap().execute_batch("DROP TRIGGER inject_books_failure;").unwrap();
+
+        assert_eq!(db.claim_stability_top_up("top-up", Some(2_500_000), None).unwrap().unwrap().booked_sats, 2_000);
+        assert!(db.claim_stability_top_up("top-up", Some(2_500_000), None).unwrap().is_none());
+        let changes = booked_changes(&db);
+        assert_eq!(changes.len(), 1);
+        assert_eq!((&changes[0]["reason"], &changes[0]["evidence"], &changes[0]["delta_msat"]), (&serde_json::json!("top_up_claimed"), &serde_json::json!("top-up"), &serde_json::json!(2_500_000)));
+        assert_eq!(db.booked_balance(BOOKED_UID).unwrap().unwrap().booked_user_msat, 15_000_000 + 2_500_000);
+        assert_eq!(db.load_channel(&uid).unwrap().unwrap().backing_sats, 12_000);
+    }
+
+    #[test]
+    fn only_payments_the_lsp_sent_to_a_user_are_found_for_the_books() {
+        let db = Database::open_in_memory().unwrap();
+        let uid = BOOKED_UID.to_string();
+        db.save_channel("physical", &uid, 10.0, 10_000, 5_000, None).unwrap();
+        db.record_sync_payment("sync", &uid, 1).unwrap();
+        db.record_settlement("trade", "trade").unwrap();
+        assert!(db.persist_trade_rejection("trade", "trade-1", "hash", "physical", &uid, "02cd", "quote_expired", 100, "{}").unwrap());
+        assert!(db.mark_trade_response_in_flight("trade", "reply").unwrap());
+        db.claim_trade_fee_refund("trade", 5_000, "02cd", 100, Some("refund")).unwrap();
+        db.record_trade_fee_refund_payment("trade", "refund", &uid).unwrap();
+        assert!(db
+            .record_stability_settlement_with_rollback("sent-the-old-way", &uid, "physical", 10_000, 12_500, 5_000, 10.0, 0, 2_500_000, "lsp_to_user", "counterparty", None)
+            .unwrap());
+        top_up_in_flight(&db, &uid);
+        db.record_settlement_with_channel("pay-back", "stability", &uid).unwrap();
+        for payment_id in ["sync", "reply", "refund", "sent-the-old-way"] {
+            assert_eq!(db.lsp_payment_channel(payment_id).unwrap(), Some(BOOKED_UID), "{payment_id}");
+        }
+        // A top-up is booked by its claim, and the rest are payments the user sent or not stable payments at all.
+        for payment_id in ["top-up", "pay-back", "trade", "elsewhere"] {
+            assert_eq!(db.lsp_payment_channel(payment_id).unwrap(), None, "{payment_id}");
+        }
+        assert_eq!(db.get_settlement_channel("refund").unwrap(), None, "a failed refund is still logged without a channel");
+        assert_eq!(db.get_settlement_channel("sync").unwrap(), Some(uid));
+    }
+
+    #[test]
+    fn channels_waiting_for_the_outcome_of_an_lsp_payment_are_found() {
+        let db = Database::open_in_memory().unwrap();
+        let (syncing, refunding, replying, old_way, idle): (u128, u128, u128, u128, u128) = (
+            189_476_124_653_200_987_495_269_098_788_434_301_048,
+            62_017_533_480_118_296_655_802_247_309_961_417_623,
+            301_558_946_207_734_119_840_266_513_078_092_554_071,
+            97_864_210_335_670_481_925_113_768_402_659_870_316,
+            245_093_118_776_402_563_981_150_437_826_014_779_582,
+        );
+        let now = chrono::Utc::now().timestamp();
+        let waiting = |db: &Database| {
+            let mut found: Vec<u128> = db.channels_awaiting_lsp_payment(now - 3_600).unwrap().into_iter().collect();
+            found.sort_unstable();
+            found
+        };
+        let sorted = |mut uids: Vec<u128>| {
+            uids.sort_unstable();
+            uids
+        };
+        assert!(waiting(&db).is_empty());
+
+        db.record_sync_payment("8a0f4c2e6b1d9e3f7a5c0b2d4e6f8a1c3e5b7d9f0a2c4e6b8d1f3a5c7e9b0d2f", &syncing.to_string(), 1).unwrap();
+        let refund_trade = "3f9a6c1e8b2d7f4a0c5e9b3d1f6a8c2e4b7d0f9a3c6e1b8d5f2a7c4e0b9d6f13";
+        let refund_id = "c4d7e0a3b6f9c2e5a8d1b4f7e0c3a6d9b2e5f8a1c4d7e0b3a6f9c2d5e8b1a4f7";
+        assert!(db.persist_trade_rejection(refund_trade, "trade-1", "hash", "physical", &refunding.to_string(), "02cd", "quote_expired", now, "{}").unwrap());
+        assert!(db.claim_trade_fee_refund(refund_trade, 5_000, "02cd", now, Some(refund_id)).unwrap().is_none());
+        let reply_trade = "d2b5e8a1c4f7b0d3e6a9c2f5b8e1d4a7c0f3b6e9d2a5c8f1b4e7a0d3c6f9b2e5";
+        let reply_id = "1e4b7d0a3c6f9e2b5d8a1c4f7b0e3d6a9c2f5e8b1d4a7c0f3e6b9d2a5c8f1e4b";
+        assert!(db.persist_trade_rejection(reply_trade, "trade-2", "hash", "physical", &replying.to_string(), "02ef", "quote_expired", now, "{}").unwrap());
+        assert!(db.mark_trade_response_in_flight(reply_trade, reply_id).unwrap());
+        db.save_channel("physical", &old_way.to_string(), 10.0, 10_000, 5_000, None).unwrap();
+        let old_way_id = "5b8e1d4a7c0f3b6e9d2a5c8f1b4e7a0d3c6f9b2e5d8a1c4f7b0e3d6a9c2f5e8b";
+        assert!(db
+            .record_stability_settlement_with_rollback(old_way_id, &old_way.to_string(), "physical", 10_000, 12_500, 5_000, 10.0, 0, 2_500_000, "lsp_to_user", "02ab", None)
+            .unwrap());
+        // A top-up booked on claim and a pay-back the user sent are no outcome to wait for here.
+        top_up_in_flight(&db, &idle.to_string());
+        db.record_settlement_with_channel("7c0f3b6e9d2a5c8f1b4e7a0d3c6f9b2e5d8a1c4f7b0e3d6a9c2f5e8b1d4a7c0f", "stability", &idle.to_string()).unwrap();
+        assert_eq!(waiting(&db), sorted(vec![syncing, refunding, replying, old_way]), "a refund claimed but not yet recorded is open");
+
+        db.record_trade_fee_refund_payment(refund_trade, refund_id, &refunding.to_string()).unwrap();
+        assert!(waiting(&db).contains(&refunding), "and once recorded until its outcome");
+        for payment_id in ["8a0f4c2e6b1d9e3f7a5c0b2d4e6f8a1c3e5b7d9f0a2c4e6b8d1f3a5c7e9b0d2f", refund_id, old_way_id] {
+            assert!(db.mark_settlement_succeeded(payment_id, Some(1), None, Some("outbound")).unwrap(), "{payment_id}");
+        }
+        assert!(db.mark_trade_response_delivered(reply_id, now).unwrap());
+        assert!(waiting(&db).is_empty());
+
+        // A failed refund's row stays pending, so it stops counting an hour after it was sent.
+        let failed_trade = "9e2b5d8a1c4f7b0e3d6a9c2f5e8b1d4a7c0f3e6b9d2a5c8f1e4b7d0a3c6f9e2b";
+        let failed_id = "a6d9b2e5f8a1c4d7e0b3a6f9c2d5e8b1a4f7c0d3e6a9b2f5c8e1d4a7b0f3c6e9";
+        assert!(db.persist_trade_rejection(failed_trade, "trade-3", "hash", "physical", &refunding.to_string(), "02cd", "quote_expired", now, "{}").unwrap());
+        assert!(db.claim_trade_fee_refund(failed_trade, 5_000, "02cd", now - 7_200, Some(failed_id)).unwrap().is_none());
+        db.record_trade_fee_refund_payment(failed_trade, failed_id, &refunding.to_string()).unwrap();
+        assert_eq!(waiting(&db), vec![refunding]);
+        db.conn.lock().unwrap().execute("UPDATE settlement_payments SET recorded_at = ?1 WHERE payment_id = ?2", params![now - 7_200, failed_id]).unwrap();
+        assert!(waiting(&db).is_empty());
+    }
+
     #[test]
     fn generic_ledger_append_rolls_back_event_when_reference_insert_fails() {
         let db = Database::open_in_memory().unwrap();
@@ -9195,5 +9442,59 @@ mod tests {
         let QueueSpliceOutcome::Queued(row) = db.queue_splice_in("9", "peer", 1, 110, 0, "", None).unwrap() else { panic!("queued") };
         db.mark_queued_splice_locked("9", row.request_id, "bb:1", 111).unwrap();
         assert!(db.close_queued_splice_channel("9", "the channel closed", true, 112).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_splice_is_the_lsps_by_its_negotiation_its_queued_funding_or_a_note_newer_than_the_books() {
+        let db = Database::open_in_memory().unwrap();
+        let uid: u128 = 189476124653200987495269098788434301048;
+        let key = uid.to_string();
+        let channel_id = "c11ceecf75fcf7e365a0b9ff9c3432e5c296fec25e6f67834f5726e4d6e5ebaa";
+        let peer = "02f79713acb95af7a3213f69f5d08d7c11abbfa2aa12f90025c818e41aac782324";
+        let before = "be859468d6051544a13110383786b959c4d88a602c99dbc870ce9ffaa855e5e0:0";
+        let negotiated = "18421e773d8d839b83196331d7687fb2681939520af61de5cb65fb39b04a8ff3:1";
+        let users = "f39cc5760e8936073c8fb24e17ad8fb4573ced71a79e3ed4506f1a5a831ced27:1";
+        let QueueSpliceOutcome::Queued(row) = db.queue_splice_in(&key, peer, 50_000, 100, 0, "", None).unwrap() else { panic!("queued") };
+        db.mark_queued_splice_splicing(&key, row.request_id, Some(before), 100_000, 50_000, 101).unwrap();
+        assert!(!db.lsp_made_splice(uid, negotiated, 100_000, 150_000).unwrap(), "no funding noted until the node negotiates");
+        db.note_queued_splice_negotiated(&key, row.request_id, negotiated, 102).unwrap();
+        assert!(db.lsp_made_splice(uid, negotiated, 100_000, 150_000).unwrap(), "negotiated, before the job sees the lock");
+        assert!(!db.lsp_made_splice(uid, users, 100_000, 150_000).unwrap());
+        assert!(!db.lsp_made_splice(uid, "", 100_000, 150_000).unwrap());
+        db.mark_queued_splice_locked(&key, row.request_id, negotiated, 103).unwrap();
+        assert!(db.lsp_made_splice(uid, negotiated, 100_000, 150_000).unwrap(), "and once locked");
+
+        // The operator's splice-out by hand leaves no note or row, but the node reports a negotiation only to a node that contributed to it.
+        let operator_out = "ad9d2d8d4526a8e59add5fed56bfd930b171452ed9b28db8be2e3e12154b9976:0";
+        assert!(!db.lsp_made_splice(uid, operator_out, 150_000, 130_000).unwrap());
+        let reported = serde_json::json!({
+            "channel_id": channel_id, "user_channel_id": key, "counterparty_node_id": peer, "funding_txo": operator_out,
+            "dedup_key": format!("lsp:splice-negotiated:{key}:{operator_out}"),
+        });
+        db.append_ledger_event(&LedgerEventDraft::from_audit_event("SPLICE_NEGOTIATED", reported)).unwrap();
+        assert!(db.lsp_made_splice(uid, operator_out, 150_000, 130_000).unwrap());
+        assert!(!db.lsp_made_splice(uid, users, 150_000, 130_000).unwrap(), "a negotiation of another funding says nothing of this one");
+
+        // A splice-in by hand counts only while the value grows onto new funding and its note is newer than the books and every splice booked on them.
+        let now = chrono::Utc::now().timestamp();
+        db.anchor_booked_balance(uid, channel_id, 50_000_000, 150_000, ForwardCursor::default(), serde_json::json!({})).unwrap();
+        db.conn.lock().unwrap().execute("UPDATE booked_balances SET anchored_at_ms = ?1", params![(now - 7_200) * 1000]).unwrap();
+        db.note_manual_splice_unless(&key, before, now - 10_800, |_| false).unwrap();
+        assert!(!db.lsp_made_splice(uid, users, 150_000, 200_000).unwrap(), "a note older than the books is spent");
+        db.note_manual_splice_unless(&key, before, now - 3_600, |_| false).unwrap();
+        assert!(db.lsp_made_splice(uid, users, 150_000, 200_000).unwrap());
+        assert!(!db.lsp_made_splice(uid, users, 150_000, 130_000).unwrap(), "a splice-out inside the note's window is the user's");
+        assert!(!db.lsp_made_splice(uid, before, 150_000, 200_000).unwrap(), "the note's own funding is no new funding");
+        let splice = BookChange {
+            user_channel_id: uid,
+            delta_msat: 0,
+            reason: BookReason::Splice,
+            evidence: "4e3c1e43500e59fe492c8c2eb19f7ab8645a305d26770b548fd5e1ffea361bcf:1".into(),
+            cursor: None,
+            channel_value_sats: Some(200_000),
+            detail: serde_json::json!({}),
+        };
+        db.book(&splice).unwrap();
+        assert!(!db.lsp_made_splice(uid, users, 200_000, 250_000).unwrap(), "its splice is booked, so a later one is not it");
     }
 }

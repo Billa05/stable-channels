@@ -1,5 +1,6 @@
 mod auth;
 mod backfill;
+mod books;
 mod channel_audit;
 mod channel_close;
 mod config;
