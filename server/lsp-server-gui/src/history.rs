@@ -412,6 +412,12 @@ fn describe(events: &[ChannelLedgerEvent], channel: &str, amount: Option<u64>, t
 		"STABILITY_TOP_UP_LOOKUP_FAILED" => (EntryKind::Other, "Stability payment outcome could not be checked: verify this channel's books".to_owned()),
 		"SYNC_RETRY_EXHAUSTED" => (EntryKind::Sync, "Stopped retrying the balance sync".to_owned()),
 		"SYNC_RETRY_BLOCKED" => (EntryKind::Sync, "Balance sync blocked: the channel cannot carry it".to_owned()),
+		"BOOKED_BALANCE_PAUSED" => (EntryKind::Other, "Books paused".to_owned()),
+		"BOOKED_BALANCE_RESOLVED" => (EntryKind::Other, "Books gap resolved".to_owned()),
+		"BOOKED_BALANCE_CUT_DEFERRED" => (EntryKind::Other, "Spend cut deferred".to_owned()),
+		"BOOKED_BALANCE_NOT_STARTED" => (EntryKind::Other, "Books not started".to_owned()),
+		"BOOKED_BALANCE_CHECK_RESET" => (EntryKind::Other, "Books check reset".to_owned()),
+		"STABILITY_TOP_UP_HELD_BELOW_BACKING" => (EntryKind::Other, "Top-up held: balance below the stable part".to_owned()),
 		"CHANNEL_ACCOUNTING_STATE_COMMITTED"
 		| "STABLE_EDITED"
 		| "BACKSTOP_STABLE_DEDUCTED"
@@ -517,6 +523,17 @@ mod tests {
 		assert!(!is_routine(&attached[0]), "a channel's own recovery stays in the feed");
 		let other = build_entries(&[ev(1, "SOMETHING_NEW_HAPPENED", serde_json::json!({}), &[])], "");
 		assert!(!is_routine(&other[0]), "unknown events are never hidden");
+	}
+
+	#[test]
+	fn books_events_read_as_their_own_labels() {
+		let summary = |event: &str| build_entries(&[ev(1, event, serde_json::json!({}), &[("user_channel_id", "7")])], "7")[0].summary.clone();
+		assert_eq!(summary("BOOKED_BALANCE_PAUSED"), "Books paused");
+		assert_eq!(summary("BOOKED_BALANCE_RESOLVED"), "Books gap resolved");
+		assert_eq!(summary("BOOKED_BALANCE_CUT_DEFERRED"), "Spend cut deferred");
+		assert_eq!(summary("BOOKED_BALANCE_NOT_STARTED"), "Books not started");
+		assert_eq!(summary("BOOKED_BALANCE_CHECK_RESET"), "Books check reset");
+		assert_eq!(summary("STABILITY_TOP_UP_HELD_BELOW_BACKING"), "Top-up held: balance below the stable part");
 	}
 
 	#[test]

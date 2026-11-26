@@ -25,7 +25,7 @@ use sc_rest_client::sc_protos::revenue::{GetRevenueRequest, RefundTradeFeeReques
 use sc_rest_client::sc_protos::stable::{
 	EditStableChannelRequest, GetPriceRequest, ListChannelLedgerEventsRequest,
 	ListChannelLedgerEventsResponse, ListSettlementPaymentsRequest, ListStableChannelsRequest,
-	LogRequest, ReleaseStabilityPaymentRequest,
+	LogRequest, ReleaseStabilityPaymentRequest, ResolveBooksGapRequest, ResolveBooksGapResponse,
 };
 
 use crate::ledger::{checked_next_cursor, merge_ledger_events};
@@ -1344,6 +1344,77 @@ pub fn release_stability_payment(ctx: AppCtx, arrived: bool) {
 				invalidate_channel_ledger(ctx);
 				fetch_channel_ledger(ctx, false);
 				fetch_stable_channels(ctx);
+			} else {
+				ctx.error(v.status);
+			}
+		},
+	);
+}
+
+/// The request for the dialog's choice: a preview asks for the figures, and a confirm echoes the figures previewed for that same choice; None until a choice is picked.
+pub(crate) fn books_resolution_request(form: &crate::state::ResolveBooksGapForm, confirm: bool) -> Option<ResolveBooksGapRequest> {
+	let choice = form.choice?;
+	let shown = form.preview.as_ref().filter(|preview| confirm && preview.choice == choice).map(|preview| &preview.figures);
+	Some(ResolveBooksGapRequest {
+		channel_id: form.channel_id.clone(),
+		choice,
+		acknowledged: shown.is_some(),
+		reason: Some(form.reason.trim().to_owned()).filter(|reason| !reason.is_empty()),
+		expected_actual_sats: shown.map(|figures| figures.actual_sats),
+		expected_gap_sats: shown.map(|figures| figures.gap_sats),
+		expected_new_expected_usd: shown.and_then(|figures| figures.new_expected_usd),
+		expected_new_backing_sats: shown.and_then(|figures| figures.new_backing_sats),
+	})
+}
+
+/// Show the daemon's figures for a choice, unless the dialog has moved on to another channel or choice since they were asked for.
+pub(crate) fn preview_books_resolution(
+	form: &mut crate::state::ResolveBooksGapForm, requested_channel_id: &str, choice: i32, figures: ResolveBooksGapResponse,
+) -> bool {
+	if form.channel_id != requested_channel_id || form.choice != Some(choice) {
+		return false;
+	}
+	form.preview = Some(crate::state::BooksPreview { choice, figures });
+	true
+}
+
+/// Reset the dialog after a resolution went through, unless it has moved on to another channel since; returns whether it should close.
+pub(crate) fn finish_books_resolution(form: &mut crate::state::ResolveBooksGapForm, requested_channel_id: &str) -> bool {
+	if form.channel_id != requested_channel_id {
+		return false;
+	}
+	*form = Default::default();
+	true
+}
+
+/// Sends the operator's choice for a paused channel's gap; the daemon first returns the figures, and applies the choice only to the figures a confirm echoes.
+pub fn resolve_books_gap(ctx: AppCtx, confirm: bool) {
+	if busy(ctx, Op::ResolveBooksGap) {
+		return;
+	}
+	let Some(client) = client(ctx) else { return };
+	let form = ctx.forms.peek().resolve_books_gap.clone();
+	let Some(request) = books_resolution_request(&form, confirm) else { return };
+	let (requested_channel_id, choice) = (form.channel_id, request.choice);
+	run(
+		ctx,
+		Op::ResolveBooksGap,
+		async move { client.resolve_books_gap(request).await },
+		move |ctx, v| {
+			let mut forms = ctx.forms;
+			if v.needs_acknowledgement {
+				// Nothing changed: these figures, fresh when they moved since the preview, are the ones to confirm.
+				preview_books_resolution(&mut forms.write().resolve_books_gap, &requested_channel_id, choice, v);
+			} else if v.ok {
+				ctx.success(v.status);
+				// The dialog may by now be open for another channel, which this resolution must not close.
+				if finish_books_resolution(&mut forms.write().resolve_books_gap, &requested_channel_id) {
+					close_dialog(ctx);
+				}
+				// Reload the table and the history so the resolution shows.
+				fetch_stable_channels(ctx);
+				invalidate_channel_ledger(ctx);
+				fetch_channel_ledger(ctx, false);
 			} else {
 				ctx.error(v.status);
 			}

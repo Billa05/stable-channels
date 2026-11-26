@@ -13,8 +13,8 @@ use ldk_server_client::ldk_server_grpc::api::{
     ListChannelsRequest, ListChannelsResponse, ListForwardedPaymentsRequest,
     ListForwardedPaymentsResponse, ListPeersRequest, ListPeersResponse, ListPaymentsRequest,
     ListPaymentsResponse, SignMessageRequest, SignMessageResponse, SpliceInRequest,
-    SpliceInResponse, SpontaneousSendRequest, SpontaneousSendResponse, VerifySignatureRequest,
-    VerifySignatureResponse,
+    SpliceInResponse, SpliceOutRequest, SpliceOutResponse, SpontaneousSendRequest, SpontaneousSendResponse,
+    VerifySignatureRequest, VerifySignatureResponse,
 };
 use ldk_server_client::ldk_server_grpc::events::ChannelStateChangeReason;
 use ldk_server_client::ldk_server_grpc::types::{Channel, CustomTlvRecord, PaymentStatus};
@@ -23,7 +23,8 @@ use stable_channels::constants::{
     STABILITY_PAYMENT_AUTH_TTL_SECS,
 };
 use stable_channels::db::{
-    BookChange, BookOutcome, BookReason, Database, ForwardCursor, InboundStabilityRegistration, PendingTradeResponse,
+    BookChange, BookOutcome, BookReason, BookedBalance, CheckState, Database, ForwardCursor, GapChoice, GapDirection, GapResolution,
+    InboundStabilityRegistration, PendingTradeResponse, UncutSpends,
 };
 use stable_channels::stable::StabilityPaymentDirection;
 use stable_channels::trade::TradeRejectionReason;
@@ -83,6 +84,26 @@ fn unresolved_user_payments_msat(
     held
 }
 
+/// Msat per channel id in payments to the user that have not resolved, the LSP's own and forwarded alike, as the node's channel monitors list them: an entry with the whole sats of each HTLC, and the sub-sat parts and dust HTLCs in the channel's rounded totals.
+fn unresolved_payments_to_user_msat(
+    balances: &[ldk_server_client::ldk_server_grpc::types::LightningBalance],
+) -> std::collections::HashMap<String, u64> {
+    use ldk_server_client::ldk_server_grpc::types::lightning_balance::BalanceType;
+    let mut paying: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for balance in balances {
+        let (channel_id, msat) = match balance.balance_type.as_ref() {
+            Some(BalanceType::MaybeTimeoutClaimableHtlc(htlc)) => (&htlc.channel_id, htlc.amount_satoshis.saturating_mul(1000)),
+            Some(BalanceType::ClaimableOnChannelClose(open)) => {
+                (&open.channel_id, open.outbound_payment_htlc_rounded_msat.saturating_add(open.outbound_forwarded_htlc_rounded_msat))
+            }
+            _ => continue,
+        };
+        let total = paying.entry(channel_id.clone()).or_insert(0);
+        *total = total.saturating_add(msat);
+    }
+    paying
+}
+
 /// Trade-entry backstop only. Inbound capacity is the user's post-payment spendable balance;
 /// neither the LSP's reserve nor the fee may be subtracted from it again.
 fn max_stabilization_rejected(
@@ -126,6 +147,87 @@ fn books_db_failed(read: bool, op: &str, uid: u128, channel_id: &str, error: &ru
     } else {
         stable_channels::audit::audit_event("DB_WRITE_FAILED", detail);
     }
+}
+
+/// The user's balance by the channel's open books, in msat; None when it has none or they cannot be read.
+fn booked_user_msat(db: &Database, uid: u128) -> Option<u64> {
+    match db.booked_balance(uid) {
+        Ok(Some(books)) if books.closed_at.is_none() => Some(books.booked_user_msat),
+        Ok(_) => None,
+        Err(e) => {
+            books_db_failed(true, "booked_balance", uid, "", &e);
+            None
+        }
+    }
+}
+
+/// What holds money going to a channel: its books, or a balance that with its held payments returned is below the backing; `books_hold` never returns the last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BooksHold {
+    Paused,
+    GapBelow,
+    Unreadable,
+    NoBooks,
+    BalanceBelowBacking,
+}
+
+impl BooksHold {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Paused => "paused",
+            Self::GapBelow => "gap_below",
+            Self::Unreadable => "books_unreadable",
+            Self::NoBooks => "no_books",
+            Self::BalanceBelowBacking => "balance_below_backing",
+        }
+    }
+}
+
+/// What holds money going to a channel on its books: a pause, a gap below being watched, books that cannot be read, or no books yet; None when nothing does.
+fn books_hold(db: &Database, uid: u128) -> Option<BooksHold> {
+    match db.booked_balance(uid) {
+        Ok(Some(books)) if books.closed_at.is_none() => match (books.check.state, books.check.direction) {
+            (CheckState::Paused, _) => Some(BooksHold::Paused),
+            (CheckState::Watching, Some(GapDirection::Below)) => Some(BooksHold::GapBelow),
+            _ => None,
+        },
+        Ok(_) => Some(BooksHold::NoBooks),
+        Err(e) => {
+            books_db_failed(true, "booked_balance", uid, "", &e);
+            Some(BooksHold::Unreadable)
+        }
+    }
+}
+
+/// The backing above the live balance an operator saw when keeping the channel's open books, no more than the gaps the books check still keeps, in msat; 0 without open books, and when they cannot be read.
+fn accepted_shortfall_msat(db: &Database, uid: u128, channel_id: &str) -> u64 {
+    match db.booked_balance(uid) {
+        Ok(Some(books)) if books.closed_at.is_none() => {
+            // The books check clears the gaps it kept once the balance meets the books and backing again, and the kept shortfall stops counting with them.
+            books.accepted_shortfall_msat.min(books.check.accepted_gap_msat.saturating_add(books.check.accepted_backing_gap_msat))
+        }
+        Ok(_) => 0,
+        Err(e) => {
+            books_db_failed(true, "booked_balance", uid, channel_id, &e);
+            0
+        }
+    }
+}
+
+/// Whether the channel's open books mark a spend uncut; None when they cannot be read.
+fn spend_waits_to_be_cut(db: &Database, uid: u128) -> Option<bool> {
+    match db.booked_balance(uid) {
+        Ok(books) => Some(books.is_some_and(|books| books.closed_at.is_none() && books.uncut.is_some())),
+        Err(e) => {
+            books_db_failed(true, "booked_balance", uid, "", &e);
+            None
+        }
+    }
+}
+
+/// Whether the channel's books are paused; books that cannot be read count as paused.
+pub(crate) fn books_paused(db: &Database, uid: u128) -> bool {
+    matches!(books_hold(db, uid), Some(BooksHold::Paused | BooksHold::Unreadable))
 }
 
 fn splice_balance_change(before_sats: u64, after_sats: u64) -> (&'static str, u64) {
@@ -269,6 +371,13 @@ pub trait LdkServerCalls: Send + Sync {
     ) -> Result<SpliceInResponse, LdkServerError> {
         Err(LdkServerError::new(LdkServerErrorCode::InternalError, "splice_in is not available on this node client"))
     }
+    /// Splice part of the LSP's side of a channel out to an on-chain address.
+    async fn splice_out(
+        &self,
+        _req: SpliceOutRequest,
+    ) -> Result<SpliceOutResponse, LdkServerError> {
+        Err(LdkServerError::new(LdkServerErrorCode::InternalError, "splice_out is not available on this node client"))
+    }
     async fn get_channel_forwarding_stats(
         &self,
         _req: GetChannelForwardingStatsRequest,
@@ -354,6 +463,9 @@ impl LdkServerCalls for crate::ldk_client::LdkClient {
     async fn splice_in(&self, req: SpliceInRequest) -> Result<SpliceInResponse, LdkServerError> {
         crate::ldk_client::LdkClient::splice_in(self, req).await
     }
+    async fn splice_out(&self, req: SpliceOutRequest) -> Result<SpliceOutResponse, LdkServerError> {
+        crate::ldk_client::LdkClient::splice_out(self, req).await
+    }
     async fn get_channel_forwarding_stats(
         &self,
         req: GetChannelForwardingStatsRequest,
@@ -377,36 +489,18 @@ struct PendingBookUpdate {
     context: &'static str,
     audits: Vec<(&'static str, serde_json::Value)>,
     needs_sync: bool,
+    /// Some for a cut taken from the books, saved as a spend, with the spends marked uncut that the same save clears.
+    clears_uncut: Option<UncutSpends>,
 }
 
-/// A run of regular ticks that found a stable channel's balance below its backing.
-#[derive(Debug, Default)]
-struct SpendCheck {
-    /// Ticks whose balance report showed the shortfall; a tick without the report leaves the count as it is.
-    sightings: u8,
-    /// The shortfall the first of them showed, so a payment started after it is not charged on the next one.
-    seen_sats: u64,
-    /// Msat the user received into the channel since the check opened, which cannot cover a spend made before.
-    received_msat: u64,
-}
-
-/// The user's balance on `channel` with `held_msat` of their unresolved payments returned and without the msat they received during an open spend check.
-fn user_sats_without_received(channel: &Channel, held_msat: u64, received_msat: u64) -> u64 {
-    (channel.inbound_capacity_msat.saturating_add(held_msat).saturating_sub(received_msat) / 1000)
-        .saturating_add(channel.counterparty_unspendable_punishment_reserve)
-}
-
-/// Ends the spend check on a channel whose balance, without what the user received during it, covers the backing again.
-fn close_spend_check_if_covered(
-    checks: &mut std::collections::HashMap<u128, SpendCheck>,
-    uid: u128,
-    channel: &Channel,
-    backing_sats: u64,
-) {
-    let received_msat = checks.get(&uid).map_or(0, |check| check.received_msat);
-    if user_sats_without_received(channel, 0, received_msat) >= backing_sats {
-        checks.remove(&uid);
-    }
+/// What a splice-out no record names is weighed with, besides the listing that shows it.
+struct SpliceWeighing {
+    /// Msat on their way into or out of the user's side that the listing leaves out and the books do not hold yet: payments in flight either way and pay-backs still to be applied.
+    on_the_way_msat: u64,
+    /// LDK's forwarding totals for the channel.
+    totals: ForwardCursor,
+    /// Forwards on the channel still waiting in the event inbox.
+    queued: ForwardCursor,
 }
 
 /// A top-up with no outcome for longer than this is reported; it still waits for its outcome.
@@ -415,6 +509,8 @@ const STABILITY_TOP_UP_STALE_SECS: i64 = 3600;
 const TOP_UP_MAX_IN_FLIGHT_SECS: i64 = 14 * 86_400;
 /// How long a top-up alarm stays quiet before it is raised again while its cause lasts.
 const STABILITY_TOP_UP_ALARM_REPEAT_SECS: i64 = 86_400;
+/// Regular ticks a tracked channel may go without books before its daily alarm.
+const BOOKS_NOT_STARTED_TICKS: u32 = 60;
 /// How many times an event waits a second for the node to answer about a top-up before it is handled anyway.
 const TOP_UP_LOOKUP_ATTEMPTS: u32 = 3;
 
@@ -433,6 +529,16 @@ pub enum TopUpSettlement {
     NotOnTheWay,
     Booked,
     ChannelMissing,
+}
+
+/// The fee of a trade request waiting to be handled again, with what its refusal records.
+#[derive(Debug, Clone)]
+struct UndecidedTradeFee {
+    fee: BookChange,
+    channel_id: String,
+    user_channel_id: String,
+    counterparty: String,
+    request_hash: String,
 }
 
 /// Whether a received payment is dealt with, or must be handled again because LDK Server didn't answer a call its decision needs.
@@ -490,14 +596,18 @@ pub struct StableChannelManager {
     pending_book_updates: std::collections::HashMap<u128, PendingBookUpdate>,
     /// Per-channel last logged stability outcome + value, so run_tick only audits on state-change.
     stability_throttle: std::collections::HashMap<u128, (String, f64)>,
+    /// The user's side of each channel as a listing showed it since the books last moved, which alone an unsigned pay-back is matched against.
+    listed_user_sats: std::collections::HashMap<u128, u64>,
     /// Per-channel categories the books pass last logged, so a disagreement is logged once until it changes.
     books_log_throttle: std::collections::HashMap<u128, String>,
     /// Per-channel sats by which native from the books last differed from the stored native, so it is logged once until it changes.
     books_native_throttle: std::collections::HashMap<u128, u64>,
     /// The settled reading each channel without books had on the last books pass; the next pass anchors only if it reads the same.
     books_anchor_candidates: std::collections::HashMap<u128, (u64, ForwardCursor)>,
-    /// Per-channel open balance check for the balance-truth backstop debounce (ignores transient in-flight HTLCs).
-    spend_debounce: std::collections::HashMap<u128, SpendCheck>,
+    /// Regular ticks each tracked channel has gone without books, for the alarm when they never start.
+    books_waiting_ticks: std::collections::HashMap<u128, u32>,
+    /// Fees of trade requests waiting to be handled again, by payment id, refused should the event loop give a request up.
+    undecided_trade_fees: std::collections::HashMap<String, UndecidedTradeFee>,
     /// When each alarm for a top-up that keeps waiting was last raised, by (payment id, alarm), so it repeats daily and not every tick.
     top_up_alarms: std::collections::HashMap<(String, &'static str), i64>,
     /// Whether the last pass over the top-ups on the way could not read them or could not ask the node about one of them.
@@ -534,6 +644,43 @@ pub struct EditOutcome {
     pub ok: bool,
     pub status: String,
 }
+
+/// Outcome of a `resolve_books_gap` call. `needs_acknowledgement` means nothing was done yet: the figures and `status` say what the choice would do, for the operator to confirm.
+#[derive(Debug, PartialEq)]
+pub struct ResolveOutcome {
+    pub ok: bool,
+    pub status: String,
+    pub needs_acknowledgement: bool,
+    pub booked_sats: u64,
+    pub actual_sats: u64,
+    pub gap_sats: u64,
+    /// The target and backing the choice leaves; None when it leaves the channel as it is.
+    pub new_expected_usd: Option<f64>,
+    pub new_backing_sats: Option<u64>,
+}
+
+impl ResolveOutcome {
+    fn refused(status: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            status: status.into(),
+            needs_acknowledgement: false,
+            booked_sats: 0,
+            actual_sats: 0,
+            gap_sats: 0,
+            new_expected_usd: None,
+            new_backing_sats: None,
+        }
+    }
+}
+
+const NOTHING_TO_RESOLVE: &str = "Nothing to resolve on this channel.";
+/// What a resolution that would change the books or backing answers while a top-up to the user is on its way.
+const TOP_UP_ON_ITS_WAY: &str = "A top-up to this user is still on its way. Keep the books now, or try again once it settles.";
+/// What a resolution that would change the books or backing answers while a pay-back from the user is still to be applied.
+const PAY_BACK_TO_APPLY: &str = "A pay-back from this user is still to be applied. Keep the books now, or try again once it is applied.";
+/// The resolution route sits behind the shared HMAC key, so every resolution is recorded as the operator's.
+const RESOLVED_BY: &str = "operator";
 
 impl StableChannelManager {
     /// Keep the next event with its caller until earlier corrections commit. Return the lock
@@ -601,14 +748,26 @@ impl StableChannelManager {
             return true;
         };
         let sc = &pending.proposed;
-        if let Err(error) = self.db.save_channel(
-            &pending.channel_id,
-            &uid.to_string(),
-            sc.expected_usd.0,
-            sc.backing_sats,
-            sc.native_sats,
-            sc.note.as_deref(),
-        ) {
+        let saved = match pending.clears_uncut {
+            Some(clears_uncut) => self.db.save_channel_after_booked_spend(
+                &pending.channel_id,
+                &uid.to_string(),
+                sc.expected_usd.0,
+                sc.backing_sats,
+                sc.native_sats,
+                sc.note.as_deref(),
+                clears_uncut,
+            ),
+            None => self.db.save_channel(
+                &pending.channel_id,
+                &uid.to_string(),
+                sc.expected_usd.0,
+                sc.backing_sats,
+                sc.native_sats,
+                sc.note.as_deref(),
+            ),
+        };
+        if let Err(error) = saved {
             tracing::error!(
                 "[stable] pending {} save failed: {}",
                 pending.context,
@@ -627,10 +786,6 @@ impl StableChannelManager {
         self.stable_channels[idx] = pending.proposed;
         self.pending_book_updates.remove(&uid);
         self.pending_splices.remove(&uid);
-        // The backstop already left its check as the saved books need it.
-        if pending.context != "backstop" {
-            self.spend_debounce.remove(&uid);
-        }
         for (event, data) in pending.audits {
             stable_channels::audit::audit_event(event, data);
         }
@@ -823,7 +978,7 @@ impl StableChannelManager {
 
     #[allow(clippy::too_many_arguments)]
     async fn reject_correlated_trade(
-        &self,
+        &mut self,
         ldk: &dyn LdkServerCalls,
         inbound_payment_id: &str,
         correlation_payment_id: &str,
@@ -833,6 +988,7 @@ impl StableChannelManager {
         user_channel_id: &str,
         counterparty: &str,
         reason: TradeRejectionReason,
+        fee: Option<&BookChange>,
     ) -> Handled {
         let decided_at = Self::unix_time_secs();
         let payload = crate::messages::build_trade_rejected_payload(
@@ -859,12 +1015,19 @@ impl StableChannelManager {
                         "error": error.to_string(),
                     }),
                 );
-                // Nothing is decided yet, so the request can be handled again once LDK Server answers.
-                return if crate::ldk_client::unanswered(&error) { Handled::Retry } else { Handled::Done };
+                // Nothing is decided yet, so the request can be handled again once LDK Server answers; one that will not be handled again leaves its fee to cut.
+                if crate::ldk_client::unanswered(&error) {
+                    return Handled::Retry;
+                }
+                self.refuse_trade_fee(fee, channel_id, user_channel_id, counterparty, request_hash, reason.as_str(), None);
+                return Handled::Done;
             }
         };
         let envelope = crate::messages::build_envelope(payload, signature);
-        match self.db.persist_trade_rejection(
+        if let Some(fee) = fee {
+            self.listed_user_sats.remove(&fee.user_channel_id);
+        }
+        match self.db.persist_trade_rejection_with_fee(
             inbound_payment_id,
             trade_id,
             request_hash,
@@ -874,6 +1037,7 @@ impl StableChannelManager {
             reason.as_str(),
             decided_at,
             &envelope,
+            fee,
         ) {
             Ok(true) => stable_channels::audit::audit_event(
                 "TRADE_REJECTION_QUEUED",
@@ -888,16 +1052,40 @@ impl StableChannelManager {
                 }),
             ),
             Ok(false) => {}
-            Err(error) => stable_channels::audit::audit_event(
-                "DB_WRITE_FAILED",
-                serde_json::json!({
-                    "op": "persist_trade_rejection",
-                    "trade_id": trade_id,
-                    "error": error.to_string(),
-                }),
-            ),
+            Err(error) => {
+                stable_channels::audit::audit_event(
+                    "DB_WRITE_FAILED",
+                    serde_json::json!({
+                        "op": "persist_trade_rejection",
+                        "trade_id": trade_id,
+                        "error": error.to_string(),
+                    }),
+                );
+                // A rejection that could not be recorded still leaves its fee to cut.
+                self.refuse_trade_fee(fee, channel_id, user_channel_id, counterparty, request_hash, reason.as_str(), None);
+            }
         }
         Handled::Done
+    }
+
+    /// Refuses a trade fee no decision takes: its payment is recorded as rejected, so no later decision can take it, and the fee is booked marked for the tick to cut, with `record` in the same write.
+    #[allow(clippy::too_many_arguments)]
+    fn refuse_trade_fee(
+        &mut self,
+        fee: Option<&BookChange>,
+        channel_id: &str,
+        user_channel_id: &str,
+        counterparty: &str,
+        request_hash: &str,
+        reason_code: &str,
+        record: Option<&stable_channels::ledger::LedgerEventDraft>,
+    ) {
+        if let Some(fee) = fee {
+            self.listed_user_sats.remove(&fee.user_channel_id);
+            if let Err(e) = self.db.refuse_trade_fee(fee, channel_id, user_channel_id, counterparty, request_hash, reason_code, Self::unix_time_secs(), record) {
+                books_db_failed(false, "refuse_trade_fee", fee.user_channel_id, channel_id, &e);
+            }
+        }
     }
 
     /// Book a claimed top-up: the database marks it settled and adds its sats in one transaction, then the cache follows.
@@ -925,6 +1113,9 @@ impl StableChannelManager {
                 );
             }
             return Ok(TopUpSettlement::ChannelMissing);
+        }
+        if let Some(uid) = parse_user_channel_id(&claim.user_channel_id) {
+            self.listed_user_sats.remove(&uid);
         }
         self.top_up_alarms.retain(|(id, _), _| id != payment_id);
         if claim.after_release {
@@ -1237,10 +1428,12 @@ impl StableChannelManager {
             openings_on_record: std::collections::HashSet::new(),
             pending_book_updates: std::collections::HashMap::new(),
             stability_throttle: std::collections::HashMap::new(),
+            listed_user_sats: std::collections::HashMap::new(),
             books_log_throttle: std::collections::HashMap::new(),
             books_native_throttle: std::collections::HashMap::new(),
             books_anchor_candidates: std::collections::HashMap::new(),
-            spend_debounce: std::collections::HashMap::new(),
+            books_waiting_ticks: std::collections::HashMap::new(),
+            undecided_trade_fees: std::collections::HashMap::new(),
             top_up_alarms: std::collections::HashMap::new(),
             top_up_lookup_failed: false,
             top_ups_unresolved: Vec::new(),
@@ -1319,6 +1512,15 @@ impl StableChannelManager {
 
         // Snapshot of any existing record for patch fallback.
         let user_channel_id_str = channel.user_channel_id.clone();
+        // A target edit sets a new allocation, so a spend still marked uncut is cut first, or the edit is refused until it can be; without a price the edit is refused for the price below.
+        if let Some(uid) = parse_user_channel_id(&user_channel_id_str).filter(|_| expected_usd_in.is_some() && btc_price > 0.0) {
+            if self.cut_waiting_spend(ldk_server, uid, btc_price).await != Some(true) {
+                return EditOutcome {
+                    ok: false,
+                    status: "A spend on this channel is still to be cut. Try again shortly.".to_owned(),
+                };
+            }
+        }
         let prior = self
             .stable_channels
             .iter()
@@ -1395,7 +1597,9 @@ impl StableChannelManager {
                 } else {
                     0
                 };
-                (backing_sats, their_balance_sats.saturating_sub(backing_sats))
+                // Spare BTC is what the books hold beyond backing.
+                let user_sats = parse_user_channel_id(&user_channel_id_str).and_then(|uid| self.booked_user_sats(uid)).unwrap_or(their_balance_sats);
+                (backing_sats, user_sats.saturating_sub(backing_sats))
             }
         };
 
@@ -1454,10 +1658,6 @@ impl StableChannelManager {
         self.stable_channels
             .retain(|sc| format!("{}", sc.user_channel_id) != user_channel_id_str);
         self.stable_channels.push(new_sc);
-        if expected_usd_in.is_some() {
-            // New books set from the live balance start any open spend check over.
-            self.spend_debounce.remove(&user_channel_id_u128);
-        }
 
         info!(
             "[stable] edited channel={} user_channel_id={} expected_usd={}",
@@ -1584,7 +1784,7 @@ impl StableChannelManager {
             let effect = match (arrived, top_up_sats.is_some(), short_sats) {
                 (true, true, Some(0)) => "Counting it as arrived adds it to backing: right only if the user's balance includes it".to_owned(),
                 (true, false, Some(0)) => "Counting it as arrived leaves the books as they are".to_owned(),
-                (true, _, short) => format!("Counting it as arrived leaves backing {} sats above what the channel holds, and the balance check will take that out of the user's target as a spend: right only if the user spent after the payment arrived", short.unwrap_or(0)),
+                (true, _, short) => format!("Counting it as arrived leaves backing {} sats above what the channel holds, which the books pause as a gap for an operator to resolve: right only if the user spent after the payment arrived", short.unwrap_or(0)),
                 (false, true, Some(0)) => "It was sent over 14 days ago, longer than a payment stays in flight. Counting it as not arrived drops it and the next stability check pays what is still owed. The channel holds enough for it to have arrived: if it did, the user is paid twice".to_owned(),
                 (false, true, Some(_)) => "It was sent over 14 days ago, longer than a payment stays in flight. Counting it as not arrived drops it and the next stability check pays what is still owed. If it did arrive and the user has spent since, the user is paid twice".to_owned(),
                 (false, true, None) => "Counting it as not arrived drops it; with no open channel nothing more is paid".to_owned(),
@@ -1638,6 +1838,261 @@ impl StableChannelManager {
         ReleaseOutcome { ok: true, status: status.to_owned(), needs_acknowledgement: false }
     }
 
+    /// Operator resolution of a paused channel's gap, from its books, live balance and backing as they stand: as the user's spend the books take the live balance and backing above it is cut from the target; as a payment to the LSP the books take the live balance and backing comes down by the balance under the books, never above the balance, the target kept; keeping the books accepts the gap, so the channel pauses again only if it grows. Refused while anything on the channel is still to be booked, and, unless the books are kept, while a top-up to the user is on its way or a pay-back from them is still to be applied; a call without `acknowledged`, or whose expected live balance, gap and, for a choice that changes them, target and backing are not the figures now, or whose balance moves while a confirm reads it, only returns the figures.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_books_gap(
+        &mut self,
+        channel_id: &str,
+        choice: GapChoice,
+        acknowledged: bool,
+        expected_actual_sats: Option<u64>,
+        expected_gap_sats: Option<u64>,
+        expected_new_expected_usd: Option<f64>,
+        expected_new_backing_sats: Option<u64>,
+        reason: Option<String>,
+        ldk: &dyn LdkServerCalls,
+        btc_price: f64,
+    ) -> ResolveOutcome {
+        if !self.hydrated {
+            return ResolveOutcome::refused("Channels are still loading; retry the resolution shortly");
+        }
+        if !self.retry_pending_reconciliations(ldk, btc_price).await {
+            return ResolveOutcome::refused("Balance correction is pending; retry the resolution after it is saved");
+        }
+        let mut c = match Self::channel_to_resolve(ldk, channel_id).await {
+            Ok(c) => c,
+            Err(refused) => return refused,
+        };
+        let tracked = parse_user_channel_id(&c.user_channel_id)
+            .and_then(|uid| self.stable_channels.iter().position(|sc| sc.user_channel_id == uid).map(|idx| (uid, idx)));
+        let Some((uid, idx)) = tracked else {
+            return ResolveOutcome::refused(NOTHING_TO_RESOLVE);
+        };
+        let (mut held_msat, paying_msat) = match Self::held_to_resolve(ldk, &c.channel_id).await {
+            Ok(held) => held,
+            Err(refused) => return refused,
+        };
+        let books = match self.db.booked_balance(uid) {
+            Ok(Some(books)) if books.closed_at.is_none() && books.check.state == CheckState::Paused => books,
+            Ok(_) => return ResolveOutcome::refused(NOTHING_TO_RESOLVE),
+            Err(e) => return ResolveOutcome::refused(format!("DB read failed: {}", e)),
+        };
+        // Read after the balances, so a forward that reached them is in LDK's totals too; a channel without a record counts as the books' cursor.
+        let totals = match ldk.get_channel_forwarding_stats(GetChannelForwardingStatsRequest { channel_id: c.channel_id.clone() }).await {
+            Ok(response) => response.stats.as_ref().map_or(books.cursor, crate::books::cursor_from_stats),
+            Err(e) => return ResolveOutcome::refused(format!("get_channel_forwarding_stats failed: {}", e)),
+        };
+        if let Some(waiting) = self.still_to_book(uid, &c, &books, held_msat, paying_msat, totals) {
+            return ResolveOutcome::refused(format!("Nothing is resolved while {waiting}; retry shortly"));
+        }
+        // Keeping changes neither the books nor the backing, so a top-up still on its way cannot be counted twice by it.
+        if choice != GapChoice::Keep && self.stability_payment_pending(uid) {
+            return ResolveOutcome::refused(TOP_UP_ON_ITS_WAY);
+        }
+        // A pay-back a retry can still apply, however old, is in the gap a spend or a payment would take, and a list that cannot be read may hold one.
+        if choice != GapChoice::Keep && self.pay_backs_to_apply_msat().is_none_or(|settling| settling.contains_key(&c.channel_id.to_ascii_lowercase())) {
+            return ResolveOutcome::refused(PAY_BACK_TO_APPLY);
+        }
+        if choice == GapChoice::Spend && btc_price <= 0.0 {
+            return ResolveOutcome::refused("BTC price is unavailable; retry the resolution shortly");
+        }
+        // A payment can leave the balance after the reads above and reach the inbox only after the check, so a confirm reads the balance again and applies only if it held.
+        let mut moved_while_read = false;
+        if acknowledged {
+            let again = match Self::channel_to_resolve(ldk, channel_id).await {
+                Ok(again) => again,
+                Err(refused) => return refused,
+            };
+            let held_again = match Self::held_to_resolve(ldk, &again.channel_id).await {
+                Ok((held_msat, _)) => held_msat,
+                Err(refused) => return refused,
+            };
+            let live_msat = |channel: &Channel, held: u64| crate::books::live_user_balance(channel, held).high_msat;
+            if live_msat(&again, held_again).abs_diff(live_msat(&c, held_msat)) > crate::books::BOOKS_TOLERANCE_MSAT {
+                (c, held_msat, moved_while_read) = (again, held_again, true);
+            }
+        }
+
+        let live = crate::books::live_user_balance(&c, held_msat);
+        let (booked_msat, actual_msat) = (books.booked_user_msat, live.high_msat);
+        let actual_sats = actual_msat / 1000;
+        let mut proposed = self.stable_channels[idx].clone();
+        let (expected_before, backing_before) = (proposed.expected_usd.0, proposed.backing_sats);
+        let backing_msat = backing_before.saturating_mul(1000);
+        let check = &books.check;
+        let (books_above_live, backing_above_books) =
+            crate::books::gaps_below(booked_msat, live, check.accepted_gap_msat, check.accepted_backing_gap_msat, backing_msat);
+        let gap_msat = crate::books::gap_below_msat(booked_msat, live, check.accepted_gap_msat, check.accepted_backing_gap_msat, backing_msat);
+        // Keeping also records the backing above the live balance the operator saw, which is all a later top-up may pass over.
+        let (new_booked_msat, accepted_gap_msat, accepted_backing_gap_msat, accepted_shortfall_msat) = match choice {
+            GapChoice::Keep => (
+                booked_msat,
+                booked_msat.saturating_sub(actual_msat),
+                backing_msat.saturating_sub(booked_msat.max(actual_msat)),
+                backing_msat.saturating_sub(actual_msat),
+            ),
+            GapChoice::Spend | GapChoice::PaymentToLsp => (actual_msat, 0, 0, 0),
+        };
+        // A preview only works the cut out; its cooldown and log line come with the applied resolution.
+        let mut spend_cut = false;
+        match choice {
+            GapChoice::Spend if actual_sats < backing_before => {
+                // Spent from books that held at least the backing, so the cut takes backing down to the live balance and the target with it.
+                let before_sats = (booked_msat / 1000).max(backing_before);
+                spend_cut = stable_channels::stable::cut_forwarded(&mut proposed, before_sats, before_sats - actual_sats, btc_price).is_some();
+            }
+            // Paid to the LSP, backing comes down by the balance under the books, as the wallet lowered its own, and never stays above the balance.
+            GapChoice::PaymentToLsp => proposed.backing_sats = backing_before.saturating_sub(booked_msat.saturating_sub(actual_msat) / 1000).min(actual_sats),
+            _ => {}
+        }
+        let changes_channel = choice != GapChoice::Keep;
+        if changes_channel {
+            // Native follows the books, as with any receipt or spend.
+            proposed.stable_receiver_btc = Bitcoin::from_sats(actual_sats);
+            proposed.stable_receiver_usd = USD::from_bitcoin(proposed.stable_receiver_btc, btc_price);
+            proposed.native_sats = actual_sats.saturating_sub(proposed.backing_sats);
+            stable_channels::stable::recompute_native(&mut proposed);
+        }
+        let (expected_after, backing_after) = (proposed.expected_usd.0, proposed.backing_sats);
+        let (booked_sats, gap_sats) = (booked_msat / 1000, gap_msat / 1000);
+        let effect = match choice {
+            GapChoice::Spend if expected_after != expected_before => format!(
+                "as the user's spend: the books take the channel's {actual_sats} sats, backing is cut to {backing_after} sats and the target from ${expected_before:.2} to ${expected_after:.2}"
+            ),
+            GapChoice::Spend => format!("as the user's spend: the books take the channel's {actual_sats} sats, and backing and the target stay"),
+            GapChoice::PaymentToLsp if backing_after != backing_before => format!(
+                "as a payment to the LSP: the books take the channel's {actual_sats} sats, backing comes down to {backing_after} sats and the ${expected_before:.2} target stays"
+            ),
+            GapChoice::PaymentToLsp => format!("as a payment to the LSP: the books take the channel's {actual_sats} sats, and backing and the ${expected_before:.2} target stay"),
+            GapChoice::Keep => format!("by keeping the books: the gap of {gap_sats} sats is kept and the channel pauses again only if it grows"),
+        };
+        let outcome = |ok: bool, status: String, needs_acknowledgement: bool| ResolveOutcome {
+            ok,
+            status,
+            needs_acknowledgement,
+            booked_sats,
+            actual_sats,
+            gap_sats,
+            new_expected_usd: changes_channel.then_some(expected_after),
+            new_backing_sats: changes_channel.then_some(backing_after),
+        };
+        let preview = |lead: &str| {
+            let figures = format!(
+                "The books hold {booked_sats} sats for the user and the channel {actual_sats} sats, with {backing_before} sats of backing: a gap of {gap_sats} sats"
+            );
+            outcome(false, format!("{lead}{figures}. Resolving it {effect}. Confirm to apply"), true)
+        };
+        if !acknowledged {
+            return preview("");
+        }
+        // Figures that moved while the confirm read them are shown again from the later read.
+        if moved_while_read {
+            return preview("The figures changed since the preview. ");
+        }
+        // A confirm applies only to the figures its preview showed, within the books' tolerance.
+        let moved = |expected_sats: u64, now_msat: u64| expected_sats.saturating_mul(1000).abs_diff(now_msat) > crate::books::BOOKS_TOLERANCE_MSAT;
+        match (expected_actual_sats, expected_gap_sats) {
+            (Some(actual), Some(gap)) if !moved(actual, actual_msat) && !moved(gap, gap_msat) => {}
+            (Some(_), Some(_)) => return preview("The figures changed since the preview. "),
+            _ => return preview("Preview first. "),
+        }
+        // A trade or an edit since the preview changes the target or backing a choice applies, though the gap stays the same.
+        if changes_channel {
+            match (expected_new_expected_usd, expected_new_backing_sats) {
+                (Some(usd), Some(sats)) if (usd - expected_after).abs() <= 0.01 && sats.abs_diff(backing_after) <= 5 => {}
+                (Some(_), Some(_)) => return preview("The figures changed since the preview. "),
+                _ => return preview("Preview first. "),
+            }
+        }
+        let resolution = GapResolution {
+            choice,
+            new_booked_msat,
+            accepted_gap_msat,
+            accepted_backing_gap_msat,
+            accepted_shortfall_msat,
+            channel: changes_channel.then_some((expected_after, backing_after, proposed.native_sats)),
+            note: proposed.note.clone(),
+            operator: RESOLVED_BY.to_owned(),
+            reason,
+            detail: serde_json::json!({
+                "actual_msat": actual_msat, "held_msat": held_msat, "gap_msat": gap_msat,
+                "books_above_live": books_above_live, "backing_above_books": backing_above_books,
+                "expected_usd_before": expected_before, "backing_sats_before": backing_before, "btc_price": btc_price,
+            }),
+        };
+        match self.db.resolve_booked_gap(uid, &c.channel_id, &resolution) {
+            Ok(true) => {
+                self.listed_user_sats.remove(&uid);
+            }
+            Ok(false) => return ResolveOutcome::refused(NOTHING_TO_RESOLVE),
+            Err(e) => return ResolveOutcome::refused(format!("DB write failed: {}", e)),
+        }
+        let counterparty = proposed.counterparty.to_string();
+        if spend_cut {
+            stable_channels::stable::set_forwarded_cooldown(&mut proposed);
+        }
+        if changes_channel {
+            self.stable_channels[idx] = proposed;
+        }
+        info!("[books] channel user_id={} resolved {} by {}", uid, effect, RESOLVED_BY);
+        // The wallet learns a new target or backing from a SYNC, sent once its balance without its payments in flight holds the backing.
+        if expected_after != expected_before || backing_after != backing_before {
+            let held = backing_after <= channel_peer_balances(&c).1;
+            if !(held && self.send_sync_message(ldk, uid, &c.channel_id, expected_after, backing_after, &counterparty).await) {
+                self.startup_sync_pending.insert(uid);
+            }
+        }
+        outcome(true, format!("Resolved {effect}"), false)
+    }
+
+    /// The channel as the node lists it now, or the refusal a resolution returns when it cannot be read.
+    async fn channel_to_resolve(ldk: &dyn LdkServerCalls, channel_id: &str) -> Result<Channel, ResolveOutcome> {
+        let channels = match ldk.list_channels(ListChannelsRequest {}).await {
+            Ok(response) => response.channels,
+            Err(e) => return Err(ResolveOutcome::refused(format!("list_channels failed: {}", e))),
+        };
+        channels.into_iter().find(|c| c.channel_id == channel_id).ok_or_else(|| ResolveOutcome::refused(format!("No channel matching: {}", channel_id)))
+    }
+
+    /// The payments the node still holds on the channel, the user's and those to the user, in msat, or the refusal a resolution returns when they cannot be read.
+    async fn held_to_resolve(ldk: &dyn LdkServerCalls, channel_id: &str) -> Result<(u64, u64), ResolveOutcome> {
+        let balances = match ldk.get_balances(GetBalancesRequest {}).await {
+            Ok(response) => response.lightning_balances,
+            Err(e) => return Err(ResolveOutcome::refused(format!("get_balances failed: {}", e))),
+        };
+        // A channel the report leaves out may have payments in flight it does not show, as the books check reads it.
+        let Some(held_msat) = unresolved_user_payments_msat(&balances).get(channel_id).copied() else {
+            return Err(ResolveOutcome::refused("The node's balance report leaves this channel out. Try again shortly."));
+        };
+        Ok((held_msat, unresolved_payments_to_user_msat(&balances).get(channel_id).copied().unwrap_or(0)))
+    }
+
+    /// What on a paused channel is still to be booked, against the payments in flight from and to the user and LDK's forwarding `totals` for it, which a resolution from the live balance would count a second time; None when nothing is.
+    fn still_to_book(&self, uid: u128, c: &Channel, books: &BookedBalance, held_msat: u64, paying_msat: u64, totals: ForwardCursor) -> Option<&'static str> {
+        // An inbox that cannot be read may hold events.
+        let events_waiting = self.event_inbox.as_ref().is_some_and(|inbox| !inbox.is_empty().unwrap_or(false));
+        let splice_unbooked = c.channel_value_sats != books.channel_value_sats
+            || self.pending_splices.contains_key(&uid)
+            || crate::books::splice_suspected(c, held_msat, paying_msat);
+        // A pay-back is waited for as long as the books check waits for one, and a list that cannot be read may hold one.
+        let since = Self::unix_time_secs().saturating_sub(SYNC_PENDING_TIMEOUT_SECS as i64);
+        let pay_back_pending = self
+            .db
+            .channels_with_inbound_stability_settlements_since(since)
+            .map_or(true, |settling| settling.contains(&c.channel_id.to_ascii_lowercase()));
+        // A forward LDK counted past the cursor is the next check's catch-up to book and cut.
+        let forward_unbooked = crate::books::catch_up(books.cursor, totals, ForwardCursor::default()).is_some();
+        [
+            (events_waiting, "events are still waiting to be handled"),
+            (forward_unbooked, "a forward on it is still to be booked"),
+            (books.uncut.is_some(), "a spend on it is still to be cut"),
+            (splice_unbooked, "a splice on it is still to be booked"),
+            (pay_back_pending, "a stability payment from it is still to be applied"),
+        ]
+        .into_iter()
+        .find_map(|(waiting, what)| waiting.then_some(what))
+    }
+
     /// Remove the stable_channel record from in-memory state when a channel closes, and soft-close the DB row (preserved for forensics, excluded from future reconcile/tick reads).
     pub fn handle_channel_closed(
         &mut self,
@@ -1675,7 +2130,7 @@ impl StableChannelManager {
             self.pending_splices.remove(&t);
             self.pending_book_updates.remove(&t);
             self.stability_throttle.remove(&t);
-            self.spend_debounce.remove(&t);
+            self.listed_user_sats.remove(&t);
         }
         if let Err(e) = self.db.mark_channel_closed(&user_channel_id) {
             tracing::error!(
@@ -1937,7 +2392,6 @@ impl StableChannelManager {
                 (
                     sc.user_channel_id,
                     sc.channel_id.to_string(),
-                    sc.stable_receiver_btc.sats,
                     sc.counterparty.to_string(),
                 )
             })
@@ -1957,6 +2411,11 @@ impl StableChannelManager {
             .iter()
             .filter(|c| c.is_usable && c.next_outbound_htlc_minimum_msat <= 1 && c.next_outbound_htlc_limit_msat >= 1)
             .filter_map(|c| parse_user_channel_id(&c.user_channel_id))
+            .collect();
+        // The wallet takes a SYNC's backing only up to its balance without its payments in flight, as this listing shows it.
+        let live_sats: std::collections::HashMap<u128, u64> = channels
+            .iter()
+            .filter_map(|c| parse_user_channel_id(&c.user_channel_id).map(|uid| (uid, channel_peer_balances(c).1)))
             .collect();
         // A usable channel that cannot carry the 1 msat keysend silently blocks every SYNC: say so once per reason, not every minute.
         let blocked: std::collections::HashMap<u128, (String, &'static str, &'static str, u64)> = channels
@@ -1986,10 +2445,10 @@ impl StableChannelManager {
                 stable_channels::audit::audit_event("SYNC_RETRY_BLOCKED", detail);
             }
         }
-        for (uid, channel_id, live_sats, counterparty) in syncs {
-            if !usable.contains(&uid) {
+        for (uid, channel_id, counterparty) in syncs {
+            let Some(&live_sats) = live_sats.get(&uid).filter(|_| usable.contains(&uid)) else {
                 continue;
-            }
+            };
             // Rebuild the correction from committed books, never from the failed payload or
             // an in-memory allocation whose database save may have failed.
             let record = match self.db.load_channel(&uid.to_string()) {
@@ -2299,10 +2758,7 @@ impl StableChannelManager {
                         );
                     }
                 }
-                // Tagged-but-not-envelope = a user's stability payment. Reconcile the
-                // books NOW: with stale backing_sats the channel still reads above par
-                // (double-charge risk) and the balance-truth backstop would misread the
-                // user's payment as an unreconciled spend and deduct expected_usd.
+                // Tagged but not an envelope is a user's stability payment, reconciled now: stale backing still reads above par (a double charge) and the books would read the payment as a gap below.
                 self.reconcile_incoming_stability(payment_id.as_deref(), amount_msat, ldk, btc_price)
                     .await;
             } else {
@@ -2482,6 +2938,7 @@ impl StableChannelManager {
             // Refused, but the money arrived: it is booked once its channel and signature are proven.
             if let Some(uid) = Self::signed_pay_back_channel(ldk, &envelope, &payload.channel_id, payment_id).await {
                 let detail = serde_json::json!({ "amount_msat": received_msat, "settlement_id": payload.settlement_id });
+                self.listed_user_sats.remove(&uid);
                 self.book_paid_to_lsp(uid, &payload.channel_id, BookReason::SignedPayBack, payment_id, received_msat, detail);
             }
             return;
@@ -2594,6 +3051,7 @@ impl StableChannelManager {
         }
         // The money arrived whatever the checks below decide, so it is booked now that the signature proves its channel.
         let detail = serde_json::json!({ "amount_msat": received_msat, "settlement_id": payload.settlement_id });
+        self.listed_user_sats.remove(&user_channel_id);
         self.book_paid_to_lsp(user_channel_id, &channel.channel_id, BookReason::SignedPayBack, payment_id, received_msat, detail);
         if payload.expected_usd.to_bits()
             != self.stable_channels[idx].expected_usd.0.to_bits()
@@ -2623,6 +3081,8 @@ impl StableChannelManager {
         }
 
         let (_, their_sats) = channel_peer_balances(&channel);
+        // Spare BTC comes from the books, which took this payment above; backing stays capped by the live balance.
+        let user_sats = self.booked_user_sats(user_channel_id).unwrap_or(their_sats);
         let amount_sats = received_msat / 1000;
         let mut allocation_expected_usd = self.stable_channels[idx].expected_usd.0;
         let mut backing_before = self.stable_channels[idx].backing_sats;
@@ -2638,7 +3098,7 @@ impl StableChannelManager {
             invalidate("allocation");
             return;
         };
-        let mut native_after = their_sats.saturating_sub(backing_after);
+        let mut native_after = user_sats.saturating_sub(backing_after);
         let amount_usd = amount_sats as f64
             / stable_channels::constants::SATS_IN_BTC as f64
             * btc_price;
@@ -2689,7 +3149,7 @@ impl StableChannelManager {
                 allocation_expected_usd = durable.expected_usd;
                 backing_before = durable.backing_sats;
                 backing_after = reloaded_backing_after;
-                native_after = their_sats.saturating_sub(backing_after);
+                native_after = user_sats.saturating_sub(backing_after);
                 match persist(backing_before, backing_after, native_after) {
                     Ok(persisted) => persisted,
                     Err(error) => {
@@ -2712,7 +3172,7 @@ impl StableChannelManager {
                     &canonical_user_channel_id,
                     allocation_expected_usd,
                     backing_before,
-                    their_sats.saturating_sub(backing_before),
+                    user_sats.saturating_sub(backing_before),
                     self.stable_channels[idx].note.as_deref(),
                 ) {
                     stable_channels::audit::audit_event(
@@ -2764,8 +3224,7 @@ impl StableChannelManager {
             stable.backing_sats = backing_after;
             stable.native_sats = native_after;
             stable_channels::stable::recompute_native(stable);
-            // A gap this payment left behind is still the backstop's to count.
-            close_spend_check_if_covered(&mut self.spend_debounce, stable.user_channel_id, &channel, backing_after);
+            self.note_listed_users([(user_channel_id, &channel)]);
         }
         stable_channels::audit::audit_event(
             "STABILITY_PAYMENT_V1_APPLIED",
@@ -2830,9 +3289,10 @@ impl StableChannelManager {
     ///
     /// The event carries no channel id, so the channel is attributed by amount:
     /// the tracked channel whose live user-side balance dropped by the payment
-    /// amount (±1 sat for msat rounding) since the last tick snapshot. If the match
-    /// is not unique, nothing is mutated and the miss is audited — the tick +
-    /// backstop path then handles it as before, but visibly.
+    /// amount (±1 sat for msat rounding) since a listing the books have not moved past;
+    /// a channel without one is not matched. If the match
+    /// is not unique, nothing is mutated and the unmatched payment is audited — the books
+    /// then hold the drop as a gap until it is explained.
     async fn reconcile_incoming_stability(
         &mut self,
         payment_id: Option<&str>,
@@ -2875,7 +3335,9 @@ impl StableChannelManager {
                 continue;
             };
             let (_, their_sats) = channel_peer_balances(c);
-            let drop = sc.stable_receiver_btc.sats.saturating_sub(their_sats);
+            // The drop is taken only from a listing since the books last moved, never from the books.
+            let Some(before_sats) = self.listed_user_sats.get(&sc.user_channel_id).copied() else { continue };
+            let drop = before_sats.saturating_sub(their_sats);
             if drop > 0 && drop.abs_diff(amount_sats) <= 1 {
                 matches.push((i, c, their_sats));
             }
@@ -2895,8 +3357,11 @@ impl StableChannelManager {
         }
         let (idx, live, their_sats) = matches[0];
         let channel_id = live.channel_id.clone();
+        let uid = self.stable_channels[idx].user_channel_id;
+        self.note_listed_users([(uid, live)]);
+        // The books take this payment once the settlement is saved below, so spare BTC counts it already.
+        let user_sats = booked_user_msat(&self.db, uid).map_or(their_sats, |msat| msat.saturating_sub(amount_msat.unwrap_or(0)) / 1000);
         let sc = &mut self.stable_channels[idx];
-        let uid = sc.user_channel_id;
 
         sc.latest_price = btc_price;
         sc.stable_receiver_btc = Bitcoin::from_sats(their_sats);
@@ -2927,10 +3392,8 @@ impl StableChannelManager {
         // Paid sats that backing does not give up are taken off a pending top-up, where they come from when it arrived without being booked yet.
         let unabsorbed_sats = amount_sats.saturating_sub(sc.backing_sats.saturating_sub(settled_backing));
         sc.backing_sats = settled_backing;
-        sc.native_sats = their_sats.saturating_sub(sc.backing_sats);
+        sc.native_sats = user_sats.saturating_sub(sc.backing_sats);
         stable_channels::stable::recompute_native(sc);
-        // Once the drop is settled the backstop forgets any ticks it counted. A gap left behind keeps its count.
-        close_spend_check_if_covered(&mut self.spend_debounce, uid, live, settled_backing);
 
         if let Err(e) = self.db.save_channel(
             &channel_id,
@@ -2959,8 +3422,11 @@ impl StableChannelManager {
             );
             let paid_msat = amount_msat.unwrap_or(0);
             let detail = serde_json::json!({ "amount_msat": paid_msat, "inferred": true });
+            self.listed_user_sats.remove(&uid);
             self.book_paid_to_lsp(uid, &channel_id, BookReason::InferredPayBack, &evidence, paid_msat, detail);
         }
+        // The listing read here already shows this payment gone, so it is the side the next pay-back is matched against.
+        self.note_listed_users([(uid, live)]);
         stable_channels::audit::audit_event(
             "STABILITY_RECEIVED_RECONCILED",
             serde_json::json!({
@@ -3025,6 +3491,8 @@ impl StableChannelManager {
             Ok(r) => r.channels,
             Err(e) => {
                 tracing::warn!("[stable] run_tick: list_channels failed: {}", e);
+                // Without a listing no channel's side is known, so no unsigned pay-back is matched until the next one.
+                self.listed_user_sats.clear();
                 return plan;
             }
         };
@@ -3036,16 +3504,21 @@ impl StableChannelManager {
                 by_user_channel_id.insert(uid, c.clone());
             }
         }
-        // Payments from the user that the node still lists as unresolved. None when it cannot say.
-        let held_msat = match ldk.get_balances(GetBalancesRequest {}).await {
-            Ok(r) => Some(unresolved_user_payments_msat(&r.lightning_balances)),
+        // Noted before the books pass, whose bookings remove the notes they make stale; a channel the listing leaves out has none.
+        self.listed_user_sats.retain(|uid, _| by_user_channel_id.contains_key(uid));
+        let tracked: Vec<u128> = self.stable_channels.iter().map(|sc| sc.user_channel_id).collect();
+        self.note_listed_users(tracked.into_iter().filter_map(|uid| by_user_channel_id.get(&uid).map(|c| (uid, c))));
+        // Payments from the user, and to them, that the node still lists as unresolved. None when it cannot say.
+        let (held_msat, paying_user_msat) = match ldk.get_balances(GetBalancesRequest {}).await {
+            Ok(r) => (Some(unresolved_user_payments_msat(&r.lightning_balances)), Some(unresolved_payments_to_user_msat(&r.lightning_balances))),
             Err(e) => {
                 tracing::warn!("[stable] run_tick: get_balances failed: {}", e);
-                None
+                (None, None)
             }
         };
         if matches!(scope, TickScope::All) {
-            self.run_books_pass(ldk, totals_before.as_ref().map(Option::as_ref), &by_user_channel_id, held_msat.as_ref(), top_ups_in_flight.as_ref()).await;
+            let in_flight = held_msat.as_ref().zip(paying_user_msat.as_ref());
+            self.run_books_pass(ldk, totals_before.as_ref().map(Option::as_ref), &by_user_channel_id, in_flight, top_ups_in_flight.as_ref(), btc_price).await;
         }
 
         let now = std::time::SystemTime::now()
@@ -3057,21 +3530,23 @@ impl StableChannelManager {
         let dollar_threshold = stable_channels::constants::STABILITY_THRESHOLD_USD;
         let cooldown = stable_channels::constants::STABILITY_PAYMENT_COOLDOWN_SECS as i64;
 
-        // Accepted USD and sat allocations for backstop SYNCs sent after the iter_mut borrow ends.
-        let mut backstop_syncs: Vec<(u128, String, f64, u64, String)> = Vec::new();
         // Wakes are collected and returned, not sent here: the push cooldown is node-scoped, so the caller picks one push per peer.
         let mut deferred_user_wakes: Vec<String> = Vec::new();
         let mut deferred_lsp_wakes: Vec<WakeSettlementRequest> = Vec::new();
-        const BACKSTOP_DEBOUNCE_TICKS: u8 = 2;
-
+        // Read after the books pass and before the loop takes the channels: what holds each channel's top-ups.
+        let holds: std::collections::HashMap<u128, BooksHold> = self
+            .stable_channels
+            .iter()
+            .filter_map(|sc| books_hold(&self.db, sc.user_channel_id).map(|reason| (sc.user_channel_id, reason)))
+            .collect();
         for sc in self.stable_channels.iter_mut() {
             if let TickScope::WokenPeer(peer) = scope {
                 if sc.counterparty.to_string() != peer {
                     continue;
                 }
             }
-            if self.pending_splices.contains_key(&sc.user_channel_id) {
-                // A failed splice save must finish before a tick can change these books.
+            if self.pending_splices.contains_key(&sc.user_channel_id) || self.pending_book_updates.contains_key(&sc.user_channel_id) {
+                // A failed splice or cut save must finish before a tick can change these books.
                 continue;
             }
             if sc.expected_usd.0 < 0.01 && sc.backing_sats == 0 {
@@ -3087,116 +3562,27 @@ impl StableChannelManager {
             proposed.stable_receiver_usd = USD::from_bitcoin(proposed.stable_receiver_btc, btc_price);
             proposed.latest_price = btc_price;
 
-            // Balance-truth backstop: live balance below backing means a spend went unreconciled (no PaymentForwarded) — deduct + SYNC. Debounced so a forward's own event can deduct first, and so a payment the node has not listed yet is not read as a spend.
             let uid = sc.user_channel_id;
-            // None when the read failed or the report leaves this channel out, which a node does not do to an open channel.
-            let channel_held_msat = held_msat.as_ref().and_then(|held| held.get(&c.channel_id).copied());
-            // Sats in a payment the user sent that has not resolved may come back, so only a balance they could not restore counts as a spend. Sats received while a check is open cannot cover it.
-            let received_msat = self.spend_debounce.get(&uid).map_or(0, |check| check.received_msat);
-            let recoverable_sats = user_sats_without_received(c, channel_held_msat.unwrap_or(0), received_msat);
+            // Without the node's report on this channel a balance below the backing may be a payment still held, which can come back, or a spend.
+            let report_missing = their_sats < sc.backing_sats && held_msat.as_ref().and_then(|held| held.get(&c.channel_id)).is_none();
             if matches!(scope, TickScope::WokenPeer(_)) {
-                // The debounce counts regular ticks 60s apart, so a wake pass must not advance it; nor may it top up a channel whose possible spend is still unreconciled.
-                if recoverable_sats < sc.backing_sats {
+                // A wake pass tops up no channel whose payments wait on the books, as `books_hold_payments` reads them, or whose balance it cannot read.
+                if report_missing || holds.get(&uid).is_some_and(|hold| *hold != BooksHold::NoBooks) {
                     continue;
                 }
-                self.spend_debounce.remove(&uid);
-            } else if recoverable_sats < sc.backing_sats {
-                // Without the node's report on this channel a held payment cannot be told from a spend: note the live balance, then leave the channel and its count to a tick that has it.
-                if channel_held_msat.is_none() {
-                    // The key changes once a day, so the ledger keeps one record a day and not one per tick.
-                    stable_channels::audit::audit_event(
-                        "LDK_CALL_FAILED",
-                        serde_json::json!({
-                            "op": "get_balances", "context": "run_tick",
-                            "channel_id": c.channel_id, "user_channel_id": uid.to_string(),
-                            "error": if held_msat.is_none() { "read_failed" } else { "channel_not_in_report" },
-                            "dedup_key": format!("lsp:balance-report-missing:{uid}:{}", Self::unix_time_secs() / STABILITY_TOP_UP_ALARM_REPEAT_SECS),
-                        }),
-                    );
-                    *sc = proposed;
-                    continue;
-                }
-                let shortfall_sats = sc.backing_sats - recoverable_sats;
-                let (count, seen_sats) = {
-                    let check = self.spend_debounce.entry(uid).or_default();
-                    check.sightings = check.sightings.saturating_add(1);
-                    if check.sightings == 1 {
-                        check.seen_sats = shortfall_sats;
-                    }
-                    (check.sightings, check.seen_sats)
-                };
-                if count >= BACKSTOP_DEBOUNCE_TICKS {
-                    // Deduct the smaller shortfall the two ticks saw, with every unresolved payment returned, then put the live balance back.
-                    proposed.stable_receiver_btc = Bitcoin::from_sats(sc.backing_sats - shortfall_sats.min(seen_sats));
-                    let usd_deducted = stable_channels::stable::reconcile_outgoing(&mut proposed, btc_price);
-                    proposed.stable_receiver_btc = Bitcoin::from_sats(their_sats);
-                    // Sats received during the check stay native.
-                    proposed.native_sats = their_sats.saturating_sub(proposed.backing_sats);
-                    stable_channels::stable::recompute_native(&mut proposed);
-                    // Any gap left is what this tick saw beyond the first sighting: a first sighting of its own, which receives before this tick may have covered.
-                    let unseen_sats = proposed.backing_sats.saturating_sub(user_sats_without_received(c, channel_held_msat.unwrap_or(0), 0));
-                    if unseen_sats > 0 {
-                        self.spend_debounce.insert(uid, SpendCheck { sightings: 1, seen_sats: unseen_sats, received_msat: 0 });
-                    } else {
-                        self.spend_debounce.remove(&uid);
-                    }
-                    if let Some(usd_deducted) = usd_deducted {
-                        if let Err(e) = self.db.save_channel(
-                            &c.channel_id,
-                            &format!("{}", uid),
-                            proposed.expected_usd.0,
-                            proposed.backing_sats,
-                            proposed.native_sats,
-                            proposed.note.as_deref(),
-                        ) {
-                            tracing::error!("[stable] backstop save_channel failed: {}", e);
-                            stable_channels::audit::audit_event(
-                                "DB_WRITE_FAILED",
-                                serde_json::json!({ "op": "save_channel", "context": "backstop", "user_channel_id": format!("{}", uid), "channel_id": c.channel_id, "error": e.to_string() }),
-                            );
-                            let data = serde_json::json!({
-                                "channel_id": c.channel_id, "user_channel_id": uid.to_string(),
-                                "their_sats": their_sats, "received_msat": received_msat, "usd_deducted": usd_deducted,
-                                "new_expected_usd": proposed.expected_usd.0,
-                                "new_backing_sats": proposed.backing_sats,
-                            });
-                            self.pending_book_updates.insert(uid, PendingBookUpdate {
-                                channel_id: c.channel_id.clone(), proposed,
-                                context: "backstop",
-                                audits: vec![("BACKSTOP_STABLE_DEDUCTED", data)],
-                                needs_sync: true,
-                            });
-                            // Preserve the exact failed correction and leave published books intact.
-                            continue;
-                        }
-                        stable_channels::audit::audit_event(
-                            "BACKSTOP_STABLE_DEDUCTED",
-                            serde_json::json!({
-                                "channel_id": c.channel_id,
-                                "user_channel_id": format!("{}", uid),
-                                "their_sats": their_sats,
-                                "received_msat": received_msat,
-                                "usd_deducted": usd_deducted,
-                                "new_expected_usd": proposed.expected_usd.0,
-                                "new_backing_sats": proposed.backing_sats,
-                            }),
-                        );
-                        if proposed.backing_sats <= their_sats {
-                            backstop_syncs.push((
-                                uid,
-                                c.channel_id.clone(),
-                                proposed.expected_usd.0,
-                                proposed.backing_sats,
-                                proposed.counterparty.to_string(),
-                            ));
-                        } else {
-                            // Backing above the live balance still holds an unresolved payment. Publish once the books match it.
-                            self.startup_sync_pending.insert(uid);
-                        }
-                    }
-                }
-            } else {
-                self.spend_debounce.remove(&uid);
+            } else if report_missing {
+                // Note the live balance and leave the channel to a tick that has the report; the key changes once a day, so the ledger keeps one record a day.
+                stable_channels::audit::audit_event(
+                    "LDK_CALL_FAILED",
+                    serde_json::json!({
+                        "op": "get_balances", "context": "run_tick",
+                        "channel_id": c.channel_id, "user_channel_id": uid.to_string(),
+                        "error": if held_msat.is_none() { "read_failed" } else { "channel_not_in_report" },
+                        "dedup_key": format!("lsp:balance-report-missing:{uid}:{}", Self::unix_time_secs() / STABILITY_TOP_UP_ALARM_REPEAT_SECS),
+                    }),
+                );
+                *sc = proposed;
+                continue;
             }
             *sc = proposed;
 
@@ -3263,6 +3649,51 @@ impl StableChannelManager {
             };
             let amount_msat = amount_sats.saturating_mul(1000);
 
+            if is_receiver_below_expected {
+                // A channel with no books waits for them, inbox attached or not, unless its balance sits inside the reserve, where they cannot start.
+                let books_hold = holds.get(&uid).copied().filter(|hold| *hold != BooksHold::NoBooks || c.inbound_capacity_msat > 0);
+                // Whatever the books say, a balance below the backing with the channel's held payments returned may be a spend not yet cut, so nothing is paid on that backing.
+                let channel_held_msat = held_msat.as_ref().and_then(|held| held.get(&c.channel_id)).copied();
+                let balance_msat = channel_held_msat.map(|held| crate::books::live_user_balance(c, held).high_msat);
+                let shortfall_msat = balance_msat.map_or(0, |balance_msat| sc.backing_sats.saturating_mul(1000).saturating_sub(balance_msat));
+                // The shortfall an operator saw when keeping the books is no hold until the balance falls further; the books are read only when there is a shortfall.
+                let tolerance_msat = crate::books::BOOKS_TOLERANCE_MSAT;
+                let kept_shortfall_msat = if shortfall_msat > tolerance_msat { accepted_shortfall_msat(&self.db, uid, &c.channel_id) } else { 0 };
+                let balance_below_backing = shortfall_msat > tolerance_msat && shortfall_msat > kept_shortfall_msat.saturating_add(tolerance_msat);
+                if let Some(hold) = books_hold.or(balance_below_backing.then_some(BooksHold::BalanceBelowBacking)) {
+                    // Money to this user waits while the books show a gap below, are paused, or are not anchored or readable yet, or while the balance is below the backing.
+                    let key = format!("top_up_held:{}", hold.as_str());
+                    let (lo, lv) = self.stability_throttle.get(&uid).cloned().unwrap_or_default();
+                    if stability_should_log(&lo, &key, lv, stable_usd_value, target, dollar_threshold, percent_threshold, false) {
+                        stable_channels::audit::audit_event(
+                            "STABILITY_TOP_UP_HELD",
+                            serde_json::json!({
+                                "channel_id": c.channel_id,
+                                "user_channel_id": c.user_channel_id.clone(),
+                                "reason": hold.as_str(),
+                                "stable_usd_value": stable_usd_value,
+                                "expected_usd": target,
+                            }),
+                        );
+                        self.stability_throttle.insert(uid, (key, stable_usd_value));
+                    }
+                    // A hold on the stable part alone has no books record, so it leaves one a day for the operator, who can set the stable part from the edit route.
+                    if hold == BooksHold::BalanceBelowBacking {
+                        let day = Self::unix_time_secs() / STABILITY_TOP_UP_ALARM_REPEAT_SECS;
+                        stable_channels::audit::audit_event(
+                            "STABILITY_TOP_UP_HELD_BELOW_BACKING",
+                            serde_json::json!({
+                                "channel_id": c.channel_id, "user_channel_id": c.user_channel_id.clone(),
+                                "shortfall_msat": shortfall_msat, "kept_shortfall_msat": kept_shortfall_msat,
+                                "backing_sats": sc.backing_sats, "balance_msat": balance_msat,
+                                "dedup_key": format!("lsp:top-up-held-below-backing:{uid}:{day}"),
+                            }),
+                        );
+                    }
+                    continue;
+                }
+            }
+
             if c.is_usable {
                 if is_receiver_below_expected {
                     if top_ups_in_flight.as_ref().is_none_or(|channels| channels.contains(&sc.user_channel_id)) {
@@ -3272,12 +3703,14 @@ impl StableChannelManager {
                     if sc.backing_sats == 0 {
                         // No backing was ever recorded: book the sats already held first, so the claim's "add what was sent" lands on equilibrium.
                         let held_sats = their_sats.min(equilibrium_sats);
+                        // Spare BTC is what the books hold beyond it.
+                        let native_sats = booked_user_msat(&self.db, sc.user_channel_id).map_or(their_sats, |msat| msat / 1000).saturating_sub(held_sats);
                         if let Err(e) = self.db.save_channel(
                             &c.channel_id,
                             &c.user_channel_id,
                             sc.expected_usd.0,
                             held_sats,
-                            their_sats - held_sats,
+                            native_sats,
                             sc.note.as_deref(),
                         ) {
                             stable_channels::audit::audit_event(
@@ -3287,7 +3720,7 @@ impl StableChannelManager {
                             continue;
                         }
                         sc.backing_sats = held_sats;
-                        sc.native_sats = their_sats - held_sats;
+                        sc.native_sats = native_sats;
                         stable_channels::stable::recompute_native(sc);
                     }
                     let settlement_id = stable_channels::stable::new_stability_settlement_id();
@@ -3538,22 +3971,6 @@ impl StableChannelManager {
                 settlement: Some(request),
             });
         }
-
-        for (uid, channel_id, expected_usd, backing_sats, counterparty) in backstop_syncs {
-            let sent = self
-                .send_sync_message(
-                    ldk,
-                    uid,
-                    &channel_id,
-                    expected_usd,
-                    backing_sats,
-                    &counterparty,
-                )
-                .await;
-            if !sent {
-                self.startup_sync_pending.insert(uid);
-            }
-        }
         plan
     }
 
@@ -3568,14 +3985,15 @@ impl StableChannelManager {
         }
     }
 
-    /// Anchors, catches up and checks each stable channel's books against this tick's reads and logs where they disagree; it writes books rows and log lines only, never a channel. `totals_before` is None when no channel was still to anchor and Some(None) when that read failed.
+    /// Anchors, catches up and checks each stable channel's books against this tick's reads and logs where they disagree; a spend or splice-out it books, and any spend the books still mark uncut, is cut from the books, and otherwise it writes books rows and log lines only. `totals_before` is None when no channel was still to anchor and Some(None) when that read failed.
     async fn run_books_pass(
         &mut self,
         ldk: &dyn LdkServerCalls,
         totals_before: Option<Option<&std::collections::HashMap<String, ForwardCursor>>>,
         channels: &std::collections::HashMap<u128, Channel>,
-        held_msat: Option<&std::collections::HashMap<String, u64>>,
+        held_msat: Option<(&std::collections::HashMap<String, u64>, &std::collections::HashMap<String, u64>)>,
         top_ups_in_flight: Option<&std::collections::HashSet<u128>>,
+        btc_price: f64,
     ) {
         // A candidate only counts on the next pass, so one this pass does not record again is dropped.
         let candidates = std::mem::take(&mut self.books_anchor_candidates);
@@ -3590,31 +4008,33 @@ impl StableChannelManager {
             )
         };
         let totals_before = match totals_before {
-            Some(None) => return unread("read_failed".to_owned()),
+            Some(None) => {
+                unread("read_failed".to_owned());
+                return self.note_books_blocked(channels, "stats_unavailable");
+            }
             Some(Some(totals)) => Some(totals),
             None => None,
         };
         // Without a readable inbox a forward still waiting in it cannot be told apart from one the books missed, so nothing is anchored, caught up or checked.
-        let inbox = self.event_inbox.as_ref().and_then(|inbox| match (inbox.queued_forwards(), inbox.is_empty()) {
-            (Ok(queued), Ok(empty)) => Some((queued, empty)),
+        let Some(inbox) = self.event_inbox.as_ref() else {
+            return self.note_books_blocked(channels, "inbox_unavailable");
+        };
+        let (queued_forwards, inbox_empty) = match (inbox.queued_forwards(), inbox.is_empty()) {
+            (Ok(queued), Ok(empty)) => (queued, empty),
             (Err(e), _) | (_, Err(e)) => {
                 tracing::warn!("[stable] books: event inbox unreadable: {}", e);
-                None
+                return self.note_books_blocked(channels, "inbox_unreadable");
             }
-        });
-        let Some((queued_forwards, inbox_empty)) = inbox else { return };
+        };
         let totals_after = match crate::books::forwarding_totals(ldk).await {
             Ok(totals) => totals,
-            Err(e) => return unread(e.to_string()),
-        };
-        // A pay-back still to be applied is already out of the balance, and applying it books it.
-        let settling: Option<std::collections::HashSet<String>> = match self.db.pending_inbound_stability_settlements(usize::MAX) {
-            Ok(pending) => Some(pending.into_iter().map(|settlement| settlement.channel_id.to_ascii_lowercase()).collect()),
             Err(e) => {
-                tracing::warn!("[stable] books: pending stability settlements unreadable: {}", e);
-                None
+                unread(e.to_string());
+                return self.note_books_blocked(channels, "stats_unavailable");
             }
         };
+        // A pay-back still to be applied is already out of the balance, and applying it books it.
+        let settling = self.pay_backs_to_apply_msat();
         // A payment to the user whose outcome is still to come books money the anchor may already hold; after the hour a SYNC is given up in, a row no longer counts.
         let paying = match self.db.channels_awaiting_lsp_payment(Self::unix_time_secs().saturating_sub(SYNC_PENDING_TIMEOUT_SECS as i64)) {
             Ok(paying) => Some(paying),
@@ -3629,9 +4049,28 @@ impl StableChannelManager {
             .unwrap_or_default()
             .as_millis()
             .min(i64::MAX as u128) as i64;
-        let tracked: Vec<(u128, u64, u64)> =
-            self.stable_channels.iter().map(|sc| (sc.user_channel_id, sc.backing_sats, sc.native_sats)).collect();
-        for (uid, backing_sats, native_sats) in tracked {
+        let tracked: Vec<u128> = self.stable_channels.iter().map(|sc| sc.user_channel_id).collect();
+        self.books_waiting_ticks.retain(|uid, _| tracked.contains(uid));
+        // A pay-back explains a gap only for as long as a payment is waited for.
+        let settling_recent = match self.db.channels_with_inbound_stability_settlements_since(Self::unix_time_secs().saturating_sub(SYNC_PENDING_TIMEOUT_SECS as i64)) {
+            Ok(recent) => Some(recent),
+            Err(e) => {
+                tracing::warn!("[stable] books: recent stability settlements unreadable: {}", e);
+                None
+            }
+        };
+        // A top-up an older daemon added to backing when it sent it explains backing above the books for as long as a payment is waited for.
+        let legacy_top_ups_recent: Option<std::collections::HashSet<u128>> = match self.db.legacy_stability_payments_pending() {
+            Ok(pending) => {
+                let since = Self::unix_time_secs().saturating_sub(SYNC_PENDING_TIMEOUT_SECS as i64);
+                Some(pending.into_iter().filter(|(_, _, recorded_at)| *recorded_at >= since).filter_map(|(_, uid, _)| parse_user_channel_id(&uid)).collect())
+            }
+            Err(e) => {
+                tracing::warn!("[stable] books: top-ups sent the old way unreadable: {}", e);
+                None
+            }
+        };
+        for uid in tracked {
             let Some(c) = channels.get(&uid) else { continue };
             let books = match self.db.booked_balance(uid) {
                 Ok(Some(books)) if books.closed_at.is_some() => continue,
@@ -3644,15 +4083,23 @@ impl StableChannelManager {
             let totals = totals_after.get(&c.channel_id).copied();
             let Some(books) = books else {
                 // Anchor only from a balance with nothing on the way into or out of it, and no forward between the reads.
-                let settled = inbox_empty
-                    && top_ups_in_flight.is_some_and(|in_flight| !in_flight.contains(&uid))
-                    && settling.as_ref().is_some_and(|settling| !settling.contains(&c.channel_id.to_ascii_lowercase()))
-                    && paying.as_ref().is_some_and(|paying| !paying.contains(&uid))
-                    && held_msat.and_then(|held| held.get(&c.channel_id)) == Some(&0)
-                    && c.inbound_capacity_msat > 0
-                    && !crate::books::splice_suspected(c, 0)
-                    && totals_before.is_some_and(|before| before.get(&c.channel_id) == totals.as_ref());
-                if !settled {
+                let channel_key = c.channel_id.to_ascii_lowercase();
+                let blocking: Vec<&'static str> = [
+                    (!inbox_empty, "events_waiting"),
+                    (!top_ups_in_flight.is_some_and(|in_flight| !in_flight.contains(&uid)), "top_up_on_the_way"),
+                    (!settling.as_ref().is_some_and(|settling| !settling.contains_key(&channel_key)), "settlement_pending"),
+                    (!paying.as_ref().is_some_and(|paying| !paying.contains(&uid)), "lsp_payment_pending"),
+                    (held_msat.is_none(), "balances_unread"),
+                    (held_msat.is_some_and(|(held, _)| held.get(&c.channel_id) != Some(&0)), "held_payment"),
+                    (c.inbound_capacity_msat == 0, "reserve_hidden"),
+                    (crate::books::splice_suspected(c, 0, 0), "splice_suspected"),
+                    (!totals_before.is_some_and(|before| before.get(&c.channel_id) == totals.as_ref()), "totals_moved"),
+                ]
+                .into_iter()
+                .filter_map(|(blocks, name)| blocks.then_some(name))
+                .collect();
+                if !blocking.is_empty() {
+                    self.note_books_waiting(uid, &c.channel_id, &blocking);
                     continue;
                 }
                 let user_msat = c.inbound_capacity_msat.saturating_add(c.counterparty_unspendable_punishment_reserve.saturating_mul(1000));
@@ -3660,70 +4107,169 @@ impl StableChannelManager {
                 // A payment still landing can leave one reading settled but not the next, so the books start from two in a row.
                 if candidates.get(&uid) != Some(&reading) {
                     self.books_anchor_candidates.insert(uid, reading);
+                    self.note_books_waiting(uid, &c.channel_id, &["reading_changed"]);
                     continue;
                 }
                 let detail = serde_json::json!({ "source": "tick" });
                 if let Err(e) = self.db.anchor_booked_balance(uid, &c.channel_id, user_msat, c.channel_value_sats, reading.1, detail) {
                     books_db_failed(false, "anchor_booked_balance", uid, &c.channel_id, &e);
                     self.books_anchor_candidates.insert(uid, reading);
+                    self.note_books_waiting(uid, &c.channel_id, &["anchor_write_failed"]);
+                } else {
+                    self.books_waiting_ticks.remove(&uid);
                 }
                 continue;
             };
-            let mut booked_msat = books.booked_user_msat;
+            self.books_waiting_ticks.remove(&uid);
             let queued = queued_forwards.get(&c.channel_id).copied().unwrap_or_default();
-            if let Some(caught) = crate::books::catch_up(books.cursor, totals.unwrap_or(books.cursor), queued) {
-                let next = caught.cursor;
-                let change = BookChange {
-                    user_channel_id: uid,
-                    delta_msat: caught.net_msat,
-                    reason: BookReason::ForwardCatchUp,
-                    evidence: format!("{}:{}:{}:{}", next.spent_count, next.received_count, next.spent_msat, next.received_msat),
-                    cursor: Some(caught.cursor),
-                    channel_value_sats: None,
-                    detail: serde_json::json!({ "spent_msat": caught.spent_msat, "received_msat": caught.received_msat }),
-                };
-                match self.db.book(&change) {
-                    Ok(BookOutcome::Applied { after_msat, .. }) => booked_msat = after_msat,
-                    Ok(_) => {}
-                    Err(e) => {
-                        // Books behind the live balance by a write that failed are no evidence of a gap.
-                        books_db_failed(false, "book", uid, &c.channel_id, &e);
-                        continue;
-                    }
-                }
+            // Books behind the live balance by a write that failed are no evidence of a gap.
+            let Some((mut booked_msat, caught_cut)) = self.catch_up_forwards(ldk, uid, &books, totals.unwrap_or(books.cursor), queued, btc_price).await else {
+                continue;
+            };
+            let mut cut_tried = books.uncut.is_some() || caught_cut;
+            // Spends the books still mark uncut, left by a missing price, a failed save or a restart, are cut now.
+            if books.uncut.is_some() {
+                self.apply_booked_spend(ldk, uid, btc_price, "deferred").await;
             }
             // A balance read that failed is no evidence, so the books are not checked against it.
-            let Some(held_msat) = held_msat else { continue };
-            let held = held_msat.get(&c.channel_id).copied().unwrap_or(0);
-            let splice_suspected = crate::books::splice_suspected(c, held);
-            // A splice that locked while the daemon was away has no Ready event to book it, so the listed value does, once no waiting event could.
-            if c.channel_value_sats != books.channel_value_sats && !splice_suspected && !events_waiting {
-                match self.book_splice(uid, None, c) {
-                    Some(BookOutcome::Applied { after_msat, .. }) => booked_msat = after_msat,
+            let Some((held_msat, paying_user_msat)) = held_msat else { continue };
+            // A channel the report leaves out may have payments in flight it does not show, so it is not checked either.
+            let Some(held) = held_msat.get(&c.channel_id).copied() else { continue };
+            let paying_user = paying_user_msat.get(&c.channel_id).copied().unwrap_or(0);
+            let splice_suspected = crate::books::splice_suspected(c, held, paying_user);
+            // A splice that locked while the daemon was away has no Ready event to book it, so the first check whose listing shows the new value does.
+            let value_changed = c.channel_value_sats != books.channel_value_sats;
+            let mut splice_booked = false;
+            if value_changed {
+                // A list of pay-backs that cannot be read may hold one, so a drop no record names is left to the next check.
+                let weighing = settling.as_ref().map(|settling| SpliceWeighing {
+                    on_the_way_msat: held.saturating_add(paying_user).saturating_add(settling.get(&c.channel_id.to_ascii_lowercase()).copied().unwrap_or(0)),
+                    totals: totals.unwrap_or(books.cursor),
+                    queued,
+                });
+                let listed_after_msat = if c.channel_value_sats < books.channel_value_sats { self.listed_for_cut(ldk, uid).await } else { None };
+                match self.book_splice(uid, None, c, weighing, listed_after_msat) {
+                    Some(BookOutcome::Applied { before_msat, after_msat }) => {
+                        booked_msat = after_msat;
+                        splice_booked = true;
+                        // A user's splice-out is spent like a forward: spare BTC first, then backing and the target.
+                        if after_msat < before_msat {
+                            self.apply_booked_spend(ldk, uid, btc_price, "splice").await;
+                            cut_tried = true;
+                        }
+                    }
                     Some(_) => {}
                     // Books left on the old value by a read or write that failed are no evidence of a gap.
                     None => continue,
                 }
             }
+            // The allocation as any cut above left it.
+            let Some((backing_sats, mut native_sats)) =
+                self.stable_channels.iter().find(|sc| sc.user_channel_id == uid).map(|sc| (sc.backing_sats, sc.native_sats))
+            else {
+                continue;
+            };
+            // A spend still marked uncut, or a cut still to be saved, is the cut's to settle, so only backing with nothing left to cut is held to the books.
+            let uncut_left = cut_tried
+                && match self.db.booked_balance(uid) {
+                    Ok(books) => books.is_some_and(|books| books.uncut.is_some()),
+                    Err(e) => {
+                        books_db_failed(true, "booked_balance", uid, &c.channel_id, &e);
+                        continue;
+                    }
+                };
+            let backing_checked_msat = (!uncut_left && !self.pending_book_updates.contains_key(&uid)).then(|| backing_sats.saturating_mul(1000));
+            let backing_msat = backing_checked_msat.unwrap_or(0);
             let live = crate::books::live_user_balance(c, held);
-            let checked_msat = crate::books::booked_with_queued(booked_msat, queued);
-            let (check, transition) = crate::books::check_books(checked_msat, live, &books.check, now_ms);
-            let figures = serde_json::json!({
+            let channel_key = c.channel_id.to_ascii_lowercase();
+            let settlement_pending = settling.as_ref().is_some_and(|settling| settling.contains_key(&channel_key));
+            let top_up_on_the_way = top_ups_in_flight.is_some_and(|in_flight| in_flight.contains(&uid));
+            // A payment still to land or leave explains a gap for this tick, and a list that cannot be read may hold one.
+            let settling_or_unknown = settling_recent.as_ref().is_none_or(|settling| settling.contains(&channel_key));
+            // A listed value the books have not taken yet is a splice still to be booked, not a receipt.
+            let value_unbooked = value_changed && !splice_booked;
+            let legacy_top_up_or_unknown = legacy_top_ups_recent.as_ref().is_none_or(|pending| pending.contains(&uid));
+            let explained = crate::books::Explained {
+                below: events_waiting || settling_or_unknown || legacy_top_up_or_unknown,
+                above: events_waiting
+                    || settling_or_unknown
+                    || value_unbooked
+                    || top_ups_in_flight.is_none_or(|in_flight| in_flight.contains(&uid))
+                    || paying.as_ref().is_none_or(|paying| paying.contains(&uid)),
+            };
+            let mut checked_msat = crate::books::booked_with_queued(booked_msat, queued);
+            let (mut check, mut transition) = crate::books::check_books(checked_msat, live, backing_checked_msat, explained, &books.check, now_ms);
+            // A surplus that lasted with nothing pending is the user's spare BTC: it is booked, then the books, and the backing they hold, are checked again.
+            let mut surplus = None;
+            if check.direction == Some(GapDirection::Above) && check.sightings >= crate::books::BOOKS_SIGHTINGS_TO_PAUSE && !explained.above {
+                let Some(after_msat) = self.book_surplus(uid, &c.channel_id, check.gap_msat, now_ms) else { continue };
+                surplus = Some((check.gap_msat, check.clone()));
+                booked_msat = after_msat;
+                checked_msat = crate::books::booked_with_queued(booked_msat, queued);
+                (check, transition) = crate::books::check_books(checked_msat, live, backing_checked_msat, explained, &books.check, now_ms);
+                native_sats = self.stable_channels.iter().find(|sc| sc.user_channel_id == uid).map_or(native_sats, |sc| sc.native_sats);
+            }
+            let (books_above_live, backing_above_books) =
+                crate::books::gaps_below(checked_msat, live, books.check.accepted_gap_msat, books.check.accepted_backing_gap_msat, backing_msat);
+            let mut figures = serde_json::json!({
                 "booked_msat": booked_msat, "queued_spent_msat": queued.spent_msat, "queued_received_msat": queued.received_msat,
                 "live_low_msat": live.low_msat, "live_high_msat": live.high_msat,
             });
-            // A splice-out waiting to confirm has left the live balance but not yet the books, which move at the lock.
-            let held_for_splice = splice_suspected && check.direction == Some(stable_channels::db::GapDirection::Below);
+            if backing_above_books {
+                figures["backing_msat"] = serde_json::json!(backing_msat);
+                figures["backing_gap_msat"] = serde_json::json!(backing_msat.saturating_sub(checked_msat.max(live.high_msat)));
+            }
+            let seen = crate::books::DisagreementContext {
+                top_up_on_the_way,
+                splice_suspected,
+                settlement_pending,
+                events_waiting,
+                totals_behind_cursor: crate::books::totals_behind_cursor(books.cursor, totals),
+                backing_above_books,
+                live_covers_books: !books_above_live,
+            };
+            let categories = crate::books::disagreement_categories(&check, c, held, &seen);
+            let row = match &surplus {
+                Some((excess_msat, before_booking)) => {
+                    let booked_categories = crate::books::disagreement_categories(before_booking, c, held, &seen);
+                    let row_figures = crate::books::with_figures(serde_json::json!({ "categories": booked_categories }), &figures);
+                    crate::books::transition_row(Some(crate::books::Transition::LastingAbove { excess_msat: *excess_msat }), &check, &row_figures)
+                }
+                None => {
+                    let row_figures = crate::books::with_figures(serde_json::json!({ "categories": categories }), &figures);
+                    crate::books::transition_row(transition, &check, &row_figures)
+                }
+            };
+            // A splice-out waiting to confirm has left the live balance but not yet the books, which move at the lock; once the listing shows a new value the gap is checked as any other.
+            let held_for_splice = splice_suspected && !value_changed && check.direction == Some(stable_channels::db::GapDirection::Below);
             // A check that changed nothing but its time is not written again, so a channel that agrees costs no write a tick.
-            let unchanged = transition.is_none()
+            let unchanged = row.is_none()
+                && transition.is_none()
                 && books.check.checked_at_ms.is_some()
                 && stable_channels::db::BooksCheck { checked_at_ms: books.check.checked_at_ms, ..check.clone() } == books.check;
+            // Whether the books now hold this check: saved this tick, or the same as the one stored.
+            let mut saved = !held_for_splice;
             if !held_for_splice && !unchanged {
-                if let Err(e) = self.db.save_books_check(uid, &check, crate::books::transition_row(transition, &check, &figures)) {
+                if let Err(e) = self.db.save_books_check(uid, &check, row) {
                     books_db_failed(false, "save_books_check", uid, &c.channel_id, &e);
+                    saved = false;
                 }
             }
-            let settlement_pending = settling.as_ref().is_some_and(|settling| settling.contains(&c.channel_id.to_ascii_lowercase()));
+            // The alarm is raised at a pause the books hold and each tick after it; the key changes once a day and with each new pause, so the ledger keeps one a day for each.
+            if saved && check.state == CheckState::Paused {
+                let day = Self::unix_time_secs() / STABILITY_TOP_UP_ALARM_REPEAT_SECS;
+                let since_ms = check.first_seen_ms.unwrap_or_default();
+                stable_channels::audit::audit_event(
+                    "BOOKED_BALANCE_PAUSED",
+                    crate::books::with_figures(
+                        serde_json::json!({
+                            "channel_id": c.channel_id, "user_channel_id": uid.to_string(), "gap_msat": check.gap_msat,
+                            "since_ms": check.first_seen_ms, "categories": categories, "dedup_key": format!("lsp:books-paused:{uid}:{since_ms}:{day}"),
+                        }),
+                        &figures,
+                    ),
+                );
+            }
             // Today's stored native lags receipts and the splices it covers, so it has its own line, logged when the difference changes.
             match crate::books::native_difference(booked_msat, backing_sats, native_sats) {
                 Some((booked_native_sats, difference_sats)) => {
@@ -3745,14 +4291,6 @@ impl StableChannelManager {
             if held_for_splice {
                 continue;
             }
-            let seen = crate::books::DisagreementContext {
-                top_up_on_the_way: top_ups_in_flight.is_some_and(|in_flight| in_flight.contains(&uid)),
-                splice_suspected,
-                settlement_pending,
-                events_waiting,
-                totals_behind_cursor: crate::books::totals_behind_cursor(books.cursor, totals),
-            };
-            let categories = crate::books::disagreement_categories(&check, c, held, &seen);
             if categories.is_empty() {
                 self.books_log_throttle.remove(&uid);
                 continue;
@@ -3773,6 +4311,144 @@ impl StableChannelManager {
             );
             self.books_log_throttle.insert(uid, logged);
         }
+    }
+
+    /// Books what LDK's `totals` for a channel show beyond its books' cursor, less the forwards still `queued` in the inbox, and cuts a spend it books as its own event would have; the books after it and whether it tried a cut, or None when the write failed.
+    async fn catch_up_forwards(
+        &mut self,
+        ldk: &dyn LdkServerCalls,
+        uid: u128,
+        books: &BookedBalance,
+        totals: ForwardCursor,
+        queued: ForwardCursor,
+        btc_price: f64,
+    ) -> Option<(u64, bool)> {
+        let Some(caught) = crate::books::catch_up(books.cursor, totals, queued) else {
+            return Some((books.booked_user_msat, false));
+        };
+        let next = caught.cursor;
+        let listed_after_msat = if caught.net_msat < 0 { self.listed_for_cut(ldk, uid).await } else { None };
+        let change = BookChange {
+            user_channel_id: uid,
+            delta_msat: caught.net_msat,
+            reason: BookReason::ForwardCatchUp,
+            evidence: format!("{}:{}:{}:{}", next.spent_count, next.received_count, next.spent_msat, next.received_msat),
+            cursor: Some(caught.cursor),
+            channel_value_sats: None,
+            detail: serde_json::json!({ "spent_msat": caught.spent_msat, "received_msat": caught.received_msat }),
+            marks_uncut: self.may_cut(uid),
+            listed_after_msat,
+        };
+        match self.db.book(&change) {
+            Ok(BookOutcome::Applied { before_msat, after_msat }) => {
+                self.listed_user_sats.remove(&uid);
+                // A spend booked from LDK's totals is cut as its own event would have cut it; netted receipts cut nothing.
+                let spent = after_msat < before_msat;
+                if spent {
+                    self.apply_booked_spend(ldk, uid, btc_price, "forward_catch_up").await;
+                }
+                Some((after_msat, spent))
+            }
+            Ok(_) => Some((books.booked_user_msat, false)),
+            Err(e) => {
+                books_db_failed(false, "book", uid, &books.channel_id, &e);
+                None
+            }
+        }
+    }
+
+    /// After a reconnect, books the forwards LDK counted beyond each open books' cursor, as the books pass does, before the events after it are handled; it anchors and checks nothing, and a correction still to be saved, or an inbox or totals it cannot read, leave the catch-up to the next tick.
+    pub(crate) async fn catch_up_forwards_after_reconnect(&mut self, ldk: &dyn LdkServerCalls, btc_price: f64) {
+        if !self.hydrated || !self.pending_book_updates.is_empty() || !self.pending_splices.is_empty() {
+            return;
+        }
+        // A forward still waiting in the inbox is its event's to book.
+        let Some(inbox) = self.event_inbox.as_ref() else { return };
+        let queued_forwards = match inbox.queued_forwards() {
+            Ok(queued) => queued,
+            Err(e) => {
+                tracing::warn!("[stable] reconnect catch-up: event inbox unreadable: {}", e);
+                return;
+            }
+        };
+        let totals = match crate::books::forwarding_totals(ldk).await {
+            Ok(totals) => totals,
+            Err(e) => {
+                tracing::warn!("[stable] reconnect catch-up: forwarding totals failed: {}", e);
+                return;
+            }
+        };
+        let tracked: Vec<u128> = self.stable_channels.iter().map(|sc| sc.user_channel_id).collect();
+        for uid in tracked {
+            let books = match self.db.booked_balance(uid) {
+                Ok(Some(books)) if books.closed_at.is_none() => books,
+                Ok(_) => continue,
+                Err(e) => {
+                    books_db_failed(true, "booked_balance", uid, "", &e);
+                    continue;
+                }
+            };
+            let Some(totals) = totals.get(&books.channel_id).copied() else { continue };
+            let queued = queued_forwards.get(&books.channel_id).copied().unwrap_or_default();
+            self.catch_up_forwards(ldk, uid, &books, totals, queued, btc_price).await;
+        }
+    }
+
+    /// Counts a waiting tick for each tracked channel still without books when the books pass cannot run for `blocking`, as the pass itself does, since their top-ups wait for the books all the same.
+    fn note_books_blocked(&mut self, channels: &std::collections::HashMap<u128, Channel>, blocking: &'static str) {
+        let tracked: Vec<u128> = self.stable_channels.iter().map(|sc| sc.user_channel_id).collect();
+        self.books_waiting_ticks.retain(|uid, _| tracked.contains(uid));
+        for uid in tracked {
+            let Some(c) = channels.get(&uid) else { continue };
+            // Open or closed books are not waited for, and books that cannot be read are reported by the read that holds the top-ups.
+            if !matches!(self.db.booked_balance(uid), Ok(None)) {
+                continue;
+            }
+            let reasons = if c.inbound_capacity_msat == 0 { vec![blocking, "reserve_hidden"] } else { vec![blocking] };
+            self.note_books_waiting(uid, &c.channel_id, &reasons);
+        }
+    }
+
+    /// Counts the regular ticks a channel with a target or backing has gone without books, and once it has waited long raises a daily alarm naming what keeps them from starting; a balance that sits inside the reserve is never anchored and keeps today's top-ups, so it raises none.
+    fn note_books_waiting(&mut self, uid: u128, channel_id: &str, blocking: &[&'static str]) {
+        if !self.may_cut(uid) {
+            return;
+        }
+        // Whatever else coincides, a balance inside the reserve can never anchor, so its wait is not counted.
+        if blocking.contains(&"reserve_hidden") {
+            self.books_waiting_ticks.remove(&uid);
+            return;
+        }
+        let ticks = self.books_waiting_ticks.entry(uid).or_insert(0);
+        *ticks = ticks.saturating_add(1);
+        let ticks = *ticks;
+        if ticks < BOOKS_NOT_STARTED_TICKS {
+            return;
+        }
+        let day = Self::unix_time_secs() / STABILITY_TOP_UP_ALARM_REPEAT_SECS;
+        stable_channels::audit::audit_event(
+            "BOOKED_BALANCE_NOT_STARTED",
+            serde_json::json!({
+                "channel_id": channel_id, "user_channel_id": uid.to_string(), "ticks_waiting": ticks, "blocking": blocking,
+                "dedup_key": format!("lsp:books-not-started:{uid}:{day}"),
+            }),
+        );
+    }
+
+    /// Books a surplus that lasted as the user's spare BTC, with native from the books in the same write; the books after it, or None when nothing was booked.
+    fn book_surplus(&mut self, uid: u128, channel_id: &str, excess_msat: u64, now_ms: i64) -> Option<u64> {
+        let change = BookChange {
+            user_channel_id: uid,
+            delta_msat: i64::try_from(excess_msat).unwrap_or(i64::MAX),
+            reason: BookReason::UnattributedReceipt,
+            evidence: now_ms.to_string(),
+            cursor: None,
+            channel_value_sats: None,
+            detail: serde_json::json!({ "excess_msat": excess_msat }),
+            marks_uncut: false,
+            listed_after_msat: None,
+        };
+        self.book_receipt(uid, channel_id, &change)
     }
 
     /// Sign a SYNC_V1 payload and keysend it (1 msat) to the counterparty in custom TLV 13377331.
@@ -3890,7 +4566,7 @@ impl StableChannelManager {
         }
     }
 
-    /// Books one side of a forward from its own amounts, capped by LDK's totals so a handled event books nothing new.
+    /// Books one side of a forward from its own amounts, capped by LDK's totals so a handled event books nothing new; NotAnchored when the channel has no open books, or when they cannot be read for a forward LDK does not count; None when nothing was booked or a read or write failed.
     async fn book_forward(
         &mut self,
         ldk: &dyn LdkServerCalls,
@@ -3903,20 +4579,26 @@ impl StableChannelManager {
         let uid = parse_user_channel_id(user_channel_id)?;
         let books = match self.db.booked_balance(uid) {
             Ok(Some(books)) if books.closed_at.is_none() => books,
-            Ok(_) => return None,
+            Ok(_) => return Some(BookOutcome::NotAnchored),
             Err(e) => {
                 books_db_failed(true, "booked_balance", uid, channel_id, &e);
-                return None;
+                // A forward LDK counts is left to the catch-up, which books it from the totals and cuts it once; one it does not count only the live balance can cut.
+                return (!counted_by_ldk).then_some(BookOutcome::NotAnchored);
             }
         };
         let totals = if counted_by_ldk {
             match ldk.get_channel_forwarding_stats(GetChannelForwardingStatsRequest { channel_id: books.channel_id.clone() }).await {
                 Ok(r) => r.stats.as_ref().map(crate::books::cursor_from_stats),
                 Err(e) => {
+                    // The key changes once a day, so the ledger keeps one record a day for each channel and not one per forward.
                     stable_channels::audit::audit_event(
                         "LDK_CALL_FAILED",
-                        serde_json::json!({ "op": "get_channel_forwarding_stats", "context": "book_forward", "user_channel_id": user_channel_id, "error": e.to_string() }),
+                        serde_json::json!({
+                            "op": "get_channel_forwarding_stats", "context": "book_forward", "user_channel_id": user_channel_id, "error": e.to_string(),
+                            "dedup_key": format!("lsp:books-forward-read:{uid}:{}", Self::unix_time_secs() / STABILITY_TOP_UP_ALARM_REPEAT_SECS),
+                        }),
                     );
+                    // Nothing is booked now: the catch-up books the forward from the totals once they read, and cuts it once.
                     None
                 }
             }
@@ -3937,6 +4619,8 @@ impl StableChannelManager {
             let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
             format!("uncounted:{}:{}", now_ms, amount_msat)
         };
+        let marks_uncut = side == crate::books::ForwardSide::OutOfUser && self.may_cut(uid);
+        let listed_after_msat = if marks_uncut && booked_msat > 0 { self.listed_for_cut(ldk, uid).await } else { None };
         let change = BookChange {
             user_channel_id: uid,
             delta_msat,
@@ -3945,6 +4629,8 @@ impl StableChannelManager {
             cursor: Some(cursor),
             channel_value_sats: None,
             detail: serde_json::json!({ "amount_msat": amount_msat, "counted_by_ldk": counted_by_ldk }),
+            marks_uncut,
+            listed_after_msat,
         };
         match self.db.book(&change) {
             Ok(outcome) => Some(outcome),
@@ -3997,9 +4683,35 @@ impl StableChannelManager {
             cursor: None,
             channel_value_sats: None,
             detail: serde_json::json!({ "amount_msat": amount_msat }),
+            marks_uncut: false,
+            listed_after_msat: None,
         };
-        if let Err(e) = self.db.book(&change) {
+        // A receipt is spare BTC, so a tracked channel's native follows the books in the same write.
+        if self.stable_channels.iter().any(|sc| sc.user_channel_id == uid) {
+            self.book_receipt(uid, &books.channel_id, &change);
+        } else if let Err(e) = self.db.book(&change) {
             books_db_failed(false, "book", uid, &books.channel_id, &e);
+        }
+    }
+
+    /// Books a receipt on a tracked channel and saves its native as the books less backing in the same write; the books after it, or None when nothing new was booked.
+    fn book_receipt(&mut self, uid: u128, channel_id: &str, change: &BookChange) -> Option<u64> {
+        self.listed_user_sats.remove(&uid);
+        let sc = self.stable_channels.iter_mut().find(|sc| sc.user_channel_id == uid)?;
+        let saved = self.db.book_receipt_with_native(change, &sc.channel_id.to_string(), sc.expected_usd.0, sc.backing_sats, sc.note.as_deref());
+        match saved {
+            Ok(Some(after_msat)) => {
+                let booked_sats = after_msat / 1000;
+                sc.stable_receiver_btc = Bitcoin::from_sats(booked_sats);
+                sc.native_sats = booked_sats.saturating_sub(sc.backing_sats);
+                stable_channels::stable::recompute_native(sc);
+                Some(after_msat)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                books_db_failed(false, "book_receipt_with_native", uid, channel_id, &e);
+                None
+            }
         }
     }
 
@@ -4013,14 +4725,17 @@ impl StableChannelManager {
             cursor: None,
             channel_value_sats: None,
             detail,
+            marks_uncut: false,
+            listed_after_msat: None,
         };
         if let Err(e) = self.db.book(&change) {
             books_db_failed(false, "book", uid, channel_id, &e);
         }
     }
 
-    /// Books a locked splice on the user's side: the whole change in channel value when the user made it, nothing when the LSP did; None when there is nothing to book or a read or write failed.
-    fn book_splice(&self, uid: u128, funding_txo: Option<&str>, c: &Channel) -> Option<BookOutcome> {
+    /// Books a locked splice on the user's side: the whole change in channel value when the user made it, nothing when the LSP did; a drop no record gives the LSP is the user's only when their side in `c`, with what `weighing` names counted as theirs, fell by about as much. None when there is nothing to book, a read or write failed, or such a drop comes without `weighing`.
+    fn book_splice(&mut self, uid: u128, funding_txo: Option<&str>, c: &Channel, weighing: Option<SpliceWeighing>, listed_after_msat: Option<u64>) -> Option<BookOutcome> {
+        self.listed_user_sats.remove(&uid);
         let books = match self.db.booked_balance(uid) {
             Ok(Some(books)) if books.closed_at.is_none() => books,
             Ok(_) => return None,
@@ -4045,12 +4760,34 @@ impl StableChannelManager {
                 return None;
             }
         };
-        let delta_msat = if lsp_made {
-            0
+        // The listing decides whose a drop with no record is, never how much is booked.
+        let counted = if !lsp_made && after < before {
+            let weighing = weighing?;
+            // Forwards out of the user that LDK counted or the inbox holds have left the listing but not yet the books.
+            let unbooked_spent_msat = weighing.totals.spent_msat.saturating_sub(books.cursor.spent_msat).max(weighing.queued.spent_msat);
+            let counted_msat = weighing.on_the_way_msat.saturating_add(unbooked_spent_msat);
+            Some((crate::books::live_user_balance(c, counted_msat).high_msat, weighing.on_the_way_msat, unbooked_spent_msat))
         } else {
+            None
+        };
+        // The books are weighed without the gap the operator kept; while the books are paused, a drop no record names is left to the operator with the gap.
+        let weighed_msat = books.booked_user_msat.saturating_sub(books.check.accepted_gap_msat);
+        let user_made = !lsp_made
+            && counted.is_none_or(|(live_msat, _, _)| {
+                books.check.state != CheckState::Paused && crate::books::user_side_fell_by(weighed_msat, live_msat, (before - after).saturating_mul(1000))
+            });
+        let delta_msat = if user_made {
             ((i128::from(after) - i128::from(before)) * 1000).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+        } else {
+            0
         };
         let evidence = if funding.is_empty() { format!("value:{after}") } else { funding };
+        let mut detail = serde_json::json!({ "made_by": if user_made { "user" } else { "lsp" }, "value_before": before, "value_after": after });
+        if let Some((live_msat, on_the_way_msat, unbooked_spent_msat)) = counted {
+            detail["listed_user_msat"] = serde_json::json!(live_msat);
+            detail["on_the_way_msat"] = serde_json::json!(on_the_way_msat);
+            detail["unbooked_spent_msat"] = serde_json::json!(unbooked_spent_msat);
+        }
         let change = BookChange {
             user_channel_id: uid,
             delta_msat,
@@ -4058,7 +4795,9 @@ impl StableChannelManager {
             evidence,
             cursor: None,
             channel_value_sats: Some(after),
-            detail: serde_json::json!({ "made_by": if lsp_made { "lsp" } else { "user" }, "value_before": before, "value_after": after }),
+            detail,
+            marks_uncut: self.may_cut(uid),
+            listed_after_msat,
         };
         match self.db.book(&change) {
             Ok(outcome) => Some(outcome),
@@ -4076,16 +4815,20 @@ impl StableChannelManager {
         channel_id: &str,
         payment_id: &str,
     ) -> Option<u128> {
-        let failed = |op: &str, error: &LdkServerError| {
+        // The key changes once a day, so the ledger keeps one record a day for each channel, or for the node while the channel is not known yet.
+        let failed = |op: &str, scope: &str, error: &LdkServerError| {
             stable_channels::audit::audit_event(
                 "LDK_CALL_FAILED",
-                serde_json::json!({ "op": op, "context": "book_pay_back", "channel_id": channel_id, "payment_id": payment_id, "error": error.to_string() }),
+                serde_json::json!({
+                    "op": op, "context": "book_pay_back", "channel_id": channel_id, "payment_id": payment_id, "error": error.to_string(),
+                    "dedup_key": format!("lsp:books-pay-back-read:{op}:{scope}:{}", Self::unix_time_secs() / STABILITY_TOP_UP_ALARM_REPEAT_SECS),
+                }),
             );
         };
         let channels = match ldk.list_channels(ListChannelsRequest {}).await {
             Ok(response) => response.channels,
             Err(e) => {
-                failed("list_channels", &e);
+                failed("list_channels", "node", &e);
                 return None;
             }
         };
@@ -4101,13 +4844,279 @@ impl StableChannelManager {
         match verified {
             Ok(response) => response.valid.then_some(uid),
             Err(e) => {
-                failed("verify_signature", &e);
+                failed("verify_signature", &uid.to_string(), &e);
                 None
             }
         }
     }
 
-    /// On a forward, reconcile a spend out of a stable channel, then book both sides of it.
+    /// Whether payments to this user wait on the books: the check is paused or watching a gap below, or the books cannot be read.
+    pub(crate) fn books_hold_payments(&self, uid: u128) -> bool {
+        books_hold(&self.db, uid).is_some_and(|hold| hold != BooksHold::NoBooks)
+    }
+
+    /// The user's sats by the channel's open books; None when it has none.
+    fn booked_user_sats(&self, uid: u128) -> Option<u64> {
+        booked_user_msat(&self.db, uid).map(|msat| msat / 1000)
+    }
+
+    /// The user's live balance with their payments still in flight, in msat, and the listing it was read from; None when the node cannot say.
+    async fn live_user_msat(ldk: &dyn LdkServerCalls, uid: u128) -> Option<(u64, Channel)> {
+        // The key changes once a day, so the ledger keeps one record a day and not one per spend.
+        let failed = |op: &str, error: &LdkServerError| {
+            stable_channels::audit::audit_event(
+                "LDK_CALL_FAILED",
+                serde_json::json!({
+                    "op": op, "context": "book_spend", "user_channel_id": uid.to_string(), "error": error.to_string(),
+                    "dedup_key": format!("lsp:books-spend-read:{op}:{uid}:{}", Self::unix_time_secs() / STABILITY_TOP_UP_ALARM_REPEAT_SECS),
+                }),
+            );
+        };
+        let channels = match ldk.list_channels(ListChannelsRequest {}).await {
+            Ok(response) => response.channels,
+            Err(e) => {
+                failed("list_channels", &e);
+                return None;
+            }
+        };
+        let channel = channels.into_iter().find(|c| parse_user_channel_id(&c.user_channel_id) == Some(uid))?;
+        let held = match ldk.get_balances(GetBalancesRequest {}).await {
+            Ok(response) => unresolved_user_payments_msat(&response.lightning_balances),
+            Err(e) => {
+                failed("get_balances", &e);
+                return None;
+            }
+        };
+        let live_msat = crate::books::live_user_balance(&channel, held.get(&channel.channel_id).copied().unwrap_or(0)).high_msat;
+        Some((live_msat, channel))
+    }
+
+    /// The channel as the node lists it now, whose user side without their payments in flight is all of a SYNC's backing the wallet takes; None when the node cannot list it.
+    async fn listed_channel(ldk: &dyn LdkServerCalls, uid: u128) -> Option<Channel> {
+        match ldk.list_channels(ListChannelsRequest {}).await {
+            Ok(response) => response.channels.into_iter().find(|c| parse_user_channel_id(&c.user_channel_id) == Some(uid)),
+            Err(e) => {
+                tracing::warn!("[books] SYNC left to the retry, list_channels failed: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Notes the user's side of each channel from a listing, as `stable_receiver_btc` held it before the books, for matching an unsigned pay-back; a channel whose forward out is still to be booked, or whose inbox cannot be read, has its note removed instead.
+    fn note_listed_users<'a>(&mut self, listed: impl IntoIterator<Item = (u128, &'a Channel)>) {
+        let queued = self.event_inbox.as_ref().map(|inbox| inbox.queued_forwards());
+        for (uid, channel) in listed {
+            let in_doubt = match &queued {
+                None => false,
+                Some(Ok(queued)) => queued.get(&channel.channel_id).is_some_and(|waiting| waiting.spent_count > 0),
+                Some(Err(_)) => true,
+            };
+            if in_doubt {
+                self.listed_user_sats.remove(&uid);
+            } else {
+                self.listed_user_sats.insert(uid, channel_peer_balances(channel).1);
+            }
+        }
+    }
+
+    /// Msat per channel id, in lower case, in pay-backs still to be applied; None when they cannot be read.
+    fn pay_backs_to_apply_msat(&self) -> Option<std::collections::HashMap<String, u64>> {
+        match self.db.pending_inbound_stability_settlements(usize::MAX) {
+            Ok(pending) => {
+                let mut settling: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+                for settlement in pending {
+                    let total = settling.entry(settlement.channel_id.to_ascii_lowercase()).or_insert(0);
+                    *total = total.saturating_add(settlement.amount_msat);
+                }
+                Some(settling)
+            }
+            Err(e) => {
+                tracing::warn!("[stable] books: pending stability settlements unreadable: {}", e);
+                None
+            }
+        }
+    }
+
+    /// What a splice-out on `c` that no record names is weighed with at its lock: payments in flight either way and pay-backs still to be applied, LDK's forwarding totals and the forwards still waiting in the inbox; None when any of it cannot be read, which leaves the splice to the books pass.
+    async fn splice_weighing_at_lock(&self, ldk: &dyn LdkServerCalls, c: &Channel) -> Option<SpliceWeighing> {
+        let queued = match self.event_inbox.as_ref().map(|inbox| inbox.queued_forwards()) {
+            None => ForwardCursor::default(),
+            Some(Ok(queued)) => queued.get(&c.channel_id).copied().unwrap_or_default(),
+            Some(Err(e)) => {
+                tracing::warn!("[splice] event inbox unreadable, a splice-out no record names is left to the books pass: {}", e);
+                return None;
+            }
+        };
+        let settling = self.pay_backs_to_apply_msat()?.get(&c.channel_id.to_ascii_lowercase()).copied().unwrap_or(0);
+        let totals = match ldk.get_channel_forwarding_stats(GetChannelForwardingStatsRequest { channel_id: c.channel_id.clone() }).await {
+            Ok(response) => response.stats.as_ref().map(crate::books::cursor_from_stats).unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!("[splice] get_channel_forwarding_stats failed, a splice-out no record names is left to the books pass: {}", e);
+                return None;
+            }
+        };
+        let balances = match ldk.get_balances(GetBalancesRequest {}).await {
+            Ok(response) => response.lightning_balances,
+            Err(e) => {
+                tracing::warn!("[splice] get_balances failed, a splice-out no record names is left to the books pass: {}", e);
+                return None;
+            }
+        };
+        // A channel the report leaves out may have payments in flight it does not show.
+        let from_user = unresolved_user_payments_msat(&balances).get(&c.channel_id).copied()?;
+        let to_user = unresolved_payments_to_user_msat(&balances).get(&c.channel_id).copied().unwrap_or(0);
+        Some(SpliceWeighing { on_the_way_msat: from_user.saturating_add(to_user).saturating_add(settling), totals, queued })
+    }
+
+    /// Whether a spend out of this channel could cut its target: it is tracked with a target or backing.
+    fn may_cut(&self, uid: u128) -> bool {
+        self.stable_channels.iter().any(|sc| sc.user_channel_id == uid && (sc.expected_usd.0 > 0.0 || sc.backing_sats > 0))
+    }
+
+    /// The user's live balance, read after a spend left, that bounds what the spend is weighed from while the books show a gap below; None on any other channel, or when it cannot be read.
+    async fn listed_for_cut(&self, ldk: &dyn LdkServerCalls, uid: u128) -> Option<u64> {
+        if !self.may_cut(uid) || !matches!(books_hold(&self.db, uid), Some(BooksHold::Paused | BooksHold::GapBelow)) {
+            return None;
+        }
+        Self::live_user_msat(ldk, uid).await.map(|(live_msat, _)| live_msat)
+    }
+
+    /// Cuts the spends a channel's books mark uncut by the overflow each booking weighed: backing falls by it and the target by its value at `btc_price`; the save that cuts them clears the mark. True when the target was cut.
+    async fn apply_booked_spend(&mut self, ldk: &dyn LdkServerCalls, uid: u128, btc_price: f64, context: &'static str) -> bool {
+        let books = match self.db.booked_balance(uid) {
+            Ok(books) => books.filter(|books| books.closed_at.is_none()),
+            Err(e) => {
+                books_db_failed(true, "booked_balance", uid, "", &e);
+                return false;
+            }
+        };
+        let Some((books, uncut)) = books.and_then(|books| books.uncut.map(|uncut| (books, uncut))) else {
+            return false;
+        };
+        // Without a price the overflow cannot be valued in dollars, and a cut still to be saved must land first; the mark keeps the spends for the next tick.
+        if btc_price <= 0.0 || self.pending_book_updates.contains_key(&uid) {
+            // The key changes once a day, so the ledger keeps one record a day for each channel and not one per tick.
+            let day = Self::unix_time_secs() / STABILITY_TOP_UP_ALARM_REPEAT_SECS;
+            stable_channels::audit::audit_event(
+                "BOOKED_BALANCE_CUT_DEFERRED",
+                serde_json::json!({
+                    "channel_id": books.channel_id, "user_channel_id": uid.to_string(), "source": context,
+                    "reason": if btc_price <= 0.0 { "price_unavailable" } else { "cut_not_saved" },
+                    "uncut_spend_msat": uncut.spent_msat, "uncut_overflow_msat": uncut.overflow_msat,
+                    "dedup_key": format!("lsp:books-cut-deferred:{uid}:{day}"),
+                }),
+            );
+            return false;
+        }
+        self.cut_booked_spend(ldk, uid, uncut, context, books.booked_user_msat, btc_price).await
+    }
+
+    /// Cuts the spends the channel's books still mark uncut, as the next tick would, before a trade or an edit is weighed on it; Some(false) while any are left to cut, None when the books cannot be read.
+    async fn cut_waiting_spend(&mut self, ldk: &dyn LdkServerCalls, uid: u128, btc_price: f64) -> Option<bool> {
+        if !spend_waits_to_be_cut(&self.db, uid)? {
+            return Some(true);
+        }
+        self.apply_booked_spend(ldk, uid, btc_price, "deferred").await;
+        let waiting = spend_waits_to_be_cut(&self.db, uid)?;
+        Some(!waiting && !self.pending_book_updates.contains_key(&uid))
+    }
+
+    /// Cuts the booked spends `uncut` on a copy of the channel and saves it; a save that fails is kept as a pending book update, retried before anything else changes the channel. True when the target was cut.
+    async fn cut_booked_spend(
+        &mut self,
+        ldk: &dyn LdkServerCalls,
+        uid: u128,
+        uncut: UncutSpends,
+        context: &'static str,
+        booked_now_msat: u64,
+        btc_price: f64,
+    ) -> bool {
+        let Some(idx) = self.stable_channels.iter().position(|sc| sc.user_channel_id == uid) else {
+            return false;
+        };
+        self.listed_user_sats.remove(&uid);
+        let spend_sats = uncut.spent_msat.div_ceil(1000);
+        let booked_now_sats = booked_now_msat / 1000;
+        let mut proposed = self.stable_channels[idx].clone();
+        let backing_before = proposed.backing_sats;
+        let old_expected = proposed.expected_usd.0;
+        // The overflow was weighed when each spend was booked, so what moved backing since never changes the cut.
+        let usd_deducted = stable_channels::stable::reconcile_overflow(&mut proposed, uncut.overflow_msat.div_ceil(1000), btc_price);
+        proposed.stable_receiver_btc = Bitcoin::from_sats(booked_now_sats);
+        proposed.stable_receiver_usd = USD::from_bitcoin(proposed.stable_receiver_btc, btc_price);
+        proposed.native_sats = booked_now_sats.saturating_sub(proposed.backing_sats);
+        stable_channels::stable::recompute_native(&mut proposed);
+        let channel_id = proposed.channel_id.to_string();
+        let mut audits = Vec::new();
+        if let Some(usd_deducted) = usd_deducted {
+            let stable_sats_spent = backing_before.saturating_sub(proposed.backing_sats).min(spend_sats);
+            let native_sats_spent = spend_sats - stable_sats_spent;
+            // A splice-out keeps the name the operator's history already shows for it.
+            let event = if context == "splice" { "SPLICE_OUT_STABLE_DEDUCTED" } else { "STABLE_SPEND_DEDUCTED" };
+            audits.push((
+                event,
+                serde_json::json!({
+                    "channel_id": channel_id,
+                    "user_channel_id": uid.to_string(),
+                    "source": context,
+                    "total_sats_spent": spend_sats,
+                    "native_sats_spent": native_sats_spent,
+                    "stable_sats_spent": stable_sats_spent,
+                    "usd_deducted": usd_deducted,
+                    "old_expected_usd": old_expected,
+                    "new_expected_usd": proposed.expected_usd.0,
+                    "btc_price": btc_price,
+                    "uncut_overflow_msat": uncut.overflow_msat,
+                }),
+            ));
+            info!(
+                "[books] channel user_id={} {} spent {} sats ({} native, {} stable), expected_usd ${:.2} -> ${:.2}",
+                uid, context, spend_sats, native_sats_spent, stable_sats_spent, old_expected, proposed.expected_usd.0
+            );
+        }
+        let (expected_usd, backing_sats, counterparty) = (proposed.expected_usd.0, proposed.backing_sats, proposed.counterparty.to_string());
+        // A top-up still in flight must stay undoable after this spend.
+        let saved = self.db.save_channel_after_booked_spend(
+            &channel_id,
+            &uid.to_string(),
+            expected_usd,
+            backing_sats,
+            proposed.native_sats,
+            proposed.note.as_deref(),
+            uncut,
+        );
+        if let Err(e) = saved {
+            error!("[books] save_channel after a {} spend failed: {}", context, e);
+            stable_channels::audit::audit_event(
+                "DB_WRITE_FAILED",
+                serde_json::json!({ "op": "save_channel", "channel_id": channel_id, "context": context, "user_channel_id": uid.to_string(), "error": e.to_string() }),
+            );
+            let deducted = usd_deducted.is_some();
+            let pending = PendingBookUpdate { channel_id, proposed, context, audits, needs_sync: deducted, clears_uncut: Some(uncut) };
+            self.pending_book_updates.insert(uid, pending);
+            return deducted;
+        }
+        self.stable_channels[idx] = proposed;
+        for (event, data) in audits {
+            stable_channels::audit::audit_event(event, data);
+        }
+        if usd_deducted.is_some() {
+            // Backing above the books still holds another spend, and the wallet takes backing only up to its balance without its payments in flight: publish once both hold it.
+            let synced_from = if backing_sats <= booked_now_sats { Self::listed_channel(ldk, uid).await } else { None };
+            let sent = synced_from.as_ref().is_some_and(|c| backing_sats <= channel_peer_balances(c).1)
+                && self.send_sync_message(ldk, uid, &channel_id, expected_usd, backing_sats, &counterparty).await;
+            if !sent {
+                self.startup_sync_pending.insert(uid);
+            }
+            // A listing this cut read came after the books last moved, so an unsigned pay-back is matched against it.
+            if let Some(channel) = synced_from {
+                self.note_listed_users([(uid, &channel)]);
+            }
+        }
+        usd_deducted.is_some()
+    }
+
+    /// On a forward, book the spend out of the user first and cut it from the books, or from the live balance on a channel without books; then book the receiving side, unless LDK reports no fee for it.
     pub async fn handle_payment_forwarded(
         &mut self,
         prev_user_channel_id: String,
@@ -4117,35 +5126,48 @@ impl StableChannelManager {
         prev_node_id: String,
         next_node_id: String,
         outbound_amount_forwarded_msat: u64,
-        fee_msat: u64,
+        fee_msat: Option<u64>,
         skimmed_fee_msat: Option<u64>,
         counted_by_ldk: bool,
         ldk: &dyn LdkServerCalls,
         btc_price: f64,
     ) {
-        // The spend check reads the live balance first, as it did before the books, so booking never delays it.
+        let fee_known = fee_msat.is_some();
+        let fee_msat = fee_msat.unwrap_or(0);
+        let total_msat = outbound_amount_forwarded_msat.saturating_add(fee_msat);
+        // A forward moves both users' sides, so neither listed side stands until a listing gives it again.
+        for uid in [Some(prev_user_channel_id.as_str()), next_user_channel_id.as_deref()].into_iter().flatten().filter_map(parse_user_channel_id) {
+            self.listed_user_sats.remove(&uid);
+        }
+        let booked = self.book_forward(ldk, &prev_user_channel_id, &prev_channel_id, crate::books::ForwardSide::OutOfUser, total_msat, counted_by_ldk).await;
         self.deduct_forwarded_spend(
             prev_user_channel_id.clone(),
             next_user_channel_id.clone(),
-            prev_channel_id.clone(),
+            prev_channel_id,
             next_channel_id.clone(),
             prev_node_id,
             next_node_id,
             outbound_amount_forwarded_msat,
             fee_msat,
             skimmed_fee_msat,
+            booked == Some(BookOutcome::NotAnchored),
             ldk,
             btc_price,
         )
         .await;
-        let total_msat = outbound_amount_forwarded_msat.saturating_add(fee_msat);
-        self.book_forward(ldk, &prev_user_channel_id, &prev_channel_id, crate::books::ForwardSide::OutOfUser, total_msat, counted_by_ldk).await;
-        if let Some(next_user_channel_id) = next_user_channel_id.as_deref() {
+        // A repeated or empty booking cuts nothing, and one whose write failed is left to the next catch-up.
+        if let (Some(BookOutcome::Applied { before_msat, after_msat }), Some(uid)) = (booked, parse_user_channel_id(&prev_user_channel_id)) {
+            if after_msat < before_msat {
+                self.apply_booked_spend(ldk, uid, btc_price, "forward").await;
+            }
+        }
+        // LDK may report a forward with no fee more than once, so its receipt is left to the books check, which books a lasting surplus once.
+        if let Some(next_user_channel_id) = next_user_channel_id.as_deref().filter(|_| fee_known) {
             self.book_forward(ldk, next_user_channel_id, &next_channel_id, crate::books::ForwardSide::IntoUser, outbound_amount_forwarded_msat, counted_by_ldk).await;
         }
     }
 
-    /// On a forward out of a stable channel, reconcile the spend: native BTC first, overflow reduces `expected_usd`.
+    /// Records a forward, and with `from_live` reconciles a spend out of a stable channel from the live balance: native BTC first, overflow reduces `expected_usd`.
     async fn deduct_forwarded_spend(
         &mut self,
         prev_user_channel_id: String,
@@ -4157,6 +5179,7 @@ impl StableChannelManager {
         outbound_amount_forwarded_msat: u64,
         fee_msat: u64,
         skimmed_fee_msat: Option<u64>,
+        from_live: bool,
         ldk: &dyn LdkServerCalls,
         btc_price: f64,
     ) {
@@ -4193,15 +5216,6 @@ impl StableChannelManager {
             );
         }
 
-        // A payment to a user with an open spend check cannot cover a spend made before it.
-        if let Some(check) = next_user_channel_id
-            .as_deref()
-            .and_then(parse_user_channel_id)
-            .and_then(|uid| self.spend_debounce.get_mut(&uid))
-        {
-            check.received_msat = check.received_msat.saturating_add(outbound_amount_forwarded_msat);
-        }
-
         let Some(target_uid) = parse_user_channel_id(&prev_user_channel_id) else {
             return;
         };
@@ -4212,9 +5226,9 @@ impl StableChannelManager {
         {
             return; // forward was not on a stable channel
         }
-        if let Some(check) = self.spend_debounce.get_mut(&target_uid) {
-            // Sats received during the check are native, so a spend uses them first, even one this handler cannot book.
-            check.received_msat = check.received_msat.saturating_sub(total_msat);
+        if !from_live {
+            // A channel with books has its spend cut from them.
+            return;
         }
 
         // gRPC ForwardedPayment carries no balance, so reconstruct the pre-forward balance as live-post + total.
@@ -4238,6 +5252,7 @@ impl StableChannelManager {
         };
         let (_, post_user_sats) = channel_peer_balances(&chan);
         let channel_id_hex = chan.channel_id.clone();
+        self.note_listed_users([(target_uid, &chan)]);
 
         let persisted = {
             let Some(sc) = self
@@ -4324,8 +5339,6 @@ impl StableChannelManager {
                 serde_json::json!({ "op": "save_channel", "channel_id": channel_id_hex, "context": "handle_payment_forwarded", "user_channel_id": ucid_str, "error": e.to_string() }),
             );
         }
-        // A forward that explains the shortfall a tick saw ends its check.
-        close_spend_check_if_covered(&mut self.spend_debounce, target_uid, &chan, backing_sats);
         if deducted {
             // Backing above the live balance still holds an unreconciled spend. Publish once the books match it.
             let sent = backing_sats <= post_user_sats
@@ -4345,8 +5358,7 @@ impl StableChannelManager {
         }
     }
 
-    /// Post-confirmation splice reconcile: refresh the new balance, infer any stable-spend overflow
-    /// via reconcile_outgoing, persist, and SYNC the wallet if stable value was deducted.
+    /// Post-confirmation splice reconcile: book the user's change and cut a splice-out from the books, or on a channel without books infer the overflow from the live balance via reconcile_outgoing; persist, and SYNC the wallet if stable value was deducted.
     async fn handle_channel_ready_splice(
         &mut self,
         uid: u128,
@@ -4390,27 +5402,53 @@ impl StableChannelManager {
         else {
             return;
         };
-        self.book_splice(uid, funding_txo, &c);
+        // A splice-out no record names is weighed here, once; when a figure it needs cannot be read, the books pass weighs it.
+        let weighing = self.splice_weighing_at_lock(ldk, &c).await;
+        let value_fell = self.db.booked_balance(uid).ok().flatten().is_some_and(|books| books.closed_at.is_none() && c.channel_value_sats < books.channel_value_sats);
+        let listed_after_msat = if value_fell { self.listed_for_cut(ldk, uid).await } else { None };
+        let booking = self.book_splice(uid, funding_txo, &c, weighing, listed_after_msat);
+        // Books that hold this listing's value give the user's side; a channel without books takes the live balance, as before the books; books that cannot be read or have not taken this splice give neither, and the books pass books it from the listing later.
+        let books_msat = match self.db.booked_balance(uid) {
+            Ok(Some(books)) if books.closed_at.is_none() => Some((books.channel_value_sats == c.channel_value_sats).then_some(books.booked_user_msat)),
+            Ok(_) => None,
+            Err(e) => {
+                books_db_failed(true, "booked_balance", uid, &c.channel_id, &e);
+                Some(None)
+            }
+        };
+        let booked_msat = books_msat.flatten();
         let (our_sats, their_sats) = channel_peer_balances(&c);
         let channel_id_hex = c.channel_id.clone();
         let new_channel_id_bytes = parse_channel_id_hex(&c.channel_id);
+        let before_receiver_sats = self.stable_channels[idx].stable_receiver_btc.sats;
+        // A user's splice-out this event booked is spent like a forward, through the mark its booking wrote: spare BTC first, then backing and the target.
+        let spliced_out = matches!(booking, Some(BookOutcome::Applied { before_msat, after_msat }) if after_msat < before_msat);
+        let booked_cut = spliced_out && booked_msat.is_some() && self.apply_booked_spend(ldk, uid, btc_price, "splice").await;
 
-        // Reconcile a copy so a failed save also preserves the old channel id and cooldown.
-        let mut proposed = self.stable_channels[idx].clone();
-        let before_receiver_sats = proposed.stable_receiver_btc.sats;
+        // Reconcile a copy so a failed save also preserves the old channel id and cooldown; a cut above whose save failed is built on, so this save carries it.
+        let (mut proposed, mut audits, cut_needs_sync, clears_uncut) = match self.pending_book_updates.remove(&uid) {
+            Some(cut) => (cut.proposed, cut.audits, cut.needs_sync, cut.clears_uncut),
+            None => (self.stable_channels[idx].clone(), Vec::new(), false, None),
+        };
         let (splice_direction, splice_amount_sats) =
             splice_balance_change(before_receiver_sats, their_sats);
         proposed.channel_id =
             ldk_node::lightning::ln::types::ChannelId::from_bytes(new_channel_id_bytes);
         proposed.stable_provider_btc = Bitcoin::from_sats(our_sats);
-        proposed.stable_receiver_btc = Bitcoin::from_sats(their_sats);
+        proposed.stable_receiver_btc = Bitcoin::from_sats(booked_msat.map_or(their_sats, |msat| msat / 1000));
         proposed.stable_provider_usd = USD::from_bitcoin(proposed.stable_provider_btc, btc_price);
         proposed.stable_receiver_usd = USD::from_bitcoin(proposed.stable_receiver_btc, btc_price);
         proposed.latest_price = btc_price;
-        stable_channels::stable::recompute_native(&mut proposed);
-        let usd_deducted = stable_channels::stable::reconcile_outgoing(&mut proposed, btc_price);
+        // On books only the splice's own booking cuts; backing above them, or above a listing they have not taken, is a gap for the check, never a cut here.
+        let usd_deducted = if books_msat.is_some() {
+            proposed.native_sats = proposed.stable_receiver_btc.sats.saturating_sub(proposed.backing_sats);
+            stable_channels::stable::recompute_native(&mut proposed);
+            None
+        } else {
+            stable_channels::stable::recompute_native(&mut proposed);
+            stable_channels::stable::reconcile_outgoing(&mut proposed, btc_price)
+        };
         let ucid_str = uid.to_string();
-        let mut audits = Vec::new();
         if let Some(d) = usd_deducted {
             audits.push((
                 "SPLICE_OUT_STABLE_DEDUCTED",
@@ -4435,7 +5473,7 @@ impl StableChannelManager {
                 "after_live_receiver_sats": their_sats,
                 "before_btc_price": btc_price,
                 "btc_price": btc_price,
-                "deducted": usd_deducted.is_some(),
+                "deducted": usd_deducted.is_some() || booked_cut,
             }),
         ));
         self.pending_book_updates.insert(
@@ -4445,7 +5483,8 @@ impl StableChannelManager {
                 proposed,
                 context: "handle_channel_ready_splice",
                 audits,
-                needs_sync: usd_deducted.is_some(),
+                needs_sync: usd_deducted.is_some() || cut_needs_sync,
+                clears_uncut,
             },
         );
         if self.persist_pending_book_update(uid) {
@@ -4464,11 +5503,42 @@ impl StableChannelManager {
         btc_price: f64,
     ) -> Handled {
         let mut handled = Handled::Done;
-        self.decide_trade(raw, inbound_payment_id, amount_msat, ldk, btc_price, &mut handled).await;
+        let mut undecided = None;
+        self.decide_trade(raw, inbound_payment_id, amount_msat, ldk, btc_price, &mut handled, &mut undecided).await;
+        // A request to be handled again keeps its fee for the refusal should it be given up; one decided with its fee no longer needs it, and one that ended before its fee was reached refuses the fee kept.
+        match (handled, undecided) {
+            (Handled::Retry, Some(undecided)) => {
+                self.undecided_trade_fees.insert(undecided.fee.evidence.clone(), undecided);
+            }
+            (Handled::Done, Some(_)) => {
+                if let Some(payment_id) = inbound_payment_id {
+                    self.undecided_trade_fees.remove(payment_id);
+                }
+            }
+            (Handled::Done, None) => {
+                if let Some(payment_id) = inbound_payment_id {
+                    self.refuse_undecided_trade(payment_id, "undecidable");
+                }
+            }
+            (Handled::Retry, None) => {}
+        }
         handled
     }
 
-    /// Sets `handled` to Retry, deciding nothing, when LDK Server didn't answer a read the decision needs.
+    /// Refuses the fee of a trade request the event loop gave up handling again, which no decision can take any more: it is recorded as refused for good, and its fee booked in the same write for the tick to cut.
+    pub(crate) fn give_up_trade(&mut self, payment_id: &str) {
+        self.refuse_undecided_trade(payment_id, "timed_out");
+    }
+
+    /// Refuses the fee kept for a trade request handled again, if any, for `reason_code`.
+    fn refuse_undecided_trade(&mut self, payment_id: &str, reason_code: &str) {
+        if let Some(undecided) = self.undecided_trade_fees.remove(payment_id) {
+            self.refuse_trade_fee(Some(&undecided.fee), &undecided.channel_id, &undecided.user_channel_id, &undecided.counterparty, &undecided.request_hash, reason_code, None);
+        }
+    }
+
+    /// Sets `handled` to Retry, deciding nothing, when LDK Server didn't answer a read the decision needs, and `undecided` to the fee to refuse should the request never be decided.
+    #[allow(clippy::too_many_arguments)]
     async fn decide_trade(
         &mut self,
         raw: &str,
@@ -4477,6 +5547,7 @@ impl StableChannelManager {
         ldk: &dyn LdkServerCalls,
         btc_price: f64,
         handled: &mut Handled,
+        undecided: &mut Option<UndecidedTradeFee>,
     ) {
         let Some(envelope) = crate::messages::parse_envelope(raw) else {
             stable_channels::audit::audit_event("TRADE_PARSE_SIGNED_FAILED", serde_json::json!({}));
@@ -4580,18 +5651,36 @@ impl StableChannelManager {
                 );
             }
         }
-        // The fee arrived whatever the trade's decision, old format included, so it is booked now that the signature proves its channel.
-        if let (Some(uid), Some(payment_id), Some(fee_msat)) = (
+        // The fee arrived whatever the trade's decision, old format included, and the signature proves its channel: it is booked with the decision, unmarked when accepted, and otherwise marked for the tick to cut.
+        let fee = match (
             parse_user_channel_id(&chan.user_channel_id),
             inbound_payment_id.filter(|payment_id| stable_channels::trade::is_payment_id(payment_id)),
             amount_msat,
         ) {
-            let detail = serde_json::json!({ "amount_msat": fee_msat, "trade_id": payload.trade_id });
-            self.book_paid_to_lsp(uid, &chan.channel_id, BookReason::TradeFee, payment_id, fee_msat, detail);
-        }
+            (Some(uid), Some(payment_id), Some(fee_msat)) => Some(BookChange {
+                user_channel_id: uid,
+                delta_msat: -(fee_msat.min(i64::MAX as u64) as i64),
+                reason: BookReason::TradeFee,
+                evidence: payment_id.to_owned(),
+                cursor: None,
+                channel_value_sats: None,
+                detail: serde_json::json!({ "amount_msat": fee_msat, "trade_id": payload.trade_id }),
+                marks_uncut: self.may_cut(uid),
+                listed_after_msat: self.listed_for_cut(ldk, uid).await,
+            }),
+            _ => None,
+        };
+        let request_hash = stable_channels::trade::request_hash(envelope.payload.as_bytes());
+        *undecided = fee.clone().map(|fee| UndecidedTradeFee {
+            fee,
+            channel_id: chan.channel_id.clone(),
+            user_channel_id: chan.user_channel_id.clone(),
+            counterparty: chan.counterparty_node_id.clone(),
+            request_hash: request_hash.clone(),
+        });
 
         if payload.trade_id.is_none() {
-            self.refuse_old_format_trade(ldk, &chan, inbound_payment_id, amount_msat).await;
+            self.refuse_old_format_trade(ldk, &chan, inbound_payment_id, amount_msat, fee.as_ref(), &request_hash).await;
             return;
         }
         if let Some(trade_id) = payload.trade_id.as_deref() {
@@ -4605,6 +5694,8 @@ impl StableChannelManager {
                     "TRADE_CORRELATION_INVALID",
                     serde_json::json!({ "channel_id": chan.channel_id }),
                 );
+                // No decision can take a request that cannot be correlated, so its fee is refused now.
+                self.refuse_trade_fee(fee.as_ref(), &chan.channel_id, &chan.user_channel_id, &chan.counterparty_node_id, &request_hash, "correlation_invalid", None);
                 return;
             }
             let Some(inbound_payment_id) = inbound_payment_id
@@ -4623,7 +5714,6 @@ impl StableChannelManager {
                 );
                 return;
             };
-            let request_hash = stable_channels::trade::request_hash(envelope.payload.as_bytes());
             let now = Self::unix_time_secs();
             let correlation_payment_id = match Self::correlation_payment_id(ldk, inbound_payment_id).await {
                 Ok(id) => id,
@@ -4661,6 +5751,7 @@ impl StableChannelManager {
                         &chan.user_channel_id,
                         &chan.counterparty_node_id,
                         TradeRejectionReason::InternalFailure,
+                        fee.as_ref(),
                     )
                     .await;
                     return;
@@ -4672,6 +5763,8 @@ impl StableChannelManager {
                         "TRADE_ID_REUSED",
                         serde_json::json!({ "trade_id": trade_id }),
                     );
+                    // The trade id's decision is already taken, so no decision can take this payment's fee.
+                    self.refuse_trade_fee(fee.as_ref(), &chan.channel_id, &chan.user_channel_id, &chan.counterparty_node_id, &request_hash, "trade_id_reused", None);
                     return;
                 }
                 Ok(None) => {}
@@ -4686,6 +5779,7 @@ impl StableChannelManager {
                         &chan.user_channel_id,
                         &chan.counterparty_node_id,
                         TradeRejectionReason::InternalFailure,
+                        fee.as_ref(),
                     )
                     .await;
                     return;
@@ -4704,6 +5798,7 @@ impl StableChannelManager {
                         &chan.user_channel_id,
                         &chan.counterparty_node_id,
                         $reason,
+                        fee.as_ref(),
                     )
                     .await;
                     return;
@@ -4730,6 +5825,19 @@ impl StableChannelManager {
                 .cloned()
             else {
                 reject_correlated!(TradeRejectionReason::InternalFailure);
+            };
+            // With a price, a spend still marked uncut is cut first, so every check and the allocation use the target after it; a cut not saved yet holds the trade for the event loop's retry.
+            let current = if btc_price.is_finite() && btc_price > 0.0 {
+                match self.cut_waiting_spend(ldk, target_uid, btc_price).await {
+                    Some(true) => self.stable_channels.iter().find(|channel| channel.user_channel_id == target_uid).cloned().unwrap_or(current),
+                    Some(false) => {
+                        *handled = Handled::Retry;
+                        return;
+                    }
+                    None => reject_correlated!(TradeRejectionReason::InternalFailure),
+                }
+            } else {
+                current
             };
             let new_expected =
                 stable_channels::stable::normalize_trade_expected_usd(payload.expected_usd);
@@ -4771,7 +5879,24 @@ impl StableChannelManager {
                 reject_correlated!(TradeRejectionReason::QuoteDeviation);
             }
             let (our_sats, their_sats) = channel_peer_balances(&chan);
-            let receiver_usd = USD::from_bitcoin(Bitcoin::from_sats(their_sats), btc_price).0;
+            // The fee is booked with this decision, so the books are read as they will stand after it; a fee already booked is not taken twice.
+            let fee_to_book_msat = match &fee {
+                Some(fee) => match self.db.has_booking(target_uid, BookReason::TradeFee, &fee.evidence) {
+                    Ok(booked) => if booked { 0 } else { fee.delta_msat.unsigned_abs() },
+                    Err(_) => reject_correlated!(TradeRejectionReason::InternalFailure),
+                },
+                None => 0,
+            };
+            let booked_sats = booked_user_msat(&self.db, target_uid).map(|msat| msat.saturating_sub(fee_to_book_msat) / 1000);
+            // While the books show a gap below, the user holds no more than the smaller of the books and the balance, so a trade cannot back sats already spent.
+            let payments_held = self.books_hold_payments(target_uid);
+            let user_sats = match booked_sats {
+                Some(booked_sats) if payments_held => booked_sats.min(their_sats),
+                _ => their_sats,
+            };
+            let mut checked_chan = chan.clone();
+            checked_chan.inbound_capacity_msat = checked_chan.inbound_capacity_msat.saturating_sub((their_sats - user_sats).saturating_mul(1000));
+            let receiver_usd = USD::from_bitcoin(Bitcoin::from_sats(user_sats), btc_price).0;
             if new_expected > receiver_usd {
                 reject_correlated!(TradeRejectionReason::InsufficientCapacity);
             }
@@ -4783,7 +5908,7 @@ impl StableChannelManager {
 
             let mut updated = current.clone();
             updated.stable_provider_btc = Bitcoin::from_sats(our_sats);
-            updated.stable_receiver_btc = Bitcoin::from_sats(their_sats);
+            updated.stable_receiver_btc = Bitcoin::from_sats(user_sats);
             updated.stable_provider_usd =
                 USD::from_bitcoin(updated.stable_provider_btc, btc_price);
             updated.stable_receiver_usd =
@@ -4806,7 +5931,7 @@ impl StableChannelManager {
                 reject_correlated!(reason);
             }
             // Trade-entry only: never apply the cap in settlement/reconciliation.
-            if max_stabilization_rejected(self.enforce_max_stabilization, &chan,
+            if max_stabilization_rejected(self.enforce_max_stabilization, &checked_chan,
                 current.expected_usd.0, new_expected, updated.backing_sats, "correlated")
             {
                 reject_correlated!(TradeRejectionReason::InsufficientCapacity);
@@ -4851,7 +5976,8 @@ impl StableChannelManager {
             };
             let response_envelope =
                 crate::messages::build_envelope(acceptance_payload, signature);
-            let native_sats = their_sats.saturating_sub(updated.backing_sats);
+            // Spare BTC is what the books hold, after this trade's fee, beyond the new backing; with a gap below, what the user holds.
+            let native_sats = if payments_held { user_sats } else { booked_sats.unwrap_or(their_sats) }.saturating_sub(updated.backing_sats);
             match self.db.persist_trade_acceptance(
                 inbound_payment_id,
                 trade_id,
@@ -4865,6 +5991,7 @@ impl StableChannelManager {
                 sync_version,
                 now,
                 &response_envelope,
+                fee.as_ref(),
             ) {
                 Ok(true) => {
                     updated.native_sats = native_sats;
@@ -4876,8 +6003,7 @@ impl StableChannelManager {
                     {
                         *in_memory = updated.clone();
                     }
-                    // A trade can move received sats into backing, so an open spend check starts over.
-                    self.spend_debounce.remove(&target_uid);
+                    self.note_listed_users([(target_uid, &chan)]);
                     stable_channels::audit::audit_event(
                         "TRADE_ACCEPTED",
                         serde_json::json!({
@@ -4909,18 +6035,24 @@ impl StableChannelManager {
         chan: &Channel,
         inbound_payment_id: Option<&str>,
         amount_msat: Option<u64>,
+        fee: Option<&BookChange>,
+        request_hash: &str,
     ) {
-        stable_channels::audit::audit_event(
-            "TRADE_LEGACY_REFUSED",
-            serde_json::json!({
-                "channel_id": chan.channel_id,
-                "user_channel_id": chan.user_channel_id.clone(),
-                "counterparty_node_id": chan.counterparty_node_id,
-                "payment_id": inbound_payment_id,
-                "amount_msat": amount_msat,
-                "reason_code": "legacy_format",
-            }),
-        );
+        let mut record = serde_json::json!({
+            "channel_id": chan.channel_id,
+            "user_channel_id": chan.user_channel_id.clone(),
+            "counterparty_node_id": chan.counterparty_node_id,
+            "payment_id": inbound_payment_id,
+            "amount_msat": amount_msat,
+            "reason_code": "legacy_format",
+        });
+        // The refusal is recorded with its fee's booking, marked for the tick to cut; the same key keeps the line below from writing it twice.
+        if let Some(fee) = fee {
+            record["dedup_key"] = serde_json::json!(format!("lsp:trade-legacy-refused:{}", fee.evidence));
+            let draft = stable_channels::ledger::LedgerEventDraft::from_audit_event("TRADE_LEGACY_REFUSED", record.clone());
+            self.refuse_trade_fee(Some(fee), &chan.channel_id, &chan.user_channel_id, &chan.counterparty_node_id, request_hash, "legacy_format", Some(&draft));
+        }
+        stable_channels::audit::audit_event("TRADE_LEGACY_REFUSED", record);
         let Some(uid) = parse_user_channel_id(&chan.user_channel_id) else {
             return;
         };
@@ -5137,12 +6269,16 @@ pub(crate) mod tests {
         pub sends_unrecorded: AtomicUsize,
         /// Every splice-in the node accepted.
         pub splice_ins: StdMutex<Vec<SpliceInRequest>>,
+        /// Every splice-out the node accepted.
+        pub splice_outs: StdMutex<Vec<SpliceOutRequest>>,
         /// The error the node answers every splice-in with, when set.
         pub splice_in_error: StdMutex<Option<(LdkServerErrorCode, String)>>,
         /// Confirmed on-chain sats the node reports as spendable.
         pub spendable_onchain_sats: std::sync::atomic::AtomicU64,
         /// Runs once inside the next balance read: something that happens while a caller is away from its tables.
         pub balances_hook: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// Runs once inside the next payment lookup, as `balances_hook` does inside a balance read.
+        pub payment_lookup_hook: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
         /// Channel listings and per-channel totals reads, in the order they were asked for.
         pub calls: StdMutex<Vec<&'static str>>,
     }
@@ -5192,9 +6328,11 @@ pub(crate) mod tests {
                 sends_unanswered: AtomicUsize::new(0),
                 sends_unrecorded: AtomicUsize::new(0),
                 splice_ins: StdMutex::new(Vec::new()),
+                splice_outs: StdMutex::new(Vec::new()),
                 splice_in_error: StdMutex::new(None),
                 spendable_onchain_sats: std::sync::atomic::AtomicU64::new(0),
                 balances_hook: StdMutex::new(None),
+                payment_lookup_hook: StdMutex::new(None),
                 calls: StdMutex::new(Vec::new()),
             }
         }
@@ -5279,6 +6417,10 @@ pub(crate) mod tests {
             }
             self.splice_ins.lock().unwrap().push(req);
             Ok(SpliceInResponse {})
+        }
+        async fn splice_out(&self, req: SpliceOutRequest) -> Result<SpliceOutResponse, LdkServerError> {
+            self.splice_outs.lock().unwrap().push(req);
+            Ok(SpliceOutResponse::default())
         }
         async fn spontaneous_send(
             &self,
@@ -5410,6 +6552,9 @@ pub(crate) mod tests {
         }
         async fn get_payment_details(&self, req: GetPaymentDetailsRequest)
             -> Result<GetPaymentDetailsResponse, LdkServerError> {
+            if let Some(hook) = self.payment_lookup_hook.lock().unwrap().take() {
+                hook();
+            }
             if self.payment_lookup_failures.load(Ordering::SeqCst) > 0 {
                 self.payment_lookup_failures.fetch_sub(1, Ordering::SeqCst);
                 return Err(LdkServerError::new(self.failure_code.lock().unwrap().clone(), "payment lookup unavailable"));
@@ -6302,7 +7447,7 @@ pub(crate) mod tests {
             "prev-node-1".to_string(),
             "next-node-1".to_string(),
             45_000_000, // outbound_amount_forwarded_msat
-            0,          // fee_msat
+            Some(0),    // fee_msat
             None,       // skimmed_fee_msat
             true,
             &fake as &dyn LdkServerCalls,
@@ -6357,7 +7502,7 @@ pub(crate) mod tests {
             COUNTERPARTY_HEX.to_string(),
             "next-node".to_string(),
             7_578_000,
-            0,
+            Some(0),
             None,
             true,
             &fake as &dyn LdkServerCalls,
@@ -6388,7 +7533,7 @@ pub(crate) mod tests {
             "prev-node-2".to_string(),
             "next-node-2".to_string(),
             20_000_000,
-            0,
+            Some(0),
             None,
             true,
             &fake as &dyn LdkServerCalls,
@@ -6423,7 +7568,7 @@ pub(crate) mod tests {
             "prev-node-3".to_string(),
             "next-node-3".to_string(),
             45_000_000,
-            0,
+            Some(0),
             None,
             true,
             &fake as &dyn LdkServerCalls,
@@ -6451,7 +7596,7 @@ pub(crate) mod tests {
             "prev-node-4".to_string(),
             "next-node-4".to_string(),
             45_000_000, // outbound_amount_forwarded_msat
-            0,          // fee_msat
+            Some(0),    // fee_msat
             None,       // skimmed_fee_msat
             true,
             &fake as &dyn LdkServerCalls,
@@ -6487,7 +7632,7 @@ pub(crate) mod tests {
             USER_CHANNEL_ID_DECIMAL.to_string(), Some("next-ucid".to_string()),
             CHANNEL_ID_HEX.to_string(), "next-channel".to_string(),
             COUNTERPARTY_HEX.to_string(), "next-node".to_string(),
-            msat, 0, None, true, fake as &dyn LdkServerCalls, 100_000.0,
+            msat, Some(0), None, true, fake as &dyn LdkServerCalls, 100_000.0,
         ).await;
     }
 
@@ -6633,6 +7778,7 @@ pub(crate) mod tests {
         assert_eq!(fake.sends.lock().unwrap().len(), 1, "the final books are published once they match the live balance");
 
         // Nothing is left above the live balance, so a later price drop is topped up as usual.
+        start_books(&mgr, &fake);
         mgr.stable_channels[0].last_stability_payment = 0;
         mgr.run_tick(&fake as &dyn LdkServerCalls, &push, 90_000.0).await;
         assert_eq!(top_ups_sent(&fake), 1);
@@ -6646,7 +7792,7 @@ pub(crate) mod tests {
             USER_CHANNEL_ID_DECIMAL.to_string(), Some("next-ucid".to_string()),
             CHANNEL_ID_HEX.to_string(), "next-channel".to_string(),
             COUNTERPARTY_HEX.to_string(), "next-node".to_string(),
-            9_990_000, 10_000, None, true, &fake as &dyn LdkServerCalls, 100_000.0,
+            9_990_000, Some(10_000), None, true, &fake as &dyn LdkServerCalls, 100_000.0,
         ).await;
         assert_books(&mgr, 40.0, 40_000, 0);
     }
@@ -6678,7 +7824,7 @@ pub(crate) mod tests {
         mgr.handle_payment_forwarded(
             USER_CHANNEL_ID_DECIMAL.into(), Some("next-ucid".into()),
             CHANNEL_ID_HEX.into(), "next-channel".into(), COUNTERPARTY_HEX.into(),
-            "next-peer".into(), 10_000_000, 0, None, true, &fake, 80_000.0,
+            "next-peer".into(), 10_000_000, Some(0), None, true, &fake, 80_000.0,
         ).await;
         assert_books(&mgr, 42.0, 52_500, 0);
         (mgr, fake, push)
@@ -6693,6 +7839,7 @@ pub(crate) mod tests {
         assert_books(&mgr, 42.0, 40_000, 0);
 
         // The books match the live balance again, so the shortfall at $80k is paid afresh, once, and the target is kept.
+        start_books(&mgr, &fake);
         for _ in 0..2 {
             mgr.stable_channels[0].last_stability_payment = 0;
             mgr.run_tick(&fake as &dyn LdkServerCalls, &push, 80_000.0).await;
@@ -6747,7 +7894,7 @@ pub(crate) mod tests {
             "prev-node-pubkey".to_string(),
             "next-node-pubkey".to_string(),
             45_000_000,
-            9,
+            Some(9),
             Some(7),
             true,
             &fake as &dyn LdkServerCalls,
@@ -6860,6 +8007,7 @@ pub(crate) mod tests {
             ),
         ));
 
+        start_books(&mgr, &fake_drift);
         mgr.run_tick(&fake_drift as &dyn LdkServerCalls, &push, 80_000.0).await;
 
         let sends = fake_drift.sends.lock().unwrap();
@@ -6956,6 +8104,7 @@ pub(crate) mod tests {
                 true,
             ),
         ]);
+        start_books(&mgr, &fake_online);
         mgr.run_tick_plan(
             &fake_online as &dyn LdkServerCalls,
             80_000.0,
@@ -7045,6 +8194,7 @@ pub(crate) mod tests {
         let sender = crate::push::testing::FakeSender::new(true);
         let push = crate::push::testing::service(sender.clone(), mgr.data_dir(), &[COUNTERPARTY_HEX]);
 
+        start_books(&mgr, &fake_offline);
         let wakes = mgr
             .run_tick(
                 &fake_offline as &dyn LdkServerCalls,
@@ -7082,6 +8232,7 @@ pub(crate) mod tests {
         let sender = crate::push::testing::FakeSender::new(true);
         let push = crate::push::testing::service(sender.clone(), mgr.data_dir(), &[COUNTERPARTY_HEX]);
 
+        start_books(&mgr, &fake_offline);
         let wakes = mgr.run_tick(&fake_offline as &dyn LdkServerCalls, &push, 120_000.0).await;
         assert_eq!(wakes.len(), 1);
         assert_eq!(wakes[0].channels[0].channel_id, CHANNEL_TWO);
@@ -7116,6 +8267,7 @@ pub(crate) mod tests {
             ),
         ));
 
+        start_books(&mgr, &fake_drift);
         mgr.run_tick(&fake_drift as &dyn LdkServerCalls, &push, 80_000.0).await;
 
         assert_eq!(
@@ -7143,6 +8295,7 @@ pub(crate) mod tests {
             100_000, 50_000_000, false,
         )]);
         let sender = crate::push::testing::FakeSender::new(true);
+        start_books(&mgr, &fake_offline);
         let push = crate::push::testing::service(sender.clone(), mgr.data_dir(), &[COUNTERPARTY_HEX]);
 
         let wakes = mgr
@@ -7192,6 +8345,20 @@ pub(crate) mod tests {
 
     type TopUpFixture = (StableChannelManager, FakeLdkServer, std::sync::Arc<tokio::sync::Mutex<crate::push::PushService>>);
 
+    /// Starts the books of every tracked channel on its listed user side, as two settled ticks with the inbox attached would; no top-up goes to a channel before them.
+    fn start_books(mgr: &StableChannelManager, ldk: &FakeLdkServer) {
+        let stats = ldk.forwarding_stats.lock().unwrap().clone();
+        for c in ldk.channels.lock().unwrap().iter() {
+            let Some(uid) = parse_user_channel_id(&c.user_channel_id) else { continue };
+            if !mgr.stable_channels.iter().any(|sc| sc.user_channel_id == uid) {
+                continue;
+            }
+            let user_msat = c.inbound_capacity_msat + c.counterparty_unspendable_punishment_reserve * 1000;
+            let cursor = stats.iter().find(|s| s.channel_id == c.channel_id).map(crate::books::cursor_from_stats).unwrap_or_default();
+            assert!(mgr.db.anchor_booked_balance(uid, &c.channel_id, user_msat, c.channel_value_sats, cursor, serde_json::json!({ "source": "test" })).unwrap());
+        }
+    }
+
     /// A $50 channel whose price fell to $80k: the LSP has sent a 12,500-sat top-up the peer has not claimed.
     async fn top_up_in_flight() -> TopUpFixture {
         let mut mgr = make_manager();
@@ -7202,6 +8369,7 @@ pub(crate) mod tests {
         let push = std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::push::PushService::new(&crate::config::PushConfig::default(), mgr.data_dir()),
         ));
+        start_books(&mgr, &ldk);
         mgr.run_tick(&ldk as &dyn LdkServerCalls, &push, 80_000.0).await;
         assert_eq!(top_up_sats_sent(&ldk), [12_500]);
         (mgr, ldk, push)
@@ -7245,47 +8413,6 @@ pub(crate) mod tests {
         assert_channel_books(&mgr, 50.0, 50_000);
         assert_eq!(top_up_sats_sent(&ldk), [12_500], "one top-up per need while it is on the way");
         assert_eq!(ldk.sends.lock().unwrap().len(), 1, "no SYNC either");
-        assert!(mgr.spend_debounce.is_empty(), "an unclaimed top-up leaves no gap for the balance check to read as a spend");
-    }
-
-    #[tokio::test]
-    async fn missed_spend_is_still_deducted_while_a_top_up_is_on_the_way() {
-        let (mut mgr, ldk, push) = top_up_in_flight().await;
-        node_reports(&ldk, "fake-payment-id", PaymentStatus::Pending);
-        // The user spent 10,000 sats ($8 at $80k) and no forwarded-payment event reported it.
-        set_receiver_sats(&ldk, 40_000);
-        tick_past_cooldown(&mut mgr, &ldk, &push, 2).await;
-        assert_channel_books(&mgr, 42.0, 40_000);
-        assert_eq!(top_up_sats_sent(&ldk), [12_500]);
-        assert_eq!(ldk.sends.lock().unwrap().len(), 2, "the corrected target is sent to the wallet");
-
-        // The claim then lands on the corrected books: 52,500 sats at $80k is the $42 target.
-        set_receiver_sats(&ldk, 52_500);
-        dispatch_sync_outcome(&mut mgr, &ldk, "fake-payment-id", true).await;
-        assert_channel_books(&mgr, 42.0, 52_500);
-        tick_past_cooldown(&mut mgr, &ldk, &push, 3).await;
-        assert_eq!(top_up_sats_sent(&ldk), [12_500]);
-    }
-
-    #[tokio::test]
-    async fn spend_misread_while_the_node_could_not_be_asked_is_corrected_by_the_balance_check() {
-        let (mut mgr, ldk, push) = top_up_in_flight().await;
-        // The top-up has landed, its event was missed, and the node cannot be asked when the user's 10,000-sat forward is handled.
-        ldk.payment_lookup_failures.store(usize::MAX, Ordering::SeqCst);
-        set_receiver_sats(&ldk, 52_500);
-        mgr.handle_payment_forwarded(
-            USER_CHANNEL_ID_DECIMAL.into(), Some("next-ucid".into()),
-            CHANNEL_ID_HEX.into(), "next-channel".into(), COUNTERPARTY_HEX.into(),
-            "next-peer".into(), 10_000_000, 0, None, true, &ldk, 80_000.0,
-        ).await;
-        assert!((mgr.stable_channels[0].expected_usd.0 - 50.0).abs() < 1e-6, "the forward was read as spare sats");
-
-        // The node answers again: the claim is booked, the books then exceed the balance by the spend, and two ticks later it is deducted.
-        ldk.payment_lookup_failures.store(0, Ordering::SeqCst);
-        node_reports(&ldk, "fake-payment-id", PaymentStatus::Succeeded);
-        tick_past_cooldown(&mut mgr, &ldk, &push, 3).await;
-        assert_channel_books(&mgr, 42.0, 52_500);
-        assert_eq!(top_up_sats_sent(&ldk), [12_500]);
     }
 
     #[tokio::test]
@@ -7346,12 +8473,13 @@ pub(crate) mod tests {
     async fn forward_while_a_top_up_is_on_the_way() {
         for succeeded in [true, false] {
             let (mut mgr, ldk, push) = top_up_in_flight().await;
-            // The user forwards 10,000 sats ($8 at $80k) out of the stable allocation.
+            // The user forwards 10,000 sats ($8 at $80k) out of the stable allocation, which LDK counts.
             set_receiver_sats(&ldk, 40_000);
+            forwards_counted(&ldk, 10_000_000, 1);
             mgr.handle_payment_forwarded(
                 USER_CHANNEL_ID_DECIMAL.into(), Some("next-ucid".into()),
                 CHANNEL_ID_HEX.into(), "next-channel".into(), COUNTERPARTY_HEX.into(),
-                "next-peer".into(), 10_000_000, 0, None, true, &ldk, 80_000.0,
+                "next-peer".into(), 10_000_000, Some(0), None, true, &ldk, 80_000.0,
             ).await;
             assert_channel_books(&mgr, 42.0, 40_000);
 
@@ -7453,6 +8581,7 @@ pub(crate) mod tests {
         let push = std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::push::PushService::new(&crate::config::PushConfig::default(), mgr.data_dir()),
         ));
+        start_books(&mgr, &ldk);
         mgr.run_tick(&ldk as &dyn LdkServerCalls, &push, 94_000.0).await;
         assert_eq!(top_up_sats_sent(&ldk), [1_457]);
         // The sats already held are booked as backing before the top-up goes out.
@@ -7524,9 +8653,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn top_up_claimed_during_a_missed_event_is_booked_before_the_next_event() {
         let (mgr, ldk, _push) = top_up_in_flight().await;
-        // The claim event was missed: the top-up has landed and the user has since forwarded 10,000 sats.
+        // The claim event was missed: the top-up has landed and the user has since forwarded 10,000 sats, which LDK counts.
         node_reports(&ldk, "fake-payment-id", PaymentStatus::Succeeded);
         set_receiver_sats(&ldk, 52_500);
+        forwards_counted(&ldk, 10_000_000, 1);
 
         // The node cannot be asked at first; the event waits for it instead of reading the top-up as spare sats.
         ldk.payment_lookup_failures.store(1, Ordering::SeqCst);
@@ -7536,7 +8666,7 @@ pub(crate) mod tests {
         mgr.handle_payment_forwarded(
             USER_CHANNEL_ID_DECIMAL.into(), Some("next-ucid".into()),
             CHANNEL_ID_HEX.into(), "next-channel".into(), COUNTERPARTY_HEX.into(),
-            "next-peer".into(), 10_000_000, 0, None, true, &ldk, 80_000.0,
+            "next-peer".into(), 10_000_000, Some(0), None, true, &ldk, 80_000.0,
         ).await;
 
         // The top-up is booked first, so the forward is charged to stable.
@@ -7686,14 +8816,17 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn full_exit_is_refused_while_a_top_up_is_on_the_way() {
-        let (mut mgr, ldk, _push) = top_up_in_flight().await;
+        let (mut mgr, ldk, push) = top_up_in_flight().await;
         // The price is back at $100k, so nothing looks owed; but the top-up is still on its way.
         let exit = || correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &fresh_hex_id(), 0.0, 100_000.0);
         handle_trade_with_valid_fee(&mut mgr, &exit(), &ldk as &dyn LdkServerCalls, 100_000.0).await;
         assert_channel_books(&mgr, 50.0, 50_000);
 
-        // Once it has an outcome the exit goes through.
+        // Once it has an outcome and the tick has cut the refused fee, an exit quoted on the new target goes through.
         dispatch_sync_outcome(&mut mgr, &ldk, "fake-payment-id", false).await;
+        mgr.attach_event_inbox(std::sync::Arc::new(crate::event_inbox::Inbox::in_memory()));
+        mgr.run_tick(&ldk as &dyn LdkServerCalls, &push, 100_000.0).await;
+        assert_eq!(mgr.db.booked_balance(mgr.stable_channels[0].user_channel_id).unwrap().unwrap().uncut, None);
         handle_trade_with_valid_fee(&mut mgr, &exit(), &ldk as &dyn LdkServerCalls, 100_000.0).await;
         assert_channel_books(&mgr, 0.0, 0);
     }
@@ -7759,6 +8892,7 @@ pub(crate) mod tests {
             CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 100_000, 50_000_000, true,
         )]);
         mgr.edit_stable_channel(CHANNEL_ID_HEX, Some(50.0), None, &ldk as &dyn LdkServerCalls, 100_000.0).await;
+        start_books(&mgr, &ldk);
         let push = std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::push::PushService::new(&crate::config::PushConfig::default(), mgr.data_dir()),
         ));
@@ -7788,6 +8922,7 @@ pub(crate) mod tests {
         let push = std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::push::PushService::new(&crate::config::PushConfig::default(), mgr.data_dir()),
         ));
+        start_books(&mgr, &ldk);
         (mgr, ldk, push)
     }
 
@@ -7961,6 +9096,7 @@ pub(crate) mod tests {
             context: "test",
             audits: Vec::new(),
             needs_sync: false,
+            clears_uncut: None,
         });
         node_reports(&ldk, "fake-payment-id", PaymentStatus::Succeeded);
         set_receiver_sats(&ldk, 62_500);
@@ -7993,6 +9129,7 @@ pub(crate) mod tests {
             context: "test",
             audits: Vec::new(),
             needs_sync: false,
+            clears_uncut: None,
         });
         node_reports(&ldk, "old-top-up", PaymentStatus::Failed);
 
@@ -8026,6 +9163,7 @@ pub(crate) mod tests {
                 set_receiver_sats(&ldk, 62_500);
             }
 
+            start_books(&mgr, &ldk);
             mgr.run_tick(&ldk as &dyn LdkServerCalls, &push, 80_000.0).await;
 
             assert!(mgr.db.legacy_stability_payments_pending().unwrap().is_empty(), "{status:?}: the row must not stay pending forever");
@@ -8241,6 +9379,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn top_up_that_arrived_and_was_then_spent_from_can_still_be_counted_as_arrived() {
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let (mut mgr, ldk, push) = top_up_in_flight().await;
         // The 12,500 landed and the user then spent 10,000 of it, unseen: 52,500 is below backing plus the top-up.
         set_receiver_sats(&ldk, 52_500);
@@ -8250,9 +9389,11 @@ pub(crate) mod tests {
         assert!(outcome.ok, "{}", outcome.status);
         assert_channel_books(&mgr, 50.0, 62_500);
 
-        // The balance check then charges the spend, and nothing is paid a second time.
-        tick_past_cooldown(&mut mgr, &ldk, &push, 3).await;
-        assert_channel_books(&mgr, 42.0, 52_500);
+        // The books, which took the top-up, pause on the spend they never saw for the operator, nothing is cut, and nothing is paid a second time.
+        mgr.attach_event_inbox(std::sync::Arc::new(crate::event_inbox::Inbox::in_memory()));
+        tick_past_cooldown(&mut mgr, &ldk, &push, 4).await;
+        assert_eq!(books_state(&mgr), (62_500_000, CheckState::Paused, 10_000_000));
+        assert_channel_books(&mgr, 50.0, 62_500);
         assert_eq!(top_up_sats_sent(&ldk), [12_500]);
     }
 
@@ -8297,7 +9438,7 @@ pub(crate) mod tests {
         stable_channels::audit::disable_test_capture();
         assert!(mgr.db.stability_top_ups_in_flight().unwrap().is_empty());
         assert_channel_books(&mgr, 50.0, 50_000);
-        assert_eq!(count_events(&events, "BACKSTOP_STABLE_DEDUCTED"), 0, "sats the wallet paid back are not a spend");
+        assert_eq!(count_events(&events, "STABLE_SPEND_DEDUCTED"), 0, "sats the wallet paid back are not a spend");
         assert_eq!(top_up_sats_sent(&ldk), [12_500]);
     }
 
@@ -8604,6 +9745,7 @@ pub(crate) mod tests {
             context: "test",
             audits: Vec::new(),
             needs_sync: false,
+            clears_uncut: None,
         });
         let conn = save_test_connection(&mgr);
         conn.execute_batch(
@@ -8720,6 +9862,7 @@ pub(crate) mod tests {
             let push = std::sync::Arc::new(tokio::sync::Mutex::new(
                 crate::push::PushService::new(&crate::config::PushConfig::default(), mgr.data_dir()),
             ));
+            start_books(&mgr, &ldk);
             mgr.run_tick(&ldk as &dyn LdkServerCalls, &push, price).await;
             let sends = ldk.sends.lock().unwrap();
             assert_eq!(sends.len(), 1, "backing {backing}");
@@ -8812,58 +9955,6 @@ pub(crate) mod tests {
         assert_eq!(payload["type"], "SYNC_V1");
         assert_eq!(payload["expected_usd"], expected);
         assert_eq!(payload["backing_sats"], backing);
-    }
-
-    #[tokio::test]
-    async fn backstop_save_failure_preserves_books_and_retries() {
-        let mut mgr = make_manager();
-        seed_persisted_save_test_channel(&mut mgr, 10.0);
-        let conn = save_test_connection(&mgr);
-        // Fail after UPDATE channels, to exercise rollback of the full save transaction.
-        conn.execute_batch(
-            "CREATE TRIGGER reject_book_save BEFORE INSERT ON ledger_events
-             WHEN NEW.event_type = 'CHANNEL_ACCOUNTING_STATE_COMMITTED'
-             BEGIN SELECT RAISE(ABORT, 'forced ledger failure'); END;",
-        )
-        .unwrap();
-        let before_commits = committed_book_count(&conn);
-        let fake = FakeLdkServer::new(vec![make_channel(
-            CHANNEL_ID_HEX,
-            USER_CHANNEL_ID_DECIMAL,
-            COUNTERPARTY_HEX,
-            100_000,
-            95_000_000,
-            true,
-        )]);
-        let push = Arc::new(tokio::sync::Mutex::new(crate::push::PushService::new(
-            &crate::config::PushConfig::default(),
-            mgr.data_dir(),
-        )));
-        mgr.run_tick(&fake, &push, 100_000.0).await;
-        let before = serde_json::to_string(&mgr.stable_channels[0]).unwrap();
-        // Price drift also exercises the requirement to skip settlement after a failed save.
-        for _ in 0..3 {
-            mgr.run_tick(&fake, &push, 80_000.0).await;
-            assert_eq!(
-                serde_json::to_string(&mgr.stable_channels[0]).unwrap(),
-                before
-            );
-            assert_saved_books(&mgr, 10.0, 10_000, 40_000);
-            assert!(fake.sends.lock().unwrap().is_empty());
-            assert!(fake.sign_calls.lock().unwrap().is_empty());
-            assert_eq!(committed_book_count(&conn), before_commits);
-        }
-
-        conn.execute_batch("DROP TRIGGER reject_book_save").unwrap();
-        // Save the original $4 correction calculated at $80k; a later price must not reprice it.
-        mgr.run_tick(&fake, &push, 100_000.0).await;
-        assert_saved_books(&mgr, 6.0, 5_000, 0);
-        assert_eq!(committed_book_count(&conn), before_commits + 1);
-        assert_book_sync(&fake, 6.0, 5_000);
-        mgr.run_tick(&fake, &push, 100_000.0).await;
-        assert_saved_books(&mgr, 6.0, 5_000, 0);
-        assert_eq!(committed_book_count(&conn), before_commits + 1);
-        assert_eq!(fake.sends.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -9017,7 +10108,7 @@ pub(crate) mod tests {
         }
     }
 
-    async fn failed_correction_before_forward(splice: bool, hold_database_failure: bool) {
+    async fn failed_correction_before_forward(hold_database_failure: bool) {
         let mut mgr = make_manager();
         seed_persisted_save_test_channel(&mut mgr, 10.0);
         let conn = save_test_connection(&mgr);
@@ -9040,19 +10131,14 @@ pub(crate) mod tests {
             &crate::config::PushConfig::default(),
             mgr.data_dir(),
         )));
-        if splice {
-            mgr.handle_channel_ready(
-                CHANNEL_ID_HEX.to_owned(),
-                USER_CHANNEL_ID_DECIMAL.to_owned(),
-                Some("splice-before-forward:0".to_owned()),
-                &fake,
-                100_000.0,
-            )
-            .await;
-        } else {
-            mgr.run_tick(&fake, &push, 100_000.0).await;
-            mgr.run_tick(&fake, &push, 100_000.0).await;
-        }
+        mgr.handle_channel_ready(
+            CHANNEL_ID_HEX.to_owned(),
+            USER_CHANNEL_ID_DECIMAL.to_owned(),
+            Some("splice-before-forward:0".to_owned()),
+            &fake,
+            100_000.0,
+        )
+        .await;
         assert_saved_books(&mgr, 10.0, 10_000, 40_000);
         assert!(fake.sends.lock().unwrap().is_empty());
         if !hold_database_failure {
@@ -9080,7 +10166,7 @@ pub(crate) mod tests {
                 COUNTERPARTY_HEX.to_owned(),
                 "next-node".to_owned(),
                 2_000_000,
-                0,
+                Some(0),
                 None,
                 true,
                 &fake,
@@ -9181,16 +10267,15 @@ pub(crate) mod tests {
                 serde_json::from_str(envelope["payload"].as_str().unwrap()).unwrap()
             })
             .collect();
-        assert_eq!(payloads.len(), 2);
-        assert_eq!(payloads[0]["expected_usd"], 5.0);
-        assert_eq!(payloads[0]["backing_sats"], 5_000);
-        assert_eq!(payloads[1]["expected_usd"], 3.0);
-        assert_eq!(payloads[1]["backing_sats"], 3_000);
+        // The splice's SYNC waits, since the balance the listing shows by then no longer holds its backing; the forward's carries both cuts.
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["expected_usd"], 3.0);
+        assert_eq!(payloads[0]["backing_sats"], 3_000);
     }
 
     #[tokio::test]
     async fn failed_splice_is_committed_before_a_later_forward() {
-        failed_correction_before_forward(true, false).await;
+        failed_correction_before_forward(false).await;
     }
 
     #[tokio::test]
@@ -9242,14 +10327,8 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn failed_backstop_is_committed_before_a_later_forward() {
-        failed_correction_before_forward(false, false).await;
-    }
-
-    #[tokio::test]
     async fn failed_correction_holds_the_event_until_database_recovery() {
-        failed_correction_before_forward(true, true).await;
-        failed_correction_before_forward(false, true).await;
+        failed_correction_before_forward(true).await;
     }
 
     #[tokio::test]
@@ -9294,84 +10373,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn backstop_deducts_and_syncs_after_two_low_ticks() {
-        let mut mgr = make_manager();
-        // expected $10 -> backing 10_000; receiver 50_000 (native 40_000) at $100k.
-        seed_channel(&mut mgr, 189476124653200987495269098788434301048u128, COUNTERPARTY_HEX, CHANNEL_ID_HEX, 10.0, 10_000, 40_000, 50_000, 100_000.0);
-        let push = std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::push::PushService::new(&crate::config::PushConfig::default(), mgr.data_dir()),
-        ));
-        // Live balance dropped to 5_000 (< backing 10_000): a spend the forwarded event missed.
-        let fake = FakeLdkServer::new(vec![make_channel(
-            CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 100_000, 95_000_000, true,
-        )]);
-
-        // Tick 1: debounce only.
-        mgr.run_tick(&fake as &dyn LdkServerCalls, &push, 100_000.0).await;
-        assert!((mgr.stable_channels[0].expected_usd.0 - 10.0).abs() < 1e-6, "tick 1 must not deduct");
-        assert!(fake.sends.lock().unwrap().is_empty(), "tick 1 must not SYNC");
-
-        // Tick 2: act.
-        mgr.run_tick(&fake as &dyn LdkServerCalls, &push, 100_000.0).await;
-        let exp = mgr.stable_channels[0].expected_usd.0;
-        assert!((exp - 5.0).abs() < 0.01, "tick 2 must deduct ~$5 (10_000-5_000 sats), got {}", exp);
-        let sends = fake.sends.lock().unwrap();
-        assert_eq!(sends.len(), 1, "tick 2 must send exactly one SYNC");
-        assert_eq!(sends[0].custom_tlvs.len(), 1, "SYNC must carry exactly one stable TLV");
-        assert_eq!(
-            sends[0].custom_tlvs[0].type_num,
-            stable_channels::constants::STABLE_CHANNEL_TLV_TYPE,
-            "SYNC TLV must be the stable-channel type",
-        );
-    }
-
-    #[tokio::test]
-    async fn wake_pass_leaves_a_possible_unreconciled_spend_to_the_regular_tick() {
-        let mut mgr = make_manager();
-        seed_channel(&mut mgr, 189476124653200987495269098788434301048u128, COUNTERPARTY_HEX, CHANNEL_ID_HEX, 10.0, 10_000, 40_000, 50_000, 100_000.0);
-        // Live balance 5_000 (< backing 10_000): a spend not yet reconciled.
-        let low = FakeLdkServer::new(vec![make_channel(
-            CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 100_000, 95_000_000, true,
-        )]);
-
-        // One regular tick, then wake passes seconds later at a price where a top-up would be due.
-        mgr.run_tick_plan(&low as &dyn LdkServerCalls, 100_000.0, TickScope::All).await;
-        for _ in 0..2 {
-            mgr.run_tick_plan(&low as &dyn LdkServerCalls, 80_000.0, TickScope::WokenPeer(COUNTERPARTY_HEX)).await;
-        }
-
-        assert!((mgr.stable_channels[0].expected_usd.0 - 10.0).abs() < 1e-6, "a wake pass must not deduct");
-        assert!(low.sends.lock().unwrap().is_empty(), "a wake pass must neither SYNC a deduction nor top up the undeducted target");
-        assert_eq!(mgr.spend_debounce.values().map(|check| check.sightings).collect::<Vec<_>>(), vec![1]);
-        assert_eq!(mgr.stable_channels[0].last_stability_payment, 0);
-    }
-
-    #[tokio::test]
-    async fn wake_pass_that_sees_the_balance_restored_clears_the_debounce() {
-        let mut mgr = make_manager();
-        seed_channel(&mut mgr, 1, COUNTERPARTY_HEX, CHANNEL_ID_HEX, 50.0, 50_000, 0, 50_000, 100_000.0);
-        let channel = |their_msat: u64| FakeLdkServer::new(vec![make_channel(
-            CHANNEL_ID_HEX, "1", COUNTERPARTY_HEX, 100_000, their_msat, true,
-        )]);
-
-        // A regular tick sees a transient dip; the wake pass then finds it resolved and tops up.
-        mgr.run_tick_plan(&channel(51_000_000), 100_000.0, TickScope::All).await;
-        let restored = channel(50_000_000);
-        mgr.run_tick_plan(&restored, 80_000.0, TickScope::WokenPeer(COUNTERPARTY_HEX)).await;
-        assert_eq!(restored.sends.lock().unwrap().len(), 1, "the wake pass pays the top-up");
-        assert!(mgr.spend_debounce.is_empty());
-
-        // The top-up is still unclaimed at the next regular ticks: the books have not moved, so there is no low sighting at all.
-        for _ in 0..3 {
-            mgr.run_tick_plan(&restored, 80_000.0, TickScope::All).await;
-        }
-        assert!((mgr.stable_channels[0].expected_usd.0 - 50.0).abs() < 1e-6, "the unclaimed top-up must not be deducted as a spend");
-        assert_eq!(mgr.stable_channels[0].backing_sats, 50_000, "backing moves when the top-up is claimed");
-        assert!(mgr.spend_debounce.is_empty());
-        assert_eq!(restored.sends.lock().unwrap().len(), 1, "and it is not sent again while it is on the way");
-    }
-
-    #[tokio::test]
     async fn wake_pass_pays_only_the_woken_peer() {
         let mut mgr = make_manager();
         let (woken_uid, other_uid) = (189476124653200987495269098788434301048u128, 271828182845904523536028747135266249775u128);
@@ -9383,6 +10384,7 @@ pub(crate) mod tests {
             make_channel(ROUTING_CHANNEL_HEX, &other_uid.to_string(), ROUTING_PEER_HEX, 100_000, 50_000_000, true),
         ]);
 
+        start_books(&mgr, &ldk);
         mgr.run_tick_plan(&ldk, 80_000.0, TickScope::WokenPeer(COUNTERPARTY_HEX)).await;
 
         let sends = ldk.sends.lock().unwrap();
@@ -9392,45 +10394,6 @@ pub(crate) mod tests {
         assert_eq!(on_the_way.len(), 1, "the other peer is left to the regular tick");
         assert_eq!(on_the_way[0].user_channel_id, USER_CHANNEL_ID_DECIMAL);
         assert_eq!((mgr.stable_channels[0].backing_sats, mgr.stable_channels[1].backing_sats), (50_000, 50_000), "sending moves no books");
-    }
-
-    #[tokio::test]
-    async fn backstop_single_tick_dip_does_not_deduct() {
-        let mut mgr = make_manager();
-        seed_channel(&mut mgr, 189476124653200987495269098788434301048u128, COUNTERPARTY_HEX, CHANNEL_ID_HEX, 10.0, 10_000, 40_000, 50_000, 100_000.0);
-        let push = std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::push::PushService::new(&crate::config::PushConfig::default(), mgr.data_dir()),
-        ));
-        // Tick 1: transient dip to 5_000 (in-flight outbound HTLC; outbound_capacity excludes it).
-        let dip = FakeLdkServer::new(vec![make_channel(
-            CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 100_000, 95_000_000, true,
-        )]);
-        mgr.run_tick(&dip as &dyn LdkServerCalls, &push, 100_000.0).await;
-        // Tick 2: balance restored to 50_000 (HTLC resolved without spending stable).
-        let restored = FakeLdkServer::new(vec![make_channel(
-            CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 100_000, 50_000_000, true,
-        )]);
-        mgr.run_tick(&restored as &dyn LdkServerCalls, &push, 100_000.0).await;
-
-        assert!((mgr.stable_channels[0].expected_usd.0 - 10.0).abs() < 1e-6, "a transient dip must not deduct");
-        assert!(restored.sends.lock().unwrap().is_empty(), "no SYNC for a transient dip");
-    }
-
-    #[tokio::test]
-    async fn backstop_noop_when_balance_healthy() {
-        let mut mgr = make_manager();
-        seed_channel(&mut mgr, 189476124653200987495269098788434301048u128, COUNTERPARTY_HEX, CHANNEL_ID_HEX, 10.0, 10_000, 40_000, 50_000, 100_000.0);
-        let push = std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::push::PushService::new(&crate::config::PushConfig::default(), mgr.data_dir()),
-        ));
-        // Healthy: their 50_000 >= backing 10_000.
-        let fake = FakeLdkServer::new(vec![make_channel(
-            CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 100_000, 50_000_000, true,
-        )]);
-        mgr.run_tick(&fake as &dyn LdkServerCalls, &push, 100_000.0).await;
-        mgr.run_tick(&fake as &dyn LdkServerCalls, &push, 100_000.0).await;
-        assert!((mgr.stable_channels[0].expected_usd.0 - 10.0).abs() < 1e-6);
-        assert!(fake.sends.lock().unwrap().is_empty(), "no backstop action when healthy");
     }
 
     // One channel's report built the way LDK's channel monitor builds it: the LSP's own sats on the channel entry, an entry per HTLC with its whole sats, the sub-sat parts and any dust HTLC in the rounded totals.
@@ -9480,109 +10443,146 @@ pub(crate) mod tests {
         }
     }
 
+    // The channel of `settled_forwards_fixture` saved, with the event inbox attached and its books anchored on the user's 50,000 sats.
+    async fn anchored_forwards_fixture() -> (StableChannelManager, FakeLdkServer) {
+        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
+        mgr.db.save_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, 50.0, 50_000, 0, None).unwrap();
+        mgr.attach_event_inbox(std::sync::Arc::new(crate::event_inbox::Inbox::in_memory()));
+        regular_ticks(&mut mgr, &fake, 2).await;
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Ok, 0), "anchored on the second matching reading");
+        (mgr, fake)
+    }
+
+    // The channel's booked balance, the state of its books check and the gap the check holds, in msat.
+    fn books_state(mgr: &StableChannelManager) -> (u64, CheckState, u64) {
+        let books = mgr.db.booked_balance(mgr.stable_channels[0].user_channel_id).unwrap().expect("the channel has books");
+        (books.booked_user_msat, books.check.state, books.check.gap_msat)
+    }
+
+    // LDK's totals for the 100k channel once it has counted `spent_msat` in `spent_count` forwards out of the user.
+    fn forwards_counted(fake: &FakeLdkServer, spent_msat: u64, spent_count: u64) {
+        *fake.forwarding_stats.lock().unwrap() = vec![ldk_server_client::ldk_server_grpc::types::ChannelForwardingStats {
+            channel_id: CHANNEL_ID_HEX.to_owned(),
+            total_inbound_amount_msat: spent_msat,
+            inbound_payments_forwarded: spent_count,
+            ..Default::default()
+        }];
+    }
+
     #[tokio::test]
     async fn payment_held_across_ticks_then_failed_leaves_the_target_unchanged() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
         // A 20,000-sat payment is held: out of the user's balance, not in the LSP's, and listed by the node as unresolved.
         channel_reports(&fake, 30_000_000, &[20_000_000], &[]);
         regular_ticks(&mut mgr, &fake, 3).await;
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Ok, 0), "sats that can still come back are no gap");
         assert_books(&mgr, 50.0, 50_000, 0);
-        assert!(mgr.spend_debounce.is_empty(), "sats that can still come back are not a sighting of a spend");
 
         // It fails and the sats come back: there was never anything to undo.
         channel_reports(&fake, 50_000_000, &[], &[]);
         regular_ticks(&mut mgr, &fake, 2).await;
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Ok, 0));
         assert_books(&mgr, 50.0, 50_000, 0);
         assert!(fake.sends.lock().unwrap().is_empty(), "nothing was spent, so there is no correction to publish");
     }
 
     #[tokio::test]
     async fn payment_held_across_ticks_then_settled_is_deducted_once() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
         channel_reports(&fake, 30_000_000, &[20_000_000], &[]);
         regular_ticks(&mut mgr, &fake, 3).await;
         assert_books(&mgr, 50.0, 50_000, 0);
 
-        // It settles: the sats reach the LSP's side and the forward is reported.
+        // It settles: the sats reach the LSP's side, LDK counts the forward and its event is handled.
         channel_reports(&fake, 30_000_000, &[], &[]);
+        forwards_counted(&fake, 20_000_000, 1);
         forward_out(&mut mgr, &fake, 20_000).await;
         assert_books(&mgr, 30.0, 30_000, 0);
         regular_ticks(&mut mgr, &fake, 3).await;
+        assert_eq!(books_state(&mgr), (30_000_000, CheckState::Ok, 0));
         assert_books(&mgr, 30.0, 30_000, 0);
         assert_book_sync(&fake, 30.0, 30_000);
     }
 
     #[tokio::test]
     async fn settled_payment_whose_event_was_missed_is_deducted_once_it_is_no_longer_held() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
         channel_reports(&fake, 30_000_000, &[20_000_000], &[]);
         regular_ticks(&mut mgr, &fake, 3).await;
         assert_books(&mgr, 50.0, 50_000, 0);
 
-        // It settles but the forward is never reported: the balance check still finds the spend.
+        // It settles and LDK counts it, but its event is never handled: the books catch it up from LDK's totals and cut it.
         channel_reports(&fake, 30_000_000, &[], &[]);
+        forwards_counted(&fake, 20_000_000, 1);
         regular_ticks(&mut mgr, &fake, 1).await;
-        assert_books(&mgr, 50.0, 50_000, 0);
+        assert_books(&mgr, 30.0, 30_000, 0);
         regular_ticks(&mut mgr, &fake, 2).await;
+        assert_eq!(books_state(&mgr), (30_000_000, CheckState::Ok, 0));
         assert_books(&mgr, 30.0, 30_000, 0);
         assert_book_sync(&fake, 30.0, 30_000);
     }
 
     #[tokio::test]
-    async fn settled_spend_beside_a_held_payment_deducts_only_the_settled_part() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        // 10,000 sats were spent with no forward reported, and 5,000 more are held.
+    async fn settled_spend_beside_a_held_payment_pauses_on_the_settled_part_only() {
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
+        // 10,000 sats were spent with no forward reported or counted, and 5,000 more are held.
         channel_reports(&fake, 35_000_000, &[5_000_000], &[]);
         regular_ticks(&mut mgr, &fake, 3).await;
-        assert_books(&mgr, 40.0, 40_000, 0);
-        assert!(fake.sends.lock().unwrap().is_empty(), "books above the live balance are not published");
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Paused, 10_000_000), "the held payment is no part of the gap");
+        assert_books(&mgr, 50.0, 50_000, 0);
 
-        // The held payment fails, the balance meets the books and they are published.
+        // The held payment fails: the gap is still the settled part, and nothing is cut or published.
         channel_reports(&fake, 40_000_000, &[], &[]);
         regular_ticks(&mut mgr, &fake, 2).await;
-        assert_books(&mgr, 40.0, 40_000, 0);
-        assert_book_sync(&fake, 40.0, 40_000);
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Paused, 10_000_000));
+        assert_books(&mgr, 50.0, 50_000, 0);
+        assert!(fake.sends.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn held_payment_left_after_a_partial_deduction_is_deducted_once_when_it_settles() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
+        // 10,000 sats were spent with no event but LDK counted them, and 5,000 more are held: the catch-up cuts the 10,000 alone.
         channel_reports(&fake, 35_000_000, &[5_000_000], &[]);
+        forwards_counted(&fake, 10_000_000, 1);
         regular_ticks(&mut mgr, &fake, 3).await;
+        assert_eq!(books_state(&mgr), (40_000_000, CheckState::Ok, 0));
         assert_books(&mgr, 40.0, 40_000, 0);
+        assert!(fake.sends.lock().unwrap().is_empty(), "books above the live balance are not published");
 
+        // The held payment settles, LDK counts it and its event is handled.
         channel_reports(&fake, 35_000_000, &[], &[]);
+        forwards_counted(&fake, 15_000_000, 2);
         forward_out(&mut mgr, &fake, 5_000).await;
         regular_ticks(&mut mgr, &fake, 3).await;
+        assert_eq!(books_state(&mgr), (35_000_000, CheckState::Ok, 0));
         assert_books(&mgr, 35.0, 35_000, 0);
         assert_book_sync(&fake, 35.0, 35_000);
     }
 
     #[tokio::test]
-    async fn partial_deduction_rounds_the_recoverable_balance_down() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        // 10,000.5 sats were spent with no forward reported, and 5,000 more are held: half a sat is all that is left of the last one.
-        channel_reports(&fake, 34_999_500, &[5_000_000], &[]);
-        regular_ticks(&mut mgr, &fake, 2).await;
-        assert_books(&mgr, 39.999, 39_999, 0);
-    }
-
-    #[tokio::test]
     async fn payment_held_across_a_restart_then_failed_leaves_the_target_unchanged() {
-        let (mgr, fake) = settled_forwards_fixture(0, 50_000);
-        mgr.db.save_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, 50.0, 50_000, 0, None).unwrap();
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
         channel_reports(&fake, 30_000_000, &[20_000_000], &[]);
-        let mut mgr = mgr;
         regular_ticks(&mut mgr, &fake, 1).await;
 
-        // The daemon restarts with the payment still held: nothing it kept in memory survives.
+        // The daemon restarts with the payment still held: only what it saved survives.
         let mut mgr = StableChannelManager::new(mgr.db.clone(), mgr.data_dir.clone());
+        mgr.attach_event_inbox(std::sync::Arc::new(crate::event_inbox::Inbox::in_memory()));
         mgr.reconcile_from_grpc(&fake as &dyn LdkServerCalls, 100_000.0).await;
         regular_ticks(&mut mgr, &fake, 3).await;
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Ok, 0));
         assert_books(&mgr, 50.0, 50_000, 0);
 
         channel_reports(&fake, 50_000_000, &[], &[]);
         regular_ticks(&mut mgr, &fake, 2).await;
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Ok, 0));
         assert_books(&mgr, 50.0, 50_000, 0);
         let saved = mgr.db.load_channel(USER_CHANNEL_ID_DECIMAL).unwrap().unwrap();
         assert_eq!((saved.expected_usd, saved.backing_sats), (50.0, 50_000));
@@ -9590,36 +10590,41 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn payment_that_fails_between_the_two_node_reads_is_not_deducted() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
         channel_reports(&fake, 30_000_000, &[20_000_000], &[]);
         regular_ticks(&mut mgr, &fake, 1).await;
 
-        // One tick reads the channel with the payment still out and the balances just after it failed.
+        // One tick reads the channel with the payment still out and the balances just after it failed: sats in neither side's balance hold the gap as a splice still confirming.
         *fake.lightning_balances.lock().unwrap() = monitor_balances(CHANNEL_ID_HEX, 50_000, &[], &[]);
         regular_ticks(&mut mgr, &fake, 1).await;
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Ok, 0));
         assert_books(&mgr, 50.0, 50_000, 0);
 
         // The next tick sees the sats back.
         channel_reports(&fake, 50_000_000, &[], &[]);
         regular_ticks(&mut mgr, &fake, 2).await;
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Ok, 0));
         assert_books(&mgr, 50.0, 50_000, 0);
-        assert!(mgr.spend_debounce.is_empty());
         assert!(fake.sends.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn held_dust_and_sub_sat_amounts_are_not_deducted() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
         // Two held payments: 20,000.5 sats, and a 300-sat one too small to get its own entry from the node.
         channel_reports(&fake, 29_699_500, &[20_000_500, 300_000], &[]);
         regular_ticks(&mut mgr, &fake, 3).await;
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Ok, 0), "every held msat counts toward the user's balance");
         assert_books(&mgr, 50.0, 50_000, 0);
         assert!(fake.sends.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn held_payment_on_a_channel_with_reserves_is_not_deducted() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
         channel_reports(&fake, 30_000_000, &[20_000_000], &[]);
         {
             // Each side's capacity leaves out the reserve it must keep: 1,000 sats for the user, 500 for the LSP.
@@ -9630,14 +10635,16 @@ pub(crate) mod tests {
             channels[0].unspendable_punishment_reserve = Some(500);
         }
         regular_ticks(&mut mgr, &fake, 3).await;
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Ok, 0));
         assert_books(&mgr, 50.0, 50_000, 0);
         assert!(fake.sends.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn settled_spend_smaller_than_the_reserve_is_still_deducted() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        // 600 sats were spent with no forward reported, which leaves the user 49,400.
+    async fn settled_spend_smaller_than_the_reserve_still_pauses_the_channel() {
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
+        // 600 sats were spent with no forward reported or counted, which leaves the user 49,400.
         channel_reports(&fake, 49_400_000, &[], &[]);
         {
             // Each side's capacity leaves out the reserve it must keep: 1,000 sats for the user, 500 for the LSP.
@@ -9648,67 +10655,78 @@ pub(crate) mod tests {
             channels[0].unspendable_punishment_reserve = Some(500);
         }
         regular_ticks(&mut mgr, &fake, 2).await;
-        assert_books(&mgr, 49.4, 49_400, 0);
-        assert_book_sync(&fake, 49.4, 49_400);
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Paused, 600_000));
+        assert_books(&mgr, 50.0, 50_000, 0);
+        assert!(fake.sends.lock().unwrap().is_empty(), "a gap is never cut on its own");
     }
 
     #[tokio::test]
     async fn payment_to_the_user_in_flight_does_not_hide_a_settled_spend() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        // 10,000 sats were spent with no forward reported, while two payments to the user are still unclaimed: 12,500.4 sats and a 300-sat dust one.
-        channel_reports(&fake, 40_000_000, &[], &[12_500_400, 300_000]);
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
+        // 10,000 sats were spent with no forward reported or counted, while two payments to the user are still unclaimed: 1,250.4 sats and a 300-sat dust one, too little to read as a splice.
+        channel_reports(&fake, 40_000_000, &[], &[1_250_400, 300_000]);
         regular_ticks(&mut mgr, &fake, 2).await;
-        assert_books(&mgr, 40.0, 40_000, 0);
-        assert_book_sync(&fake, 40.0, 40_000);
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Paused, 10_000_000));
+        assert_books(&mgr, 50.0, 50_000, 0);
+        assert!(fake.sends.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn payment_held_on_another_channel_does_not_hide_a_settled_spend() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
+    async fn a_payment_to_the_user_in_flight_does_not_look_like_a_splice() {
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
+        // 20,000 sats were spent with no forward reported or counted, while a 10,000-sat payment to the user, far above a splice's allowance, is still unclaimed.
+        channel_reports(&fake, 30_000_000, &[], &[10_000_000]);
+        regular_ticks(&mut mgr, &fake, 1).await;
+        let check = mgr.db.booked_balance(mgr.stable_channels[0].user_channel_id).unwrap().unwrap().check;
+        assert_eq!((check.state, check.direction, check.gap_msat), (CheckState::Watching, Some(GapDirection::Below), 20_000_000), "the gap is saved as usual");
+        regular_ticks(&mut mgr, &fake, 1).await;
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Paused, 20_000_000));
+        assert_books(&mgr, 50.0, 50_000, 0);
+        assert!(fake.sends.lock().unwrap().is_empty(), "a gap is never cut on its own");
+    }
+
+    #[tokio::test]
+    async fn payment_held_on_another_channel_does_not_explain_a_settled_spend() {
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
         channel_reports(&fake, 30_000_000, &[], &[]);
         *fake.lightning_balances.lock().unwrap() = monitor_balances(ROUTING_CHANNEL_HEX, 50_000, &[20_000_000], &[]);
         regular_ticks(&mut mgr, &fake, 2).await;
-        assert_books(&mgr, 30.0, 30_000, 0);
-        assert_book_sync(&fake, 30.0, 30_000);
-    }
-
-    #[tokio::test]
-    async fn splice_out_awaiting_confirmation_is_still_deducted_after_two_ticks() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        // A negotiated 20,000-sat splice-out: out of the user's balance, the LSP's unchanged, and no payment for the node to list.
-        let mut channel = make_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 100_000, 50_000_000, true);
-        channel.inbound_capacity_msat = 30_000_000;
-        *fake.channels.lock().unwrap() = vec![channel];
-        *fake.lightning_balances.lock().unwrap() = monitor_balances(CHANNEL_ID_HEX, 50_000, &[], &[]);
-
-        regular_ticks(&mut mgr, &fake, 2).await;
-        assert_books(&mgr, 30.0, 30_000, 0);
-        assert_book_sync(&fake, 30.0, 30_000);
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Paused, 20_000_000));
+        assert_books(&mgr, 50.0, 50_000, 0);
+        assert!(fake.sends.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn held_payment_is_not_deducted_while_the_node_cannot_report_balances() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
         channel_reports(&fake, 30_000_000, &[20_000_000], &[]);
         fake.balances_fail.store(true, Ordering::SeqCst);
         regular_ticks(&mut mgr, &fake, 3).await;
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Ok, 0), "the books are not checked against a balance read that failed");
         assert_books(&mgr, 50.0, 50_000, 0);
 
         // It fails once the node can report again: the target was never touched.
         fake.balances_fail.store(false, Ordering::SeqCst);
         channel_reports(&fake, 50_000_000, &[], &[]);
         regular_ticks(&mut mgr, &fake, 2).await;
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Ok, 0));
         assert_books(&mgr, 50.0, 50_000, 0);
         assert!(fake.sends.lock().unwrap().is_empty(), "nothing was spent, so there is no correction to publish");
     }
 
     #[tokio::test]
     async fn held_payment_listed_once_is_not_deducted_when_later_balance_reads_fail() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
         channel_reports(&fake, 30_000_000, &[20_000_000], &[]);
         regular_ticks(&mut mgr, &fake, 1).await;
         fake.balances_fail.store(true, Ordering::SeqCst);
         regular_ticks(&mut mgr, &fake, 3).await;
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Ok, 0));
         assert_books(&mgr, 50.0, 50_000, 0);
         assert!(fake.sends.lock().unwrap().is_empty());
     }
@@ -9723,27 +10741,6 @@ pub(crate) mod tests {
         regular_ticks(&mut mgr, &fake, 3).await;
         assert_books(&mgr, 50.0, 50_000, 0);
         assert!(fake.sends.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn settled_spend_waits_while_the_report_leaves_out_its_channel_then_is_deducted_once() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        // 10,000 sats were spent with no forward reported, and the report covers only another channel.
-        channel_reports(&fake, 40_000_000, &[], &[]);
-        *fake.lightning_balances.lock().unwrap() = monitor_balances(ROUTING_CHANNEL_HEX, 50_000, &[], &[]);
-        fake.balances_incomplete.store(true, Ordering::SeqCst);
-        regular_ticks(&mut mgr, &fake, 3).await;
-        assert_books(&mgr, 50.0, 50_000, 0);
-        assert!(mgr.spend_debounce.is_empty(), "a tick that cannot tell is not a sighting");
-        assert!(fake.sends.lock().unwrap().is_empty());
-
-        // It still takes two ticks whose report covers the channel.
-        fake.balances_incomplete.store(false, Ordering::SeqCst);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        assert_books(&mgr, 50.0, 50_000, 0);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        assert_books(&mgr, 40.0, 40_000, 0);
-        assert_book_sync(&fake, 40.0, 40_000);
     }
 
     #[tokio::test]
@@ -9786,8 +10783,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn settled_spend_waits_while_the_node_cannot_report_balances_then_is_deducted_once() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
+    async fn settled_spend_waits_while_the_node_cannot_report_balances_then_pauses_the_channel() {
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
         channel_reports(&fake, 30_000_000, &[], &[]);
         fake.balances_fail.store(true, Ordering::SeqCst);
         regular_ticks(&mut mgr, &fake, 3).await;
@@ -9797,33 +10795,37 @@ pub(crate) mod tests {
         mgr.run_tick(&fake as &dyn LdkServerCalls, &push, 80_000.0).await;
         assert!(fake.sends.lock().unwrap().is_empty(), "no top-up and no SYNC while a spend cannot be told from a held payment");
 
-        // The ticks that could not read the report were not sightings: it still takes two that can.
+        // The ticks that could not read the report checked nothing: it still takes two that can, and the gap is paused, not cut.
         fake.balances_fail.store(false, Ordering::SeqCst);
         regular_ticks(&mut mgr, &fake, 1).await;
-        assert_books(&mgr, 50.0, 50_000, 0);
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Watching, 20_000_000));
         regular_ticks(&mut mgr, &fake, 3).await;
-        assert_books(&mgr, 30.0, 30_000, 0);
-        assert_book_sync(&fake, 30.0, 30_000);
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Paused, 20_000_000));
+        assert_books(&mgr, 50.0, 50_000, 0);
+        assert!(fake.sends.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn failed_balance_read_neither_counts_nor_clears_a_sighting_of_a_spend() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
         channel_reports(&fake, 30_000_000, &[], &[]);
         regular_ticks(&mut mgr, &fake, 1).await;
         fake.balances_fail.store(true, Ordering::SeqCst);
         regular_ticks(&mut mgr, &fake, 1).await;
-        assert_books(&mgr, 50.0, 50_000, 0);
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Watching, 20_000_000));
 
         fake.balances_fail.store(false, Ordering::SeqCst);
         regular_ticks(&mut mgr, &fake, 1).await;
-        assert_books(&mgr, 30.0, 30_000, 0);
-        assert_book_sync(&fake, 30.0, 30_000);
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Paused, 20_000_000), "the second tick that reads the report is the second sighting");
+        assert_books(&mgr, 50.0, 50_000, 0);
+        assert!(fake.sends.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn channel_at_its_backing_is_still_topped_up_when_the_node_cannot_report_balances() {
         let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
+        start_books(&mgr, &fake);
         fake.balances_fail.store(true, Ordering::SeqCst);
         // At $80k the $50 target needs 62,500 sats against 50,000 of backing.
         let push = test_push(&mgr);
@@ -9836,8 +10838,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn unsigned_pay_back_is_matched_after_ticks_that_could_not_read_balances() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        regular_ticks(&mut mgr, &fake, 1).await;
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
         // 10,000 sats are spent with no event while the node cannot report balances.
         fake.balances_fail.store(true, Ordering::SeqCst);
         channel_reports(&fake, 40_000_000, &[], &[]);
@@ -9850,18 +10852,19 @@ pub(crate) mod tests {
         mgr.handle_payment_received(vec![stability_marker()], Some("unsigned-pay-back".to_owned()), Some(4_545_000), &fake as &dyn LdkServerCalls, 110_000.0).await;
         assert_books(&mgr, 50.0, 45_455, 0);
 
-        // Only the 10,000 sats that were spent come off: $11 at $110k.
+        // The books take the pay-back, so the gap they pause is the 10,000 sats that were spent, and nothing is cut.
         fake.balances_fail.store(false, Ordering::SeqCst);
         for _ in 0..3 {
             mgr.run_tick(&fake as &dyn LdkServerCalls, &push, 110_000.0).await;
         }
-        assert_books(&mgr, 39.0, 35_455, 0);
+        assert_eq!(books_state(&mgr), (45_455_000, CheckState::Paused, 10_000_000));
+        assert_books(&mgr, 50.0, 45_455, 0);
     }
 
     #[tokio::test]
     async fn unsigned_pay_back_beside_a_held_payment_is_matched_after_ticks_that_could_not_read_balances() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        regular_ticks(&mut mgr, &fake, 1).await;
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
         fake.balances_fail.store(true, Ordering::SeqCst);
         channel_reports(&fake, 40_000_000, &[10_000_000], &[]);
         let push = test_push(&mgr);
@@ -9874,6 +10877,7 @@ pub(crate) mod tests {
         for _ in 0..3 {
             mgr.run_tick(&fake as &dyn LdkServerCalls, &push, 110_000.0).await;
         }
+        assert_eq!(books_state(&mgr), (45_455_000, CheckState::Ok, 0));
         assert_books(&mgr, 50.0, 45_455, 0);
 
         // The held payment fails: the pay-back was the only sats that left.
@@ -9881,6 +10885,7 @@ pub(crate) mod tests {
         for _ in 0..3 {
             mgr.run_tick(&fake as &dyn LdkServerCalls, &push, 110_000.0).await;
         }
+        assert_eq!(books_state(&mgr), (45_455_000, CheckState::Ok, 0));
         assert_books(&mgr, 50.0, 45_455, 0);
         assert!(fake.sends.lock().unwrap().is_empty());
     }
@@ -9905,324 +10910,90 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn wake_pass_leaves_a_gap_alone_when_the_node_cannot_report_balances() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
+        // 20,000 sats leave the balance while the node cannot report balances, so no tick has checked the books against it.
         channel_reports(&fake, 30_000_000, &[], &[]);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        let uid = mgr.stable_channels[0].user_channel_id;
-        assert_eq!(mgr.spend_debounce.get(&uid).map(|check| check.sightings), Some(1));
-
         fake.balances_fail.store(true, Ordering::SeqCst);
         mgr.run_tick_plan(&fake as &dyn LdkServerCalls, 80_000.0, TickScope::WokenPeer(COUNTERPARTY_HEX)).await;
         assert!(fake.sends.lock().unwrap().is_empty(), "no top-up from a wake pass that cannot tell a held payment from a spend");
-        assert_eq!(mgr.spend_debounce.get(&uid).map(|check| check.sightings), Some(1), "the count is left to the regular tick");
-        assert_books(&mgr, 50.0, 50_000, 0);
-    }
-
-    #[tokio::test]
-    async fn tick_that_explains_the_gap_restarts_the_count() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        // A sighting: the payment is out of the balance and the node does not list it yet.
-        channel_reports(&fake, 30_000_000, &[20_000_000], &[]);
-        *fake.lightning_balances.lock().unwrap() = monitor_balances(CHANNEL_ID_HEX, 50_000, &[], &[]);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        let uid = mgr.stable_channels[0].user_channel_id;
-        assert_eq!(mgr.spend_debounce.get(&uid).map(|check| check.sightings), Some(1));
-
-        // The next tick sees it listed, so the gap is explained.
-        channel_reports(&fake, 30_000_000, &[20_000_000], &[]);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        assert!(mgr.spend_debounce.is_empty(), "an explained gap ends the run of sightings");
-
-        // A later read that misses it again is a first sighting, not the second.
-        *fake.lightning_balances.lock().unwrap() = monitor_balances(CHANNEL_ID_HEX, 50_000, &[], &[]);
-        regular_ticks(&mut mgr, &fake, 1).await;
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Ok, 0));
         assert_books(&mgr, 50.0, 50_000, 0);
     }
 
     // A payment to the user forwarded in from a routing channel, after which the user side holds `user_msat`.
     async fn forward_in(mgr: &mut StableChannelManager, fake: &FakeLdkServer, msat: u64, user_msat: u64) {
         channel_reports(fake, user_msat, &[], &[]);
+        {
+            // LDK counts the receive in the channel's totals, as it does every forward it reports this way.
+            let mut stats = fake.forwarding_stats.lock().unwrap();
+            if !stats.iter().any(|s| s.channel_id == CHANNEL_ID_HEX) {
+                stats.push(ldk_server_client::ldk_server_grpc::types::ChannelForwardingStats { channel_id: CHANNEL_ID_HEX.to_owned(), ..Default::default() });
+            }
+            let record = stats.iter_mut().find(|s| s.channel_id == CHANNEL_ID_HEX).unwrap();
+            record.total_outbound_amount_msat += msat;
+            record.outbound_payments_forwarded += 1;
+        }
         mgr.handle_payment_forwarded(
             "77162951604739255617201343530838311422".to_string(), Some(USER_CHANNEL_ID_DECIMAL.to_string()),
             ROUTING_CHANNEL_HEX.to_string(), CHANNEL_ID_HEX.to_string(),
             ROUTING_PEER_HEX.to_string(), COUNTERPARTY_HEX.to_string(),
-            msat, 0, None, true, fake as &dyn LdkServerCalls, 100_000.0,
+            msat, Some(0), None, true, fake as &dyn LdkServerCalls, 100_000.0,
         ).await;
     }
 
     #[tokio::test]
     async fn receive_after_a_sighting_does_not_cover_the_spend_it_saw() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        // 10,000 sats were spent with no forward reported.
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
+        // 10,000 sats were spent with no forward reported or counted.
         channel_reports(&fake, 40_000_000, &[], &[]);
         regular_ticks(&mut mgr, &fake, 1).await;
-        // The user receives 10,000 sats before the second tick.
+        // The user receives 10,000 sats before the second tick, and the books take them too.
         forward_in(&mut mgr, &fake, 10_000_000, 50_000_000).await;
         regular_ticks(&mut mgr, &fake, 1).await;
-        assert_books(&mgr, 40.0, 40_000, 10_000);
-        assert_book_sync(&fake, 40.0, 40_000);
+        assert_eq!(books_state(&mgr), (60_000_000, CheckState::Paused, 10_000_000));
         regular_ticks(&mut mgr, &fake, 3).await;
-        assert_books(&mgr, 40.0, 40_000, 10_000);
-        assert!(mgr.spend_debounce.is_empty());
-    }
-
-    #[tokio::test]
-    async fn balance_back_with_no_receive_reported_ends_the_check() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        channel_reports(&fake, 40_000_000, &[], &[]);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        // The sats come back with no forward: a payment the node had not listed yet failed.
-        channel_reports(&fake, 50_000_000, &[], &[]);
-        regular_ticks(&mut mgr, &fake, 3).await;
+        assert_eq!(books_state(&mgr), (60_000_000, CheckState::Paused, 10_000_000));
         assert_books(&mgr, 50.0, 50_000, 0);
-        assert!(mgr.spend_debounce.is_empty());
         assert!(fake.sends.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn receive_while_balance_reads_fail_does_not_cover_a_spend_already_seen() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
+    async fn balance_back_with_no_receive_reported_ends_the_check() {
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
         channel_reports(&fake, 40_000_000, &[], &[]);
         regular_ticks(&mut mgr, &fake, 1).await;
-        fake.balances_fail.store(true, Ordering::SeqCst);
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Watching, 10_000_000));
+        // The sats come back with no forward: a payment the node had not listed yet failed.
+        channel_reports(&fake, 50_000_000, &[], &[]);
         regular_ticks(&mut mgr, &fake, 3).await;
-        forward_in(&mut mgr, &fake, 10_000_000, 50_000_000).await;
-        regular_ticks(&mut mgr, &fake, 2).await;
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Ok, 0));
         assert_books(&mgr, 50.0, 50_000, 0);
-        fake.balances_fail.store(false, Ordering::SeqCst);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        assert_books(&mgr, 40.0, 40_000, 10_000);
-    }
-
-    #[tokio::test]
-    async fn native_spend_left_unbooked_during_a_check_uses_the_received_sats() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        // A 10,000-sat payment the node does not list yet is seen once.
-        channel_reports(&fake, 40_000_000, &[], &[]);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        // 20,000 sats come in and the payment fails, so 30,000 are native.
-        forward_in(&mut mgr, &fake, 20_000_000, 60_000_000).await;
-        channel_reports(&fake, 70_000_000, &[], &[]);
-        // 15,000 of them go out, but the forward handler cannot read the channel list.
-        channel_reports(&fake, 55_000_000, &[], &[]);
-        fake.list_channels_fails.store(true, Ordering::SeqCst);
-        forward_out(&mut mgr, &fake, 15_000).await;
-        fake.list_channels_fails.store(false, Ordering::SeqCst);
-        regular_ticks(&mut mgr, &fake, 3).await;
-        assert_books(&mgr, 50.0, 50_000, 0);
-        assert!(mgr.spend_debounce.is_empty());
-    }
-
-    #[tokio::test]
-    async fn spend_of_received_sats_with_no_gap_seen_stays_native() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        mgr.db.save_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, 50.0, 50_000, 0, None).unwrap();
-        mgr.reconcile_from_grpc(&fake as &dyn LdkServerCalls, 100_000.0).await;
-        forward_in(&mut mgr, &fake, 20_000_000, 70_000_000).await;
-        // 15,000 go out while the forward handler cannot read the channel list.
-        channel_reports(&fake, 55_000_000, &[], &[]);
-        fake.list_channels_fails.store(true, Ordering::SeqCst);
-        forward_out(&mut mgr, &fake, 15_000).await;
-        fake.list_channels_fails.store(false, Ordering::SeqCst);
-        regular_ticks(&mut mgr, &fake, 3).await;
-        assert_books(&mgr, 50.0, 50_000, 0);
-        assert!(mgr.spend_debounce.is_empty());
-    }
-
-    #[tokio::test]
-    async fn second_sighting_charges_no_more_than_the_first_saw() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        channel_reports(&fake, 40_000_000, &[], &[]);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        // A 5,000-sat payment then leaves the balance before the node lists it.
-        channel_reports(&fake, 35_000_000, &[], &[]);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        assert_books(&mgr, 40.0, 40_000, 0);
-        // It fails and its sats come back.
-        channel_reports(&fake, 40_000_000, &[], &[]);
-        regular_ticks(&mut mgr, &fake, 3).await;
-        assert_books(&mgr, 40.0, 40_000, 0);
-    }
-
-    #[tokio::test]
-    async fn gap_beyond_the_first_sighting_stays_checked_after_the_deduction() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        // Two spends go unreported: 10,000 sats before the first tick and 5,000 before the second.
-        channel_reports(&fake, 40_000_000, &[], &[]);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        channel_reports(&fake, 35_000_000, &[], &[]);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        assert_books(&mgr, 40.0, 40_000, 0);
-        // The user receives 5,000 sats before the next tick.
-        forward_in(&mut mgr, &fake, 5_000_000, 40_000_000).await;
-        regular_ticks(&mut mgr, &fake, 1).await;
-        assert_books(&mgr, 35.0, 35_000, 5_000);
-        regular_ticks(&mut mgr, &fake, 2).await;
-        assert_books(&mgr, 35.0, 35_000, 5_000);
-    }
-
-    #[tokio::test]
-    async fn sats_received_before_the_second_tick_can_cover_what_only_it_saw() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        channel_reports(&fake, 40_000_000, &[], &[]);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        // 3,000 sats come in, then 5,000 go out unreported, before the second tick: the 3,000 pay for part of it.
-        forward_in(&mut mgr, &fake, 3_000_000, 43_000_000).await;
-        channel_reports(&fake, 38_000_000, &[], &[]);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        assert_books(&mgr, 40.0, 40_000, 0);
-        regular_ticks(&mut mgr, &fake, 3).await;
-        assert_books(&mgr, 38.0, 38_000, 0);
-        assert!(mgr.spend_debounce.is_empty());
+        assert!(fake.sends.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn wake_pass_leaves_a_seen_gap_alone_when_received_sats_raise_the_balance() {
-        let (mut mgr, fake) = check_open_with_a_receive().await;
-        // At $80k the undeducted $50 would call for a top-up.
-        mgr.run_tick_plan(&fake as &dyn LdkServerCalls, 80_000.0, TickScope::WokenPeer(COUNTERPARTY_HEX)).await;
-        assert_eq!(top_ups_sent(&fake), 0, "no top-up on a target a seen spend may still cut");
-        let uid = mgr.stable_channels[0].user_channel_id;
-        assert_eq!(mgr.spend_debounce.get(&uid).map(|check| check.sightings), Some(1));
-        regular_ticks(&mut mgr, &fake, 1).await;
-        assert_books(&mgr, 40.0, 40_000, 20_000);
-    }
-
-    #[tokio::test]
-    async fn gap_beyond_the_first_sighting_stays_checked_across_a_failed_save() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        mgr.db.save_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, 50.0, 50_000, 0, None).unwrap();
-        let conn = save_test_connection(&mgr);
-        channel_reports(&fake, 40_000_000, &[], &[]);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        channel_reports(&fake, 35_000_000, &[], &[]);
-        conn.execute_batch(
-            "CREATE TRIGGER reject_book_save BEFORE INSERT ON ledger_events
-             WHEN NEW.event_type = 'CHANNEL_ACCOUNTING_STATE_COMMITTED'
-             BEGIN SELECT RAISE(ABORT, 'forced ledger failure'); END;",
-        )
-        .unwrap();
-        regular_ticks(&mut mgr, &fake, 1).await;
-        assert_books(&mgr, 50.0, 50_000, 0);
-        conn.execute_batch("DROP TRIGGER reject_book_save").unwrap();
-        forward_in(&mut mgr, &fake, 5_000_000, 40_000_000).await;
-        // The first tick saves the $40 correction, the next sees the rest of the gap again.
-        regular_ticks(&mut mgr, &fake, 1).await;
-        assert_books(&mgr, 40.0, 40_000, 0);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        assert_books(&mgr, 35.0, 35_000, 5_000);
-    }
-
-    #[tokio::test]
-    async fn forward_that_explains_a_sighting_ends_the_check() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        // A tick runs between a payment settling and its forward event.
-        channel_reports(&fake, 40_000_000, &[], &[]);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        forward_out(&mut mgr, &fake, 10_000).await;
-        assert_books(&mgr, 40.0, 40_000, 0);
-        assert!(mgr.spend_debounce.is_empty(), "the event explains what the tick saw");
-        // A later 5,000-sat gap is a first sighting, not the second.
-        channel_reports(&fake, 35_000_000, &[], &[]);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        assert_books(&mgr, 40.0, 40_000, 0);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        assert_books(&mgr, 35.0, 35_000, 0);
-    }
-
-    #[tokio::test]
-    async fn forward_beside_an_unexplained_gap_keeps_the_check() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        channel_reports(&fake, 40_000_000, &[], &[]);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        // Another 5,000 sats go out with their event; the missed 10,000 are still unexplained.
-        channel_reports(&fake, 35_000_000, &[], &[]);
-        forward_out(&mut mgr, &fake, 5_000).await;
-        assert_books(&mgr, 45.0, 45_000, 0);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        assert_books(&mgr, 35.0, 35_000, 0);
-    }
-
-    #[tokio::test]
-    async fn spend_during_a_check_uses_the_received_sats_first() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        // 10,000 sats spent with no forward reported, seen once.
-        channel_reports(&fake, 40_000_000, &[], &[]);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        // 15,000 sats come in, then 8,000 go out with their event, so 7,000 of the received sats are left.
-        forward_in(&mut mgr, &fake, 15_000_000, 55_000_000).await;
-        channel_reports(&fake, 47_000_000, &[], &[]);
-        forward_out(&mut mgr, &fake, 8_000).await;
-        regular_ticks(&mut mgr, &fake, 1).await;
-        // Only the missed $10 comes off the target.
-        assert_books(&mgr, 40.0, 40_000, 7_000);
-        regular_ticks(&mut mgr, &fake, 3).await;
-        assert_books(&mgr, 40.0, 40_000, 7_000);
-    }
-
-    // The wallet spent $10 with no forward reported, a tick saw it, then 20,000 sats came in.
-    async fn check_open_with_a_receive() -> (StableChannelManager, FakeLdkServer) {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
-        mgr.db.save_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, 50.0, 50_000, 0, None).unwrap();
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
+        // The wallet spent $10 with no forward reported or counted, a tick saw it, then 20,000 sats came in.
         channel_reports(&fake, 40_000_000, &[], &[]);
         regular_ticks(&mut mgr, &fake, 1).await;
         forward_in(&mut mgr, &fake, 20_000_000, 60_000_000).await;
-        (mgr, fake)
-    }
-
-    #[tokio::test]
-    async fn correlated_trade_made_during_a_check_is_not_cut_by_it() {
-        let (mut mgr, fake) = check_open_with_a_receive().await;
-        let envelope = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &"d".repeat(64), 55.0, 100_000.0);
-        let fee = expected_trade_fee_msat(50.0, 55.0, 100_000.0).unwrap();
-        mgr.handle_trade_payment(&envelope, Some(&"e".repeat(64)), Some(fee), &fake, 100_000.0).await;
-        assert_eq!(mgr.stable_channels[0].expected_usd.0, 55.0);
-        regular_ticks(&mut mgr, &fake, 3).await;
-        assert_eq!(mgr.stable_channels[0].expected_usd.0, 55.0, "the trade's target stands");
-    }
-
-    #[tokio::test]
-    async fn signed_pay_back_during_a_check_leaves_the_spend_it_saw() {
-        let (mut mgr, fake) = check_open_with_a_receive().await;
-        // At $110k the books read above par, and the wallet pays back 4,545 sats.
-        wallet_pays_back(&mut mgr, &fake, "c2", 4_545, 55_455, 110_000.0).await;
-        assert_eq!(mgr.stable_channels[0].backing_sats, 45_455);
-        assert_eq!(mgr.spend_debounce.len(), 1, "the received sats do not cover the gap");
+        // At $80k the uncut $50 would call for a top-up, but payments to the channel wait on its books.
+        mgr.run_tick_plan(&fake as &dyn LdkServerCalls, 80_000.0, TickScope::WokenPeer(COUNTERPARTY_HEX)).await;
+        assert_eq!(top_ups_sent(&fake), 0, "no top-up while the books watch a gap below");
         regular_ticks(&mut mgr, &fake, 1).await;
-        assert!((mgr.stable_channels[0].expected_usd.0 - 40.0).abs() < 1e-6, "{}", mgr.stable_channels[0].expected_usd.0);
-    }
-
-    #[tokio::test]
-    async fn unsigned_pay_back_during_a_check_leaves_the_spend_it_saw() {
-        let (mut mgr, fake) = check_open_with_a_receive().await;
-        // A tick that cannot read the balance report notes the balance the received sats raised.
-        fake.balances_fail.store(true, Ordering::SeqCst);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        // At $110k the books read above par, and the wallet pays back 4,545 sats with the unsigned marker.
-        set_receiver_sats(&fake, 55_455);
-        mgr.handle_payment_received(
-            vec![stability_marker()], Some("pay-back-unsigned".to_string()), Some(4_545_000),
-            &fake as &dyn LdkServerCalls, 110_000.0,
-        ).await;
-        assert_eq!(mgr.stable_channels[0].backing_sats, 45_455);
-        assert_eq!(mgr.spend_debounce.len(), 1, "the received sats do not cover the gap");
-        fake.balances_fail.store(false, Ordering::SeqCst);
-        regular_ticks(&mut mgr, &fake, 1).await;
-        assert!((mgr.stable_channels[0].expected_usd.0 - 40.0).abs() < 1e-6, "{}", mgr.stable_channels[0].expected_usd.0);
-    }
-
-    #[tokio::test]
-    async fn operator_target_set_during_a_check_is_not_cut_by_it() {
-        let (mut mgr, fake) = check_open_with_a_receive().await;
-        let outcome = mgr.edit_stable_channel(CHANNEL_ID_HEX, Some(55.0), None, &fake, 100_000.0).await;
-        assert!(outcome.ok, "{}", outcome.status);
-        regular_ticks(&mut mgr, &fake, 3).await;
-        assert_eq!(mgr.stable_channels[0].expected_usd.0, 55.0, "the operator's target stands");
+        assert_eq!(books_state(&mgr), (70_000_000, CheckState::Paused, 10_000_000));
+        assert_books(&mgr, 50.0, 50_000, 0);
     }
 
     #[tokio::test]
     async fn wake_pass_tops_up_a_channel_whose_only_gap_is_a_held_payment() {
-        let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
         channel_reports(&fake, 30_000_000, &[20_000_000], &[]);
 
         // At $80k the $50 target needs 62,500 sats against 50,000 of backing.
@@ -10230,6 +11001,78 @@ pub(crate) mod tests {
         let sends = fake.sends.lock().unwrap();
         assert_eq!(sends.len(), 1, "the held payment is not a spend, so the woken peer is topped up");
         assert_eq!(sends[0].amount_msat, 12_500_000);
+    }
+
+    // The reasons of the top-up holds a capture recorded for the channel.
+    fn top_up_hold_reasons(events: &[(String, serde_json::Value)]) -> Vec<serde_json::Value> {
+        events
+            .iter()
+            .filter(|(name, data)| name == "STABILITY_TOP_UP_HELD" && data["user_channel_id"] == USER_CHANNEL_ID_DECIMAL)
+            .map(|(_, data)| data["reason"].clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_wake_pass_holds_a_top_up_while_the_balance_is_below_the_backing() {
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut mgr, fake) = anchored_forwards_fixture().await;
+        // 10,000 sats leave with no event, and the peer wakes before a regular tick checks the books against it.
+        channel_reports(&fake, 40_000_000, &[], &[]);
+        stable_channels::audit::enable_test_capture();
+        // At $80k the $50 target on 50,000 sats of backing would call for a 12,500-sat top-up.
+        mgr.run_tick_plan(&fake as &dyn LdkServerCalls, 80_000.0, TickScope::WokenPeer(COUNTERPARTY_HEX)).await;
+        let events = stable_channels::audit::drain_test_capture();
+        stable_channels::audit::disable_test_capture();
+        assert!(fake.sends.lock().unwrap().is_empty(), "no top-up on a backing the balance does not hold");
+        assert_eq!(top_up_hold_reasons(&events), [serde_json::json!("balance_below_backing")]);
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Ok, 0), "the books have not seen the drop yet");
+        assert_books(&mgr, 50.0, 50_000, 0);
+    }
+
+    #[tokio::test]
+    async fn a_channel_without_books_gets_no_top_up_while_its_balance_is_below_the_backing() {
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Without the event inbox no books start, so the top-up waits for them; with it, a balance that sits only in the reserve cannot start them, and the backing holds the top-up.
+        for (inbox_attached, held_for) in [(false, "no_books"), (true, "balance_below_backing")] {
+            let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
+            mgr.db.save_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, 50.0, 50_000, 0, None).unwrap();
+            if inbox_attached {
+                mgr.attach_event_inbox(std::sync::Arc::new(crate::event_inbox::Inbox::in_memory()));
+                // 30,000 sats are left, all in the reserve LDK holds for the user.
+                let mut channel = make_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 100_000, 70_000_000, true);
+                channel.inbound_capacity_msat = 0;
+                channel.counterparty_unspendable_punishment_reserve = 30_000;
+                *fake.channels.lock().unwrap() = vec![channel];
+            } else {
+                channel_reports(&fake, 30_000_000, &[], &[]);
+            }
+            stable_channels::audit::enable_test_capture();
+            let push = test_push(&mgr);
+            mgr.run_tick(&fake as &dyn LdkServerCalls, &push, 80_000.0).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert_eq!(top_ups_sent(&fake), 0, "inbox_attached={inbox_attached}");
+            assert_eq!(top_up_hold_reasons(&events), [serde_json::json!(held_for)], "inbox_attached={inbox_attached}");
+            assert!(mgr.db.booked_balance(mgr.stable_channels[0].user_channel_id).unwrap().is_none());
+            assert_books(&mgr, 50.0, 50_000, 0);
+            assert!(fake.sends.lock().unwrap().is_empty(), "nothing is cut, so nothing is published");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_balance_within_tolerance_of_the_backing_is_still_topped_up() {
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // 4.5 sats below the backing is within the books' tolerance and the top-up reaches equilibrium on the backing; 6 sats below is not.
+        for (user_msat, top_ups_msat) in [(49_995_500, vec![12_500_000]), (49_994_000, vec![])] {
+            let (mut mgr, fake) = settled_forwards_fixture(0, 50_000);
+            channel_reports(&fake, user_msat, &[], &[]);
+            start_books(&mgr, &fake);
+            let push = test_push(&mgr);
+            mgr.run_tick(&fake as &dyn LdkServerCalls, &push, 80_000.0).await;
+            let sent: Vec<u64> = fake.sends.lock().unwrap().iter().map(|send| send.amount_msat).filter(|&msat| msat > 1).collect();
+            assert_eq!(sent, top_ups_msat, "user_msat={user_msat}");
+            assert_books(&mgr, 50.0, 50_000, 0);
+        }
     }
 
     #[tokio::test]
@@ -11445,9 +12288,9 @@ pub(crate) mod tests {
         // Only the acceptance's signing gets no answer, so rejecting instead would go through and settle a valid request.
         fake.sign_failures.store(1, Ordering::SeqCst);
         assert_eq!(mgr.handle_trade_payment(&request, Some(&payment_id), Some(fee), &fake, 100_000.0).await, Handled::Retry, "acceptance signature");
-        for id in [&payment_id, &underpaid] {
-            assert!(mgr.db.trade_decision_by_payment(id).unwrap().is_none(), "nothing is decided without those answers");
-        }
+        assert!(mgr.db.trade_decision_by_payment(&payment_id).unwrap().is_none(), "nothing is decided without those answers");
+        // A rejection whose signing was refused is not handled again, so its payment is refused for good.
+        assert_eq!(mgr.db.trade_decision_summary(&underpaid).unwrap().unwrap().outcome, "rejected");
         assert!(fake.sends.lock().unwrap().is_empty());
         // A refused lookup is an answer too: the reply falls back to the inbound id, as before.
         *fake.failure_code.lock().unwrap() = refused;
@@ -12638,30 +13481,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn stability_payment_keeps_the_backstop_count_for_a_gap_it_left() {
-        for signed in [true, false] {
-            // A 10,000-sat spend never produced an event, so only the tick backstop can deduct it.
-            let (mut mgr, fake) = settled_forwards_fixture(0, 40_000);
-            let push = test_push(&mgr);
-            mgr.run_tick(&fake as &dyn LdkServerCalls, &push, 100_000.0).await;
-
-            // A 1-sat payment between the two low ticks leaves that gap in place.
-            set_user_side_sats(&fake, 39_999);
-            if signed {
-                receive_one_sat_stability(&mut mgr, &fake).await;
-            } else {
-                mgr.handle_payment_received(
-                    vec![stability_marker()], Some("one-sat-marker".to_owned()), Some(1_000),
-                    &fake as &dyn LdkServerCalls, 100_000.0,
-                ).await;
-            }
-            mgr.run_tick(&fake as &dyn LdkServerCalls, &push, 100_000.0).await;
-
-            assert_books(&mgr, 40.0, 39_999, 0);
-        }
-    }
-
-    #[tokio::test]
     async fn signed_stability_uses_local_state_when_peer_expected_usd_differs() {
         let _guard = AUDIT_TEST_GUARD.lock().unwrap();
         let mut mgr = manager_at_par_for_signed_stability().await;
@@ -13115,17 +13934,19 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn incoming_stability_payment_prevents_backstop_misfire() {
-        let _guard = AUDIT_TEST_GUARD.lock().unwrap();
+    async fn incoming_stability_payment_leaves_no_gap_in_the_books() {
+        let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut mgr = make_manager();
         let fake0 = FakeLdkServer::new(vec![make_channel(
             CHANNEL_ID_HEX, USER_CHANNEL_ID_HEX, COUNTERPARTY_HEX, 100_000, 50_000_000, true,
         )]);
         mgr.edit_stable_channel(CHANNEL_ID_HEX, Some(10.0), None, &fake0 as &dyn LdkServerCalls, 100_000.0).await;
-        let push = std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::push::PushService::new(&crate::config::PushConfig::default(), mgr.data_dir()),
-        ));
-        mgr.run_tick(&fake0 as &dyn LdkServerCalls, &push, 100_000.0).await;
+        mgr.attach_event_inbox(std::sync::Arc::new(crate::event_inbox::Inbox::in_memory()));
+        let push = test_push(&mgr);
+        for _ in 0..2 {
+            mgr.run_tick(&fake0 as &dyn LdkServerCalls, &push, 100_000.0).await;
+        }
+        assert_eq!(books_state(&mgr), (50_000_000, CheckState::Ok, 0));
 
         // User settles 909 sats; books reconciled at receive.
         let fake = FakeLdkServer::new(vec![make_channel(
@@ -13137,18 +13958,10 @@ pub(crate) mod tests {
         ).await;
         let expected_before = mgr.stable_channels[0].expected_usd.0;
 
-        // Two ticks at the new price: without receive-time reconcile the backstop
-        // would read the settled sats as an unreconciled spend and deduct expected_usd.
-        stable_channels::audit::enable_test_capture();
+        // Two ticks at the new price: the books took the payment when it arrived, so it is no gap.
         mgr.run_tick(&fake as &dyn LdkServerCalls, &push, 110_000.0).await;
         mgr.run_tick(&fake as &dyn LdkServerCalls, &push, 110_000.0).await;
-        let events = stable_channels::audit::drain_test_capture();
-        stable_channels::audit::disable_test_capture();
-
-        assert!(
-            !events.iter().any(|(e, _)| e == "BACKSTOP_STABLE_DEDUCTED"),
-            "settled stability payment must not trigger the backstop"
-        );
+        assert_eq!(books_state(&mgr), (49_091_000, CheckState::Ok, 0));
         assert_eq!(
             mgr.stable_channels[0].expected_usd.0, expected_before,
             "expected_usd must survive a settled stability payment"
@@ -13507,7 +14320,7 @@ pub(crate) mod tests {
             history.clone(), GrpcForwardedPayment { id: "history-two".into(), ..history },
         ]);
         for _ in 0..2 {
-            mgr.handle_payment_forwarded("10".into(), Some("20".into()), "same-prev".into(), "same-next".into(), "02aa".into(), "02bb".into(), 1_000, 7, None, true, &fake, 80_000.0).await;
+            mgr.handle_payment_forwarded("10".into(), Some("20".into()), "same-prev".into(), "same-next".into(), "02aa".into(), "02bb".into(), 1_000, Some(7), None, true, &fake, 80_000.0).await;
         }
         assert_eq!(ledger_for(&db, "same-prev").len(), 2, "equal live occurrences are not replays");
         assert_eq!(crate::backfill::backfill_forwards(&fake, &db, None).await.emitted, 2);
@@ -13529,7 +14342,7 @@ pub(crate) mod tests {
         };
         let fake = FakeLdkServer::new(vec![]).with_forwarded(vec![history]);
         assert_eq!(crate::backfill::backfill_forwards(&fake, &db, None).await.emitted, 1);
-        mgr.handle_payment_forwarded("10".into(), Some("20".into()), "buffered-prev".into(), "buffered-next".into(), "02aa".into(), "02bb".into(), 1_000, 7, None, true, &fake, 80_000.0).await;
+        mgr.handle_payment_forwarded("10".into(), Some("20".into()), "buffered-prev".into(), "buffered-next".into(), "02aa".into(), "02bb".into(), 1_000, Some(7), None, true, &fake, 80_000.0).await;
         let rows = ledger_for(&db, "buffered-prev");
         assert_eq!(rows.len(), 2);
         let live = rows.iter().find(|row| row.event_type == "PAYMENT_FORWARDED").unwrap();
@@ -13781,7 +14594,7 @@ pub(crate) mod tests {
         use super::*;
         use crate::event_inbox::{Entry, Inbox};
         use ldk_server_client::ldk_server_grpc::types::ChannelForwardingStats;
-        use stable_channels::db::{BookedBalance, CheckState, ForwardCursor};
+        use stable_channels::db::{BookedBalance, BooksCheck, CheckState, ForwardCursor, GapChoice, GapDirection, UncutSpends};
 
         const UID: u128 = 189476124653200987495269098788434301048;
         const RESERVE_SATS: u64 = 1_000;
@@ -13836,15 +14649,6 @@ pub(crate) mod tests {
         async fn ticks(mgr: &mut StableChannelManager, fake: &FakeLdkServer, count: usize) {
             for _ in 0..count {
                 mgr.run_tick_plan(fake as &dyn LdkServerCalls, 100_000.0, TickScope::All).await;
-            }
-        }
-
-        /// The node reports every SYNC the LSP sent so far as delivered, as it does within seconds for a wallet that is online.
-        async fn syncs_delivered(mgr: &mut StableChannelManager, fake: &FakeLdkServer) {
-            let sent = fake.sends.lock().unwrap().len();
-            for n in 1..=sent {
-                let payment_id = if n == 1 { "fake-payment-id".to_owned() } else { format!("fake-payment-id-{n}") };
-                outcome(mgr, fake, &payment_id, Some(1), true).await;
             }
         }
 
@@ -13926,6 +14730,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         async fn a_forward_counted_after_the_first_reading_restarts_the_anchor_wait() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let (mut mgr, fake, _inbox) = fixture(50.0).await;
             // The forward has left the balance but LDK has not counted it yet.
             user_holds(&fake, 50_000_000 - 10_500);
@@ -13933,8 +14738,6 @@ pub(crate) mod tests {
             *fake.forwarding_stats.lock().unwrap() = totals_after_a_forward_out();
             ticks(&mut mgr, &fake, 1).await;
             assert!(booked(&mgr).is_none(), "the totals moved since the first reading");
-            // The existing check published the drop with a SYNC, which the wallet takes.
-            syncs_delivered(&mut mgr, &fake).await;
             ticks(&mut mgr, &fake, 1).await;
             let books = booked(&mgr).expect("anchored once the reading repeats");
             assert_eq!(books.booked_user_msat, 50_000_000 - 10_500);
@@ -13992,8 +14795,6 @@ pub(crate) mod tests {
             assert_eq!(count_events(&events, "BOOKED_BALANCE_DISAGREES"), 0);
 
             user_holds(&fake, 20_000_000 + RESERVE_SATS * 1000);
-            // The existing check published the drop with a SYNC, which the wallet takes.
-            syncs_delivered(&mut mgr, &fake).await;
             ticks(&mut mgr, &fake, 2).await;
             let books = booked(&mgr).expect("anchored once the balance can be read");
             assert_eq!(books.booked_user_msat, 20_000_000 + RESERVE_SATS * 1000);
@@ -14001,8 +14802,13 @@ pub(crate) mod tests {
 
         #[tokio::test]
         async fn a_channel_with_a_top_up_on_the_way_is_not_anchored() {
-            let (mut mgr, ldk, push) = top_up_in_flight().await;
-            *ldk.forwarding_stats.lock().unwrap() = totals_so_far();
+            let mut mgr = make_manager();
+            let ldk = FakeLdkServer::new(vec![make_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 100_000, 50_000_000, true)])
+                .with_forwarding_stats(totals_so_far());
+            mgr.edit_stable_channel(CHANNEL_ID_HEX, Some(50.0), None, &ldk as &dyn LdkServerCalls, 100_000.0).await;
+            let push = test_push(&mgr);
+            // A 12,500-sat top-up a release before the books sent at $80k, which the peer has not claimed yet.
+            assert!(mgr.db.record_stability_top_up_in_flight("fake-payment-id", USER_CHANNEL_ID_DECIMAL, CHANNEL_ID_HEX, 12_500, 50.0, 50_000, 0, 12_500_000, "lsp_to_user", COUNTERPARTY_HEX).unwrap());
             mgr.attach_event_inbox(std::sync::Arc::new(Inbox::in_memory()));
             // The node still lists the top-up as pending, so its claim is not in the balance yet.
             node_reports(&ldk, "fake-payment-id", PaymentStatus::Pending);
@@ -14042,10 +14848,76 @@ pub(crate) mod tests {
             assert_eq!(failed[0]["dedup_key"], format!("lsp:books-stats:{day}"));
         }
 
+        #[tokio::test]
+        async fn a_forward_whose_totals_cannot_be_read_is_recorded_once_a_day_per_channel() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            anchor(&mut mgr, &fake).await;
+            // Two forwards out of the user are handled while LDK's totals for the channel cannot be read.
+            fake.stats_fail.store(true, Ordering::SeqCst);
+            forwarded(&mut mgr, &fake, USER_CHANNEL_ID_DECIMAL, CHANNEL_ID_HEX, None, ROUTING_CHANNEL_HEX, 10_000, 100).await;
+            forwarded(&mut mgr, &fake, USER_CHANNEL_ID_DECIMAL, CHANNEL_ID_HEX, None, ROUTING_CHANNEL_HEX, 7_250, 90).await;
+            let failed: Vec<_> = ledger_rows(&mgr, "LDK_CALL_FAILED").into_iter().filter(|row| row["context"] == "book_forward").collect();
+            assert_eq!(failed.len(), 1, "one record a day for the channel, not one per forward");
+            let day = StableChannelManager::unix_time_secs() / STABILITY_TOP_UP_ALARM_REPEAT_SECS;
+            assert_eq!(failed[0]["dedup_key"], format!("lsp:books-forward-read:{UID}:{day}"));
+        }
+
+        #[tokio::test]
+        async fn a_counted_forward_whose_totals_cannot_be_read_is_left_to_the_catch_up() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // A 10,000-sat spend LDK counts, its event handled twice while LDK's totals for the channel cannot be read.
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spending(10_000_000);
+            user_holds(&fake, 40_000_000);
+            fake.stats_fail.store(true, Ordering::SeqCst);
+            for _ in 0..2 {
+                spend_out_of_the_user(&mut mgr, &fake, 10_000_000).await;
+            }
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "nothing booked or cut yet");
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty());
+            assert!(fake.sends.lock().unwrap().is_empty());
+
+            // Once the totals read again, the tick books the spend from them and cuts it once.
+            fake.stats_fail.store(false, Ordering::SeqCst);
+            let cuts = tick_cuts(&mut mgr, &fake).await;
+            assert_eq!((cuts.len(), &cuts[0]["source"], &cuts[0]["stable_sats_spent"]), (1, &serde_json::json!("forward_catch_up"), &serde_json::json!(10_000)));
+            assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)));
+            assert!(tick_cuts(&mut mgr, &fake).await.is_empty());
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.uncut, books.check.state), (40_000_000, None, CheckState::Ok));
+        }
+
+        #[tokio::test]
+        async fn a_channel_the_balance_report_leaves_out_is_not_checked() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // A 1,500-sat payment from the user is in flight, in neither side's balance, and the node's balance report leaves the channel out.
+            user_holds(&fake, 48_500_000);
+            fake.channels.lock().unwrap()[0].outbound_capacity_msat -= 1_500_000;
+            fake.lightning_balances.lock().unwrap().clear();
+            fake.balances_incomplete.store(true, Ordering::SeqCst);
+            ticks(&mut mgr, &fake, 3).await;
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.check.state, books.check.direction), (50_000_000, CheckState::Ok, None), "a payment that can still come back is no gap");
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+
+            // Once the report lists the channel and its payment, the books and the balance agree.
+            fake.balances_incomplete.store(false, Ordering::SeqCst);
+            *fake.lightning_balances.lock().unwrap() = monitor_balances(CHANNEL_ID_HEX, 50_000, &[1_500_000], &[]);
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+        }
+
         async fn forwarded(mgr: &mut StableChannelManager, fake: &FakeLdkServer, prev_ucid: &str, prev_chan: &str, next_ucid: Option<&str>, next_chan: &str, outbound_msat: u64, fee_msat: u64) {
             mgr.handle_payment_forwarded(
                 prev_ucid.to_string(), next_ucid.map(str::to_string), prev_chan.to_string(), next_chan.to_string(),
-                "02aa".to_string(), "02bb".to_string(), outbound_msat, fee_msat, None, true, fake as &dyn LdkServerCalls, 100_000.0,
+                "02aa".to_string(), "02bb".to_string(), outbound_msat, Some(fee_msat), None, true, fake as &dyn LdkServerCalls, 100_000.0,
             ).await;
         }
 
@@ -14082,6 +14954,42 @@ pub(crate) mod tests {
         }
 
         #[tokio::test]
+        async fn a_forward_into_the_user_with_an_unknown_fee_is_left_to_the_books_check() {
+            use ldk_server_client::ldk_server_grpc::events::{event_envelope::Event, PaymentForwarded};
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // 15,000 sats reach the user from a channel that closed on chain, so LDK reports no fee, counts nothing and may report the forward again.
+            user_holds(&fake, 65_000_000);
+            let locator = |channel_id: &str, user_channel_id: &str| vec![HtlcLocator { channel_id: channel_id.to_owned(), user_channel_id: Some(user_channel_id.to_owned()), ..Default::default() }];
+            let event = Event::PaymentForwarded(PaymentForwarded {
+                prev_htlcs: locator(ROUTING_CHANNEL_HEX, OTHER_USER_CHANNEL_ID_DECIMAL),
+                next_htlcs: locator(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL),
+                outbound_amount_forwarded_msat: 15_000_000,
+                total_fee_earned_msat: None,
+                ..Default::default()
+            });
+            let db = mgr.db.clone();
+            for _ in 0..2 {
+                std::thread::sleep(std::time::Duration::from_millis(3));
+                assert_eq!(crate::event_loop::dispatch_event(Some(event.clone()), &mut mgr, &db, &fake, 100_000.0).await, crate::event_loop::DispatchOutcome::Continue);
+            }
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000, "neither copy is booked");
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty());
+
+            // The surplus lasts two checks and is booked once as spare BTC, with nothing cut.
+            ticks(&mut mgr, &fake, 4).await;
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            let reasons: Vec<_> = changes.iter().map(|row| (row["reason"].clone(), row["delta_msat"].clone())).collect();
+            assert_eq!(reasons, [(serde_json::json!("unattributed_receipt"), serde_json::json!(15_000_000))]);
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.check.state, books.uncut), (65_000_000, CheckState::Ok, None));
+            assert_eq!(money(&mgr), ((50.0, 50_000, 15_000), (50.0, 50_000, 15_000)));
+            let mismatches: Vec<_> = ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").iter().map(|row| (row["direction"].clone(), row["effect"].clone())).collect();
+            assert_eq!(mismatches, [(serde_json::json!("above"), serde_json::json!("booked_as_spare"))], "never paused");
+        }
+
+        #[tokio::test]
         async fn a_forward_event_handled_twice_is_booked_once() {
             let (mut mgr, fake, _inbox) = fixture(50.0).await;
             anchor(&mut mgr, &fake).await;
@@ -14094,13 +15002,14 @@ pub(crate) mod tests {
         }
 
         #[tokio::test]
-        async fn the_existing_deduction_is_unchanged_by_booking() {
+        async fn a_forward_ldk_did_not_count_is_cut_from_the_books() {
+            // The books agree with the live balance here, so the cut is the one the live balance gave.
             let (mut mgr, fake) = seed_forwarded_fixture().await;
             *fake.channels.lock().unwrap() = vec![make_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 100_000, 95_000_000, true)];
             mgr.db.anchor_booked_balance(UID, CHANNEL_ID_HEX, 50_000_000, 100_000, ForwardCursor::default(), serde_json::json!({})).unwrap();
             mgr.handle_payment_forwarded(
                 USER_CHANNEL_ID_DECIMAL.to_string(), Some("next-ucid-1".to_string()), "prev-chan-1".to_string(), "next-chan-1".to_string(),
-                "prev-node-1".to_string(), "next-node-1".to_string(), 45_000_000, 0, None, false, &fake as &dyn LdkServerCalls, 100_000.0,
+                "prev-node-1".to_string(), "next-node-1".to_string(), 45_000_000, Some(0), None, false, &fake as &dyn LdkServerCalls, 100_000.0,
             ).await;
             assert!((mgr.stable_channels[0].expected_usd.0 - 5.0).abs() < 0.01);
             assert_eq!(mgr.stable_channels[0].backing_sats, 5_000);
@@ -14179,7 +15088,7 @@ pub(crate) mod tests {
         #[tokio::test]
         async fn a_forward_waiting_in_the_inbox_is_counted_in_the_check() {
             let _guard = AUDIT_TEST_GUARD.lock().unwrap();
-            // $10 on 10,000 sats of backing, so the existing check leaves the drop alone.
+            // $10 on 10,000 sats of backing, so the drop leaves the user above backing.
             let (mut mgr, fake, inbox) = fixture(10.0).await;
             anchor(&mut mgr, &fake).await;
             // A forward out of the user whose event is saved but not handled, already gone from the live balance; LDK's totals here do not hold it, so nothing else books it.
@@ -14223,26 +15132,27 @@ pub(crate) mod tests {
         }
 
         #[tokio::test]
-        async fn a_lasting_gap_is_logged_as_a_pause_that_did_not_happen() {
+        async fn a_lasting_gap_pauses_a_channel_with_books_and_is_never_cut() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let (with_books, figures) = lasting_gap(false).await;
             let mismatches = ledger_rows(&with_books, "BOOKED_BALANCE_MISMATCH");
             assert_eq!(mismatches.len(), 1);
-            assert_eq!(mismatches[0]["effect"], "log_only");
+            assert_eq!(mismatches[0]["effect"], "paused");
             assert_eq!(mismatches[0]["direction"], "below");
             assert_eq!(mismatches[0]["gap_msat"], 20_000_000);
             assert_eq!(booked(&with_books).unwrap().check.state, CheckState::Paused);
+            assert_eq!(figures, ((50.0, 50_000, 0), (50.0, 50_000, 0), 0), "the books pause the gap and cut nothing");
 
+            // Without books nothing cuts the gap either, and nothing is published.
             let (without_books, figures_without) = lasting_gap(true).await;
             assert!(booked(&without_books).is_none());
-            assert_eq!(figures, figures_without, "the books pass changes no money");
-            assert_eq!(figures.1, (30.0, 30_000, 0), "the existing balance check deducted the gap in both runs");
-            assert_eq!(figures.2, 1, "and published it with one SYNC");
+            assert_eq!(figures_without, ((50.0, 50_000, 0), (50.0, 50_000, 0), 0));
         }
 
         #[tokio::test]
         async fn a_disagreement_is_logged_once_until_it_changes() {
             let _guard = AUDIT_TEST_GUARD.lock().unwrap();
-            // $10 on 10,000 sats of backing, so a 20,000-sat gap leaves the user above backing and the existing check leaves it alone.
+            // $10 on 10,000 sats of backing, so a 20,000-sat gap leaves the user above backing.
             let (mut mgr, fake, _inbox) = fixture(10.0).await;
             assert_eq!((mgr.stable_channels[0].backing_sats, mgr.stable_channels[0].native_sats), (10_000, 40_000));
             anchor(&mut mgr, &fake).await;
@@ -14548,6 +15458,26 @@ pub(crate) mod tests {
         }
 
         #[tokio::test]
+        async fn a_pay_back_whose_signature_cannot_be_checked_is_recorded_once_a_day_per_channel() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut mgr = anchored_at_par().await;
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            let fake = user_paid_lsp(909);
+            *fake.verify_failure.lock().unwrap() = Some(LdkServerErrorCode::InternalServerError);
+            // Two expired pay-backs arrive while the node cannot check signatures.
+            for (settlement_id, payment_id) in [
+                ("3f0c9a51d27e48b6a0e4c1f97b25d8e36a4f0b17c92d5e68f3a1b04c7d9e2f58", "8d41e7b20f9c36a5d18e4b7f2a6c09d35e81b4f7c2a90d63e5f1b8a47c03d2e9"),
+                ("c62b84f1e09d3a75b4e8f2c16d7a90b3e54f18c2a7d06b9e3f41c85a2d7e0b16", "1a7e3c95f04b82d6e9c1a37f5b08d4e2c6f93a1b7e05d8c4f2a69e13b7d05c48"),
+            ] {
+                mgr.handle_payment_received(vec![expired_signed_pay_back(settlement_id, 909_000)], Some(payment_id.to_owned()), Some(909_000), &fake, 110_000.0).await;
+            }
+            let failed: Vec<_> = ledger_rows(&mgr, "LDK_CALL_FAILED").into_iter().filter(|row| row["context"] == "book_pay_back").collect();
+            assert_eq!(failed.len(), 1, "one record a day for the channel, not one per pay-back");
+            let day = StableChannelManager::unix_time_secs() / STABILITY_TOP_UP_ALARM_REPEAT_SECS;
+            assert_eq!(failed[0]["dedup_key"], format!("lsp:books-pay-back-read:verify_signature:{UID}:{day}"));
+        }
+
+        #[tokio::test]
         async fn a_pay_back_that_cannot_be_booked_is_still_applied() {
             let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut mgr = anchored_at_par().await;
@@ -14675,6 +15605,304 @@ pub(crate) mod tests {
             assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
         }
 
+        /// Books a splice that locked the channel on `SPLICE_OUT_TXID`, from its Ready event or, when the daemon missed it, from the next tick's listing; the records it writes.
+        async fn splice_out_booked(mgr: &mut StableChannelManager, fake: &FakeLdkServer, by_tick: bool) -> Vec<(String, serde_json::Value)> {
+            stable_channels::audit::enable_test_capture();
+            if by_tick {
+                ticks(mgr, fake, 1).await;
+            } else {
+                splice_locked(mgr, fake, &format!("{SPLICE_OUT_TXID}:1")).await;
+            }
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            events
+        }
+
+        #[tokio::test]
+        async fn an_lsp_splice_out_with_no_negotiation_record_is_not_cut_from_the_user() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            for by_tick in [false, true] {
+                // $50 backed by all of the user's 50,000 sats.
+                let (mut mgr, fake, _inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                // 20,000 sats of the LSP's side leave the channel with no negotiation the daemon recorded, no queued row and no note: the user's side stays at 50,000.
+                spliced(&fake, 80_000, 50_000_000, SPLICE_OUT_TXID);
+                let events = splice_out_booked(&mut mgr, &fake, by_tick).await;
+                let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+                assert_eq!(changes.len(), 1, "{by_tick}");
+                assert_eq!((&changes[0]["made_by"], &changes[0]["delta_msat"]), (&serde_json::json!("lsp"), &serde_json::json!(0)), "{by_tick}");
+                assert_eq!(count_events(&events, "SPLICE_OUT_STABLE_DEDUCTED"), 0, "{by_tick}");
+                assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "the target and backing stay: {by_tick}");
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.channel_value_sats, books.uncut), (50_000_000, 80_000, None), "{by_tick}");
+                ticks(&mut mgr, &fake, 2).await;
+                assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok, "{by_tick}");
+                assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty(), "{by_tick}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_splice_out_with_no_record_beside_a_paused_gap_is_left_to_the_operator() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            for by_tick in [false, true] {
+                // $50 backed by all of the user's 50,000 sats; 20,000 of them leave with nothing to explain them, and the check pauses on the gap.
+                let (mut mgr, fake, _inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                user_holds(&fake, 30_000_000);
+                ticks(&mut mgr, &fake, 3).await;
+                let paused = booked(&mgr).unwrap().check;
+                assert_eq!((paused.state, paused.gap_msat), (CheckState::Paused, 20_000_000), "{by_tick}");
+                // 20,000 sats of the LSP's side then leave with no record, and the user's side stays at 30,000.
+                spliced(&fake, 80_000, 30_000_000, SPLICE_OUT_TXID);
+                let events = splice_out_booked(&mut mgr, &fake, by_tick).await;
+                let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+                assert_eq!((changes.len(), &changes[0]["made_by"], &changes[0]["delta_msat"]), (1, &serde_json::json!("lsp"), &serde_json::json!(0)), "{by_tick}");
+                assert_eq!(count_events(&events, "SPLICE_OUT_STABLE_DEDUCTED"), 0, "{by_tick}");
+                assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "the gap stays the operator's: {by_tick}");
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.check.state), (50_000_000, CheckState::Paused), "{by_tick}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_splice_out_at_its_lock_counts_a_forward_ldk_counted_first() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // $50 backed by all of the user's 50,000 sats; the user spends 20,000, which LDK counts before its event arrives.
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spending(20_000_000);
+            // 20,000 sats of the LSP's side leave with no record before the next tick.
+            spliced(&fake, 80_000, 30_000_000, SPLICE_OUT_TXID);
+            let mut events = splice_out_booked(&mut mgr, &fake, false).await;
+            // The lock weighs the splice-out with the spend counted as the user's, so it is the LSP's.
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!((changes.len(), &changes[0]["made_by"], &changes[0]["delta_msat"]), (1, &serde_json::json!("lsp"), &serde_json::json!(0)));
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            // The tick books the spend and cuts it once.
+            events.extend(splice_out_booked(&mut mgr, &fake, true).await);
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            let booked_as: Vec<_> = changes.iter().map(|change| (change["reason"].clone(), change["delta_msat"].clone())).collect();
+            assert_eq!(booked_as, [("splice", 0), ("forward_catch_up", -20_000_000)].map(|(reason, delta)| (serde_json::json!(reason), serde_json::json!(delta))));
+            let cuts = spend_cuts(&events);
+            assert_eq!((cuts.len(), &cuts[0]["source"], &cuts[0]["stable_sats_spent"]), (1, &serde_json::json!("forward_catch_up"), &serde_json::json!(20_000)));
+            assert_eq!(count_events(&events, "SPLICE_OUT_STABLE_DEDUCTED"), 0);
+            assert_eq!(money(&mgr), ((30.0, 30_000, 0), (30.0, 30_000, 0)), "cut once");
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+        }
+
+        #[tokio::test]
+        async fn a_missed_splice_lock_is_booked_at_the_first_check_that_sees_it() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // $50 backed by all of the user's 50,000 sats, of which the user takes 20,000 out on chain; the daemon misses the lock, and an event waits in the inbox.
+            let (mut mgr, fake, inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            spliced(&fake, 80_000, 30_000_000, SPLICE_OUT_TXID);
+            inbox.save(&[(unrelated_event(), 0)]).unwrap();
+            let mut events = splice_out_booked(&mut mgr, &fake, true).await;
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!(changes.len(), 1, "booked by the first check, the event still waiting");
+            assert_eq!((&changes[0]["made_by"], &changes[0]["delta_msat"]), (&serde_json::json!("user"), &serde_json::json!(-20_000_000)));
+            assert!(!inbox.is_empty().unwrap());
+            // Later checks book and cut nothing more.
+            events.extend(splice_out_booked(&mut mgr, &fake, true).await);
+            let cuts: Vec<_> = events.iter().filter(|(name, _)| name == "SPLICE_OUT_STABLE_DEDUCTED").map(|(_, data)| data.clone()).collect();
+            assert_eq!((cuts.len(), &cuts[0]["stable_sats_spent"]), (1, &serde_json::json!(20_000)));
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").len(), 1);
+            assert_eq!(money(&mgr), ((30.0, 30_000, 0), (30.0, 30_000, 0)));
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.channel_value_sats, books.check.state), (30_000_000, 80_000, CheckState::Ok));
+        }
+
+        #[tokio::test]
+        async fn a_missed_lsp_splice_out_beside_a_forward_still_in_the_inbox_is_not_cut_from_the_user() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // $50 backed by all of the user's 50,000 sats; the user spends 20,000, which LDK counts while its event still waits in the inbox.
+            let (mut mgr, fake, inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spending(20_000_000);
+            inbox.save(&[(forward_out_of_the_user(20_000_000, 0), 0)]).unwrap();
+            // 20,000 sats of the LSP's side leave with no record, and the daemon misses the lock.
+            spliced(&fake, 80_000, 30_000_000, SPLICE_OUT_TXID);
+            let events = splice_out_booked(&mut mgr, &fake, true).await;
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!(changes.len(), 1, "the spend is left to its event");
+            assert_eq!((&changes[0]["reason"], &changes[0]["made_by"], &changes[0]["delta_msat"]), (&serde_json::json!("splice"), &serde_json::json!("lsp"), &serde_json::json!(0)));
+            assert_eq!(count_events(&events, "SPLICE_OUT_STABLE_DEDUCTED"), 0);
+            assert!(spend_cuts(&events).is_empty());
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.channel_value_sats), (50_000_000, 80_000));
+            assert_eq!((books.check.state, books.check.direction), (CheckState::Watching, Some(GapDirection::Below)), "the backing above the balance waits for the spend's own booking");
+            // The event is deleted unhandled, as an interrupted one is, and the catch-up books the spend and cuts it once.
+            let id = inbox.oldest().unwrap().unwrap().id;
+            inbox.finish(id).unwrap();
+            let events = splice_out_booked(&mut mgr, &fake, true).await;
+            let cuts = spend_cuts(&events);
+            assert_eq!((cuts.len(), &cuts[0]["source"], &cuts[0]["stable_sats_spent"]), (1, &serde_json::json!("forward_catch_up"), &serde_json::json!(20_000)));
+            assert_eq!(count_events(&events, "SPLICE_OUT_STABLE_DEDUCTED"), 0);
+            assert_eq!(money(&mgr), ((30.0, 30_000, 0), (30.0, 30_000, 0)), "cut once");
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+        }
+
+        #[tokio::test]
+        async fn a_user_splice_out_is_still_booked_and_cut_once() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            for by_tick in [false, true] {
+                // $50 backed by all of the user's 50,000 sats, of which the user takes 20,000 out on chain.
+                let (mut mgr, fake, _inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                spliced(&fake, 80_000, 30_000_000, SPLICE_OUT_TXID);
+                let mut events = splice_out_booked(&mut mgr, &fake, by_tick).await;
+                // Booked again from the other source, it books and cuts nothing more.
+                events.extend(splice_out_booked(&mut mgr, &fake, !by_tick).await);
+                let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+                assert_eq!(changes.len(), 1, "{by_tick}");
+                assert_eq!((&changes[0]["made_by"], &changes[0]["delta_msat"]), (&serde_json::json!("user"), &serde_json::json!(-20_000_000)), "{by_tick}");
+                let cuts: Vec<_> = events.iter().filter(|(name, _)| name == "SPLICE_OUT_STABLE_DEDUCTED").map(|(_, data)| data.clone()).collect();
+                assert_eq!((cuts.len(), &cuts[0]["stable_sats_spent"]), (1, &serde_json::json!(20_000)), "{by_tick}");
+                assert_eq!(money(&mgr), ((30.0, 30_000, 0), (30.0, 30_000, 0)), "{by_tick}");
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.channel_value_sats, books.uncut), (30_000_000, 80_000, None), "{by_tick}");
+                ticks(&mut mgr, &fake, 2).await;
+                assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok, "{by_tick}");
+            }
+        }
+
+        #[tokio::test]
+        async fn an_operator_splice_out_from_the_gui_route_is_the_lsps() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // The operator takes 20,000 sats of the LSP's side out from the GUI.
+            let request = SpliceOutRequest {
+                user_channel_id: USER_CHANNEL_ID_DECIMAL.into(),
+                counterparty_node_id: COUNTERPARTY_HEX.into(),
+                address: None,
+                splice_amount_sats: 20_000,
+            };
+            let response = crate::handlers::channels::splice_out_noted(&mgr.db, &fake, request, StableChannelManager::unix_time_secs()).await;
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            assert_eq!(fake.splice_outs.lock().unwrap().len(), 1);
+            assert!(mgr.db.load_manual_splice(USER_CHANNEL_ID_DECIMAL).unwrap().is_some(), "the route notes the splice before making it");
+            // No negotiation event reaches the daemon, and the node cannot report the user's payments when the lock is handled.
+            spliced(&fake, 80_000, 50_000_000, SPLICE_OUT_TXID);
+            fake.balances_fail.store(true, Ordering::SeqCst);
+            let events = splice_out_booked(&mut mgr, &fake, false).await;
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!(changes.len(), 1);
+            assert_eq!((&changes[0]["made_by"], &changes[0]["delta_msat"]), (&serde_json::json!("lsp"), &serde_json::json!(0)));
+            assert_eq!(count_events(&events, "SPLICE_OUT_STABLE_DEDUCTED"), 0);
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.channel_value_sats), (50_000_000, 80_000));
+            fake.balances_fail.store(false, Ordering::SeqCst);
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+        }
+
+        #[tokio::test]
+        async fn an_operator_splice_in_still_pending_does_not_make_a_user_splice_out_the_lsps() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // The operator adds 30,000 sats to the channel from the GUI, and the route notes it before making it.
+            let request = SpliceInRequest {
+                user_channel_id: USER_CHANNEL_ID_DECIMAL.into(),
+                counterparty_node_id: COUNTERPARTY_HEX.into(),
+                amount: Some(ldk_server_client::ldk_server_grpc::api::splice_in_request::Amount::SpliceAmountSats(30_000)),
+            };
+            let response = crate::handlers::channels::splice_in_noted(&mgr.db, &fake, request, StableChannelManager::unix_time_secs()).await;
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            assert_eq!(mgr.db.load_manual_splice(USER_CHANNEL_ID_DECIMAL).unwrap().and_then(|note| note.direction), Some(stable_channels::db::SpliceDirection::In));
+            // Before it locks, the user takes 20,000 sats out on chain: the value falls, so the note is not for it.
+            spliced(&fake, 80_000, 30_000_000, SPLICE_OUT_TXID);
+            let events = splice_out_booked(&mut mgr, &fake, false).await;
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!((changes.len(), &changes[0]["made_by"], &changes[0]["delta_msat"]), (1, &serde_json::json!("user"), &serde_json::json!(-20_000_000)));
+            assert_eq!(count_events(&events, "SPLICE_OUT_STABLE_DEDUCTED"), 1);
+            assert_eq!(money(&mgr), ((30.0, 30_000, 0), (30.0, 30_000, 0)));
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.channel_value_sats, books.uncut), (30_000_000, 80_000, None));
+        }
+
+        #[tokio::test]
+        async fn backing_above_the_books_is_not_cut_at_a_splice_lock() {
+            // $50 backed by all of the user's 50,000 sats; the books were started on the channel after the user's 20,000-sat splice-out locked.
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            spliced(&fake, 80_000, 30_000_000, SPLICE_OUT_TXID);
+            assert!(mgr.db.anchor_booked_balance(UID, CHANNEL_ID_HEX, 30_000_000, 80_000, cursor_so_far(), serde_json::json!({})).unwrap());
+            splice_locked(&mut mgr, &fake, &format!("{SPLICE_OUT_TXID}:1")).await;
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty(), "the books already hold the new value");
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "a gap between backing and the books is no cut");
+        }
+
+        #[tokio::test]
+        async fn a_small_splice_out_on_books_started_mid_confirmation_is_left_to_the_operator() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // $50 backed by all of the user's 50,000 sats; the books were started at 48,500 while a 1,500-sat splice-out too small to look like one confirmed.
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            assert!(mgr.db.anchor_booked_balance(UID, CHANNEL_ID_HEX, 48_500_000, 100_000, cursor_so_far(), serde_json::json!({})).unwrap());
+            spliced(&fake, 98_500, 48_500_000, SPLICE_OUT_TXID);
+            stable_channels::audit::enable_test_capture();
+            splice_locked(&mut mgr, &fake, &format!("{SPLICE_OUT_TXID}:1")).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            // A splice-out the allowance covers is no evidence of the user, so it cuts nothing.
+            assert_eq!(count_events(&events, "SPLICE_OUT_STABLE_DEDUCTED"), 0);
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!((changes.len(), &changes[0]["made_by"], &changes[0]["delta_msat"]), (1, &serde_json::json!("lsp"), &serde_json::json!(0)));
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            // The backing above the books and the balance is a gap the operator resolves.
+            ticks(&mut mgr, &fake, 3).await;
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.channel_value_sats), (48_500_000, 98_500));
+            assert_eq!((books.check.state, books.check.gap_kind, books.check.gap_msat), (CheckState::Paused, Some(stable_channels::db::GapKind::Backing), 1_500_000));
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+        }
+
+        #[tokio::test]
+        async fn a_splice_out_within_the_allowance_with_no_record_is_left_to_the_operator() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            for by_tick in [false, true] {
+                // $50 backed by all of the user's 50,000 sats; a 1,000-sat splice-out no record names locks, and the user's side shows 1,000 sats less.
+                let (mut mgr, fake, _inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                spliced(&fake, 99_000, 49_000_000, SPLICE_OUT_TXID);
+                let events = splice_out_booked(&mut mgr, &fake, by_tick).await;
+                // A drop the allowance covers is no evidence of the user, so nothing is cut and the books keep the gap.
+                let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+                assert_eq!((changes.len(), &changes[0]["made_by"], &changes[0]["delta_msat"]), (1, &serde_json::json!("lsp"), &serde_json::json!(0)), "{by_tick}");
+                assert_eq!(count_events(&events, "SPLICE_OUT_STABLE_DEDUCTED"), 0, "{by_tick}");
+                assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "{by_tick}");
+                ticks(&mut mgr, &fake, 3).await;
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.channel_value_sats), (50_000_000, 99_000), "{by_tick}");
+                assert_eq!((books.check.state, books.check.direction, books.check.gap_msat), (CheckState::Paused, Some(GapDirection::Below), 1_000_000), "{by_tick}");
+            }
+        }
+
+        #[tokio::test]
+        async fn an_lsp_splice_in_cuts_nothing_from_backing_above_the_books() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            // A receipt the books never took let a trade, checked against the live balance, set backing 5,000 sats above the books.
+            assert!(mgr.db.anchor_booked_balance(UID, CHANNEL_ID_HEX, 45_000_000, 100_000, cursor_so_far(), serde_json::json!({})).unwrap());
+            let stable_channels::db::QueueSpliceOutcome::Queued(row) = mgr.db.queue_splice_in(USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 50_000, 100, 0, "", None).unwrap() else {
+                panic!("queued")
+            };
+            mgr.db.mark_queued_splice_splicing(USER_CHANNEL_ID_DECIMAL, row.request_id, Some(&format!("{FUNDING_TXID}:0")), 100_000, 50_000, 101).unwrap().unwrap();
+            let funding = format!("{SPLICE_IN_TXID}:1");
+            mgr.db.note_queued_splice_negotiated(USER_CHANNEL_ID_DECIMAL, row.request_id, &funding, 102).unwrap().unwrap();
+            spliced(&fake, 150_000, 50_000_000, SPLICE_IN_TXID);
+            splice_locked(&mut mgr, &fake, &funding).await;
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!((changes.len(), &changes[0]["made_by"], &changes[0]["delta_msat"]), (1, &serde_json::json!("lsp"), &serde_json::json!(0)));
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "the splice-in cuts nothing");
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.channel_value_sats, books.uncut), (45_000_000, 150_000, None));
+        }
+
         #[tokio::test]
         async fn an_lsp_splice_in_leaves_the_user_books() {
             let (mut mgr, fake, _inbox) = fixture(50.0).await;
@@ -14780,17 +16008,21 @@ pub(crate) mod tests {
         }
 
         #[tokio::test]
-        async fn a_user_splice_out_inside_a_hand_made_notes_window_is_the_users() {
+        async fn a_splice_out_inside_a_hand_made_notes_window_is_left_to_the_operator() {
             let (mut mgr, fake, _inbox) = fixture(10.0).await;
             anchor(&mut mgr, &fake).await;
-            // The operator noted a splice-in by hand on the current funding, and the user's own splice-out locks first.
+            // The operator noted a splice by hand on the current funding, and a splice-out that moved the user's side locks first.
             let now = StableChannelManager::unix_time_secs();
-            mgr.db.note_manual_splice_unless(USER_CHANNEL_ID_DECIMAL, &format!("{FUNDING_TXID}:0"), now, |_| false).unwrap();
+            mgr.db.note_manual_splice_unless(USER_CHANNEL_ID_DECIMAL, &format!("{FUNDING_TXID}:0"), stable_channels::db::SpliceDirection::Out, now, |_| false).unwrap();
             spliced(&fake, 80_000, 30_000_000, SPLICE_OUT_TXID);
             splice_locked(&mut mgr, &fake, &format!("{SPLICE_OUT_TXID}:1")).await;
             let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
-            assert_eq!((&changes[0]["delta_msat"], &changes[0]["made_by"]), (&serde_json::json!(-20_000_000), &serde_json::json!("user")));
-            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 30_000_000);
+            assert_eq!((&changes[0]["delta_msat"], &changes[0]["made_by"]), (&serde_json::json!(0), &serde_json::json!("lsp")));
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000);
+            assert_eq!(money(&mgr), ((10.0, 10_000, 40_000), (10.0, 10_000, 40_000)), "nothing is cut");
+            // The user's side below the books is a gap for the operator.
+            ticks(&mut mgr, &fake, 1).await;
+            assert_eq!(booked(&mgr).unwrap().check.direction, Some(GapDirection::Below));
         }
 
         #[tokio::test]
@@ -14889,13 +16121,30 @@ pub(crate) mod tests {
             assert_eq!((books.channel_value_sats, books.check.state), (80_000, CheckState::Ok));
             assert_eq!(count_events(&events, "BOOKED_BALANCE_DISAGREES"), 0);
             assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
-            // The trade rewrote the stored native, and the splice-out it covered left it 20,000 sats behind again.
+            // The trade rewrote the stored native, and the splice-out it covered now sets it from the books as well.
             let differences: Vec<_> = native_lines(&events).iter().map(|line| line["difference_sats"].as_u64()).collect();
-            assert_eq!(differences, [Some(7), Some(20_000)]);
+            assert_eq!(differences, [Some(7)]);
         }
 
         #[tokio::test]
-        async fn a_forward_lists_the_channels_for_the_spend_check_before_the_books_read_totals() {
+        async fn a_pause_held_back_while_a_splice_out_confirms_raises_no_alarm() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            anchor(&mut mgr, &fake).await;
+            // 5,000 sats leave with nothing to explain them, then a splice-out starts confirming before the gap is seen again.
+            user_holds(&fake, 45_000_000);
+            ticks(&mut mgr, &fake, 1).await;
+            let watching = booked(&mgr).unwrap().check;
+            assert_eq!((watching.state, watching.direction), (CheckState::Watching, Some(GapDirection::Below)));
+            splice_out_confirming(&fake, 20_000);
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check, watching, "the check is left as it was");
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_PAUSED").is_empty(), "no alarm for a pause the books do not show");
+        }
+
+        #[tokio::test]
+        async fn a_forward_on_a_channel_with_books_reads_the_balance_only_to_publish() {
             let (mut mgr, fake, _inbox) = fixture(50.0).await;
             anchor(&mut mgr, &fake).await;
             *fake.forwarding_stats.lock().unwrap() = totals_after_a_forward_out();
@@ -14903,11 +16152,593 @@ pub(crate) mod tests {
             fake.calls.lock().unwrap().clear();
             forwarded(&mut mgr, &fake, USER_CHANNEL_ID_DECIMAL, CHANNEL_ID_HEX, Some(OTHER_USER_CHANNEL_ID_DECIMAL), ROUTING_CHANNEL_HEX, 10_000, 500).await;
             let calls = fake.calls.lock().unwrap().clone();
-            let first = |name: &str| calls.iter().position(|call| *call == name);
-            let (listed, read_totals) = (first("list_channels"), first("get_channel_forwarding_stats"));
-            assert!(listed.is_some() && read_totals.is_some(), "{calls:?}");
-            assert!(listed < read_totals, "the spend check reads the balance before the books read LDK's totals: {calls:?}");
+            assert_eq!(calls, vec!["get_channel_forwarding_stats", "list_channels"], "the books take the spend and decide the cut; the listing then says whether the wallet's balance holds its SYNC");
             assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000 - 10_500);
+            assert_eq!(fake.sends.lock().unwrap().len(), 1);
+        }
+
+        /// LDK's totals once it has counted one more forward of `msat` out of the user, with no fee.
+        fn totals_after_spending(msat: u64) -> Vec<ChannelForwardingStats> {
+            totals_after_spends(&[msat])
+        }
+
+        /// LDK's totals once it has counted these forwards out of the user, with no fee.
+        fn totals_after_spends(spends: &[u64]) -> Vec<ChannelForwardingStats> {
+            let (msat, count) = (spends.iter().sum::<u64>(), spends.len() as u64);
+            vec![totals(CHANNEL_ID_HEX, 7_350_000 + msat, 3 + count, 4_125_500, 2), totals(ROUTING_CHANNEL_HEX, 4_127_100, 2, 7_342_650 + msat, 3 + count)]
+        }
+
+        async fn spend_out_of_the_user(mgr: &mut StableChannelManager, fake: &FakeLdkServer, msat: u64) {
+            spend_out_of_the_user_at(mgr, fake, msat, 100_000.0).await;
+        }
+
+        async fn spend_out_of_the_user_at(mgr: &mut StableChannelManager, fake: &FakeLdkServer, msat: u64, btc_price: f64) {
+            mgr.handle_payment_forwarded(
+                USER_CHANNEL_ID_DECIMAL.to_string(), Some(OTHER_USER_CHANNEL_ID_DECIMAL.to_string()), CHANNEL_ID_HEX.to_string(), ROUTING_CHANNEL_HEX.to_string(),
+                "02aa".to_string(), "02bb".to_string(), msat, Some(0), None, true, fake as &dyn LdkServerCalls, btc_price,
+            ).await;
+        }
+
+        /// The target, backing and native in memory and as saved.
+        fn money(mgr: &StableChannelManager) -> ((f64, u64, u64), (f64, u64, u64)) {
+            let sc = &mgr.stable_channels[0];
+            let saved = mgr.db.load_channel(USER_CHANNEL_ID_DECIMAL).unwrap().unwrap();
+            ((sc.expected_usd.0, sc.backing_sats, sc.native_sats), (saved.expected_usd, saved.backing_sats, saved.native_sats))
+        }
+
+        fn spend_cuts(events: &[(String, serde_json::Value)]) -> Vec<serde_json::Value> {
+            events.iter().filter(|(name, _)| name == "STABLE_SPEND_DEDUCTED").map(|(_, data)| data.clone()).collect()
+        }
+
+        #[tokio::test]
+        async fn a_spend_is_cut_from_the_books_even_when_a_receive_shows_first() {
+            // $50 at $100k backed by all of the user's 50,000 sats, which the books hold.
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // The user spends 10,000 sats, and a 15,000-sat receive already shows in the balance before its event is booked.
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spending(10_000_000);
+            user_holds(&fake, 50_000_000 + 15_000_000 - 10_000_000);
+            spend_out_of_the_user(&mut mgr, &fake, 10_000_000).await;
+            assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)));
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 40_000_000);
+            assert_eq!(fake.sends.lock().unwrap().len(), 1, "the cut is published with a SYNC");
+        }
+
+        #[tokio::test]
+        async fn a_forward_within_spare_btc_keeps_the_target() {
+            // $10 on 10,000 sats of backing, so 40,000 of the user's 50,000 sats are spare BTC.
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            // A 20,000-sat spend, with a 15,000-sat receive the books have not taken yet already in the balance.
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spending(20_000_000);
+            user_holds(&fake, 50_000_000 + 15_000_000 - 20_000_000);
+            spend_out_of_the_user(&mut mgr, &fake, 20_000_000).await;
+            assert_eq!(money(&mgr), ((10.0, 10_000, 20_000), (10.0, 10_000, 20_000)), "spare BTC is the books less backing");
+            assert_eq!(mgr.stable_channels[0].native_channel_btc.sats, 20_000);
+            assert!(fake.sends.lock().unwrap().is_empty(), "nothing to publish");
+        }
+
+        #[tokio::test]
+        async fn a_forward_handled_twice_cuts_once() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spending(10_000_000);
+            user_holds(&fake, 40_000_000);
+            stable_channels::audit::enable_test_capture();
+            spend_out_of_the_user(&mut mgr, &fake, 10_000_000).await;
+            // The event is handled again while a 5,000-sat payment from the user is still in flight.
+            user_holds(&fake, 35_000_000);
+            spend_out_of_the_user(&mut mgr, &fake, 10_000_000).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)));
+            let cuts = spend_cuts(&events);
+            assert_eq!(cuts.len(), 1);
+            assert_eq!((&cuts[0]["source"], &cuts[0]["stable_sats_spent"]), (&serde_json::json!("forward"), &serde_json::json!(10_000)));
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 40_000_000);
+            assert_eq!(fake.sends.lock().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_forward_whose_event_never_arrives_is_cut_by_the_tick_and_sends_a_sync() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // A 10,000-sat spend whose event never reached the daemon.
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spending(10_000_000);
+            user_holds(&fake, 40_000_000);
+            stable_channels::audit::enable_test_capture();
+            ticks(&mut mgr, &fake, 1).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)));
+            let cuts = spend_cuts(&events);
+            assert_eq!(cuts.len(), 1);
+            assert_eq!(cuts[0]["source"], "forward_catch_up");
+            let sends = fake.sends.lock().unwrap().clone();
+            assert_eq!(sends.len(), 1);
+            assert_eq!((sends[0].amount_msat, sends[0].custom_tlvs[0].type_num), (1, stable_channels::constants::STABLE_CHANNEL_TLV_TYPE));
+
+            ticks(&mut mgr, &fake, 1).await;
+            assert_eq!(money(&mgr).0, (40.0, 40_000, 0), "the cursor already covers it");
+            assert_eq!(fake.sends.lock().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_channel_without_books_keeps_the_live_deduction() {
+            let (mut mgr, fake) = seed_forwarded_fixture().await;
+            // Forward 45k out: 40k native + 5k stable. Post-forward user side = 5_000 (LSP 95_000).
+            *fake.channels.lock().unwrap() = vec![make_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 100_000, 95_000_000, true)];
+            mgr.handle_payment_forwarded(
+                USER_CHANNEL_ID_DECIMAL.to_string(), Some("next-ucid-1".to_string()), "prev-chan-1".to_string(), "next-chan-1".to_string(),
+                "prev-node-1".to_string(), "next-node-1".to_string(), 45_000_000, Some(0), None, true, &fake as &dyn LdkServerCalls, 100_000.0,
+            ).await;
+            assert!(booked(&mgr).is_none());
+            let sc = &mgr.stable_channels[0];
+            assert!((sc.expected_usd.0 - 5.0).abs() < 0.01, "expected_usd should drop to ~5.0, got {}", sc.expected_usd.0);
+            assert_eq!((sc.backing_sats, sc.native_sats, sc.native_channel_btc.sats), (5_000, 0, 0));
+            assert_eq!(sc.stable_receiver_btc.sats, 5_000, "from the live balance");
+        }
+
+        #[tokio::test]
+        async fn a_trade_uses_the_books_for_spare_btc() {
+            let mut mgr = make_manager();
+            let (fake, request, fee) = trade_request(&mut mgr);
+            // The live balance holds 99,900 sats the books have not taken yet.
+            assert!(mgr.db.anchor_booked_balance(UID, CHANNEL_ID_HEX, 200_000_000, 300_000, ForwardCursor::default(), serde_json::json!({})).unwrap());
+            let payment_id = "dd2c96dd5241012974f7e341bca4e5c9a621468c83f185b46615eaecf64085b1";
+            assert_eq!(mgr.handle_trade_payment(&request, Some(payment_id), Some(fee), &fake, 100_000.0).await, Handled::Done);
+            // $10 more at $100k floors to 9,999 sats of new backing.
+            let native = (200_000_000 - fee) / 1000 - 59_999;
+            assert_eq!(money(&mgr), ((60.0, 59_999, native), (60.0, 59_999, native)));
+        }
+
+        /// A $10 position whose books still hold the user's 50,000 sats after 35,000 left with nothing booked, then a booked 10,000-sat spend, with the stored check as given.
+        async fn spend_after_an_unbooked_drop(state: CheckState, direction: Option<GapDirection>) -> (f64, u64, u64) {
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            let now_ms = StableChannelManager::unix_time_secs() * 1000;
+            let gap_msat = if direction.is_some() { 35_000_000 } else { 0 };
+            let check = BooksCheck { state, direction, gap_msat, first_seen_ms: direction.map(|_| now_ms), sightings: u8::from(direction.is_some()), accepted_gap_msat: 0, accepted_backing_gap_msat: 0, checked_at_ms: Some(now_ms), gap_kind: None };
+            mgr.db.save_books_check(UID, &check, None).unwrap();
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spending(10_000_000);
+            user_holds(&fake, 5_000_000);
+            spend_out_of_the_user(&mut mgr, &fake, 10_000_000).await;
+            money(&mgr).0
+        }
+
+        #[tokio::test]
+        async fn a_spend_while_the_books_show_a_gap_below_is_cut_from_the_smaller_balance() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // The books say 40,000 sats are spare, but the user held 15,000 before the spend, so 5,000 of it comes off the target.
+            assert_eq!(spend_after_an_unbooked_drop(CheckState::Paused, Some(GapDirection::Below)).await, (5.0, 5_000, 35_000));
+            assert_eq!(spend_after_an_unbooked_drop(CheckState::Watching, Some(GapDirection::Below)).await, (5.0, 5_000, 35_000));
+            // With no gap below the books alone decide, and their spare BTC covers the spend.
+            assert_eq!(spend_after_an_unbooked_drop(CheckState::Ok, None).await, (10.0, 10_000, 30_000));
+        }
+
+        /// The $50 fixture anchored, then a 10,000-sat spend handled while the price cache is cold.
+        async fn spent_while_cold() -> (StableChannelManager, FakeLdkServer, std::sync::Arc<Inbox>) {
+            let (mut mgr, fake, inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spends(&[10_000_000]);
+            user_holds(&fake, 40_000_000);
+            spend_out_of_the_user_at(&mut mgr, &fake, 10_000_000, 0.0).await;
+            (mgr, fake, inbox)
+        }
+
+        /// The same spend's second part: 5,000 sats more, also while the price is cold.
+        async fn spend_more_while_cold(mgr: &mut StableChannelManager, fake: &FakeLdkServer) {
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spends(&[10_000_000, 5_000_000]);
+            user_holds(fake, 35_000_000);
+            spend_out_of_the_user_at(mgr, fake, 5_000_000, 0.0).await;
+        }
+
+        /// A tick with the audit capture on, and the cuts it made.
+        async fn tick_cuts(mgr: &mut StableChannelManager, fake: &FakeLdkServer) -> Vec<serde_json::Value> {
+            stable_channels::audit::enable_test_capture();
+            ticks(mgr, fake, 1).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            spend_cuts(&events)
+        }
+
+        fn deferrals(events: &[(String, serde_json::Value)]) -> Vec<serde_json::Value> {
+            events.iter().filter(|(name, _)| name == "BOOKED_BALANCE_CUT_DEFERRED").map(|(_, data)| data.clone()).collect()
+        }
+
+        #[tokio::test]
+        async fn a_spend_booked_while_the_price_is_cold_is_cut_once_a_price_arrives() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            stable_channels::audit::enable_test_capture();
+            let (mut mgr, fake, _inbox) = spent_while_cold().await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            let books = booked(&mgr).unwrap();
+            assert_eq!(books.booked_user_msat, 40_000_000, "the books take the spend");
+            assert_eq!(books.uncut, Some(UncutSpends { spent_msat: 10_000_000, overflow_msat: 10_000_000 }), "all of it beyond spare BTC");
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").last().unwrap()["uncut_spend_msat"], 10_000_000, "marked in the booking's own row");
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "with no price nothing is cut");
+            let deferred = deferrals(&events);
+            assert_eq!(deferred.len(), 1);
+            let why = (&deferred[0]["source"], &deferred[0]["reason"], &deferred[0]["uncut_spend_msat"]);
+            assert_eq!(why, (&serde_json::json!("forward"), &serde_json::json!("price_unavailable"), &serde_json::json!(10_000_000)));
+            assert!(fake.sends.lock().unwrap().is_empty());
+
+            // The first tick with a price cuts it and publishes the cut.
+            let cuts = tick_cuts(&mut mgr, &fake).await;
+            assert_eq!(cuts.len(), 1);
+            assert_eq!((&cuts[0]["source"], &cuts[0]["stable_sats_spent"]), (&serde_json::json!("deferred"), &serde_json::json!(10_000)));
+            assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)));
+            assert_eq!(booked(&mgr).unwrap().uncut, None);
+            assert_eq!(fake.sends.lock().unwrap().len(), 1, "one SYNC");
+
+            assert!(tick_cuts(&mut mgr, &fake).await.is_empty(), "the next tick cuts nothing");
+            assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)));
+            assert_eq!(fake.sends.lock().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_cut_deferred_twice_the_same_day_is_recorded_once() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            anchor(&mut mgr, &fake).await;
+            // Two spends while the price is cold each leave the cut deferred.
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spends(&[10_000_000]);
+            user_holds(&fake, 40_000_000);
+            spend_out_of_the_user_at(&mut mgr, &fake, 10_000_000, 0.0).await;
+            spend_more_while_cold(&mut mgr, &fake).await;
+            let rows = ledger_rows(&mgr, "BOOKED_BALANCE_CUT_DEFERRED");
+            assert_eq!(rows.len(), 1, "one row a day for the channel");
+            assert_eq!((&rows[0]["reason"], &rows[0]["uncut_spend_msat"]), (&serde_json::json!("price_unavailable"), &serde_json::json!(10_000_000)));
+            // The cut still lands once a price arrives.
+            assert_eq!(tick_cuts(&mut mgr, &fake).await.len(), 1);
+            assert_eq!(money(&mgr), ((35.0, 35_000, 0), (35.0, 35_000, 0)));
+        }
+
+        #[tokio::test]
+        async fn two_spends_booked_while_cold_are_cut_together() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            stable_channels::audit::enable_test_capture();
+            let (mut mgr, fake, _inbox) = spent_while_cold().await;
+            spend_more_while_cold(&mut mgr, &fake).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert_eq!(booked(&mgr).unwrap().uncut, Some(UncutSpends { spent_msat: 15_000_000, overflow_msat: 15_000_000 }));
+            let marks: Vec<_> = deferrals(&events).iter().map(|row| row["uncut_spend_msat"].clone()).collect();
+            assert_eq!(marks, [serde_json::json!(10_000_000), serde_json::json!(15_000_000)]);
+
+            let cuts = tick_cuts(&mut mgr, &fake).await;
+            assert_eq!(cuts.len(), 1, "one cut for both");
+            assert_eq!(cuts[0]["total_sats_spent"], 15_000);
+            assert_eq!(money(&mgr), ((35.0, 35_000, 0), (35.0, 35_000, 0)));
+            assert_eq!(booked(&mgr).unwrap().uncut, None);
+            assert_eq!(fake.sends.lock().unwrap().len(), 1, "one SYNC");
+        }
+
+        #[tokio::test]
+        async fn spends_deferred_across_a_restart_are_cut_once() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mgr, fake, inbox) = spent_while_cold().await;
+            // The daemon restarts on the same database while the price is still cold, and the second spend comes after it.
+            let mut mgr = restarted(&mgr);
+            mgr.reconcile_unless_hydrated(&fake as &dyn LdkServerCalls, 0.0).await;
+            mgr.attach_event_inbox(inbox.clone());
+            spend_more_while_cold(&mut mgr, &fake).await;
+            assert_eq!(booked(&mgr).unwrap().uncut, Some(UncutSpends { spent_msat: 15_000_000, overflow_msat: 15_000_000 }));
+
+            let cuts = tick_cuts(&mut mgr, &fake).await;
+            assert_eq!((cuts.len(), &cuts[0]["total_sats_spent"]), (1, &serde_json::json!(15_000)));
+            assert_eq!(money(&mgr), ((35.0, 35_000, 0), (35.0, 35_000, 0)));
+
+            // Another restart finds nothing left to cut.
+            let mut mgr = restarted(&mgr);
+            mgr.reconcile_unless_hydrated(&fake as &dyn LdkServerCalls, 100_000.0).await;
+            mgr.attach_event_inbox(inbox);
+            assert_eq!(booked(&mgr).unwrap().uncut, None);
+            assert!(tick_cuts(&mut mgr, &fake).await.is_empty());
+            assert_eq!(money(&mgr), ((35.0, 35_000, 0), (35.0, 35_000, 0)));
+        }
+
+        #[tokio::test]
+        async fn a_deferred_cut_whose_save_fails_is_kept_until_it_is_saved() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = spent_while_cold().await;
+            let conn = save_test_connection(&mgr);
+            conn.execute_batch("CREATE TRIGGER reject_book_save BEFORE UPDATE ON channels BEGIN SELECT RAISE(ABORT, 'forced channel failure'); END;").unwrap();
+            assert!(tick_cuts(&mut mgr, &fake).await.is_empty(), "a cut not saved is not reported");
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            assert!(mgr.pending_book_updates.contains_key(&UID), "kept for the retry");
+            assert_eq!(booked(&mgr).unwrap().uncut, Some(UncutSpends { spent_msat: 10_000_000, overflow_msat: 10_000_000 }), "still on the books");
+
+            conn.execute_batch("DROP TRIGGER reject_book_save;").unwrap();
+            let cuts = tick_cuts(&mut mgr, &fake).await;
+            assert_eq!((cuts.len(), &cuts[0]["source"]), (1, &serde_json::json!("deferred")));
+            assert!(mgr.pending_book_updates.is_empty());
+            assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)));
+            assert_eq!(booked(&mgr).unwrap().uncut, None, "cleared with the save");
+            ticks(&mut mgr, &fake, 1).await;
+            assert_eq!(fake.sends.lock().unwrap().len(), 1, "the queued SYNC goes out");
+            assert!(tick_cuts(&mut mgr, &fake).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_cut_lost_to_a_crash_after_its_booking_is_made_by_the_next_tick() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // The forward is booked, the channel save that cuts it fails, and the daemon stops before the retry.
+            let conn = save_test_connection(&mgr);
+            conn.execute_batch("CREATE TRIGGER reject_book_save BEFORE UPDATE ON channels BEGIN SELECT RAISE(ABORT, 'forced channel failure'); END;").unwrap();
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spends(&[10_000_000]);
+            user_holds(&fake, 40_000_000);
+            spend_out_of_the_user(&mut mgr, &fake, 10_000_000).await;
+            assert!(mgr.pending_book_updates.contains_key(&UID));
+            assert_eq!(booked(&mgr).unwrap().uncut, Some(UncutSpends { spent_msat: 10_000_000, overflow_msat: 10_000_000 }), "marked in the booking's own write");
+            conn.execute_batch("DROP TRIGGER reject_book_save;").unwrap();
+            let mut mgr = restarted(&mgr);
+            mgr.reconcile_unless_hydrated(&fake as &dyn LdkServerCalls, 100_000.0).await;
+            mgr.attach_event_inbox(inbox);
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "the cut was only in the lost process");
+
+            // The event is handled again, as one interrupted before it finished is; its booking is already there.
+            spend_out_of_the_user(&mut mgr, &fake, 10_000_000).await;
+            assert_eq!(money(&mgr).0, (50.0, 50_000, 0));
+            let cuts = tick_cuts(&mut mgr, &fake).await;
+            assert_eq!((cuts.len(), &cuts[0]["source"], &cuts[0]["stable_sats_spent"]), (1, &serde_json::json!("deferred"), &serde_json::json!(10_000)));
+            assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)));
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.uncut), (40_000_000, None));
+            assert!(tick_cuts(&mut mgr, &fake).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_spend_covered_by_spare_btc_clears_its_mark_without_moving_the_target() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // $10 on 10,000 sats of backing, so 40,000 of the user's 50,000 sats are spare BTC.
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            // A 20,000-sat spend while the price is cold stays marked.
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spends(&[20_000_000]);
+            user_holds(&fake, 30_000_000);
+            spend_out_of_the_user_at(&mut mgr, &fake, 20_000_000, 0.0).await;
+            assert_eq!(booked(&mgr).unwrap().uncut, Some(UncutSpends { spent_msat: 20_000_000, overflow_msat: 0 }), "spare BTC covers it");
+            // The tick's cut moves spare BTC only, and the same save clears the mark.
+            assert!(tick_cuts(&mut mgr, &fake).await.is_empty());
+            assert_eq!(money(&mgr), ((10.0, 10_000, 20_000), (10.0, 10_000, 20_000)));
+            assert_eq!(booked(&mgr).unwrap().uncut, None);
+            assert!(fake.sends.lock().unwrap().is_empty(), "nothing to publish");
+            // With a price, the mark is gone once the forward is handled.
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spends(&[20_000_000, 5_000_000]);
+            user_holds(&fake, 25_000_000);
+            spend_out_of_the_user(&mut mgr, &fake, 5_000_000).await;
+            assert_eq!(booked(&mgr).unwrap().uncut, None);
+            assert_eq!(money(&mgr), ((10.0, 10_000, 15_000), (10.0, 10_000, 15_000)));
+        }
+
+        #[tokio::test]
+        async fn a_forward_handled_again_after_a_cold_booking_is_cut_once() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = spent_while_cold().await;
+            // Handled again with a price: the books take nothing new, so the mark alone is left to cut.
+            spend_out_of_the_user(&mut mgr, &fake, 10_000_000).await;
+            assert_eq!(money(&mgr).0, (50.0, 50_000, 0));
+            assert_eq!(tick_cuts(&mut mgr, &fake).await.len(), 1);
+            // And once more after the cut.
+            spend_out_of_the_user(&mut mgr, &fake, 10_000_000).await;
+            assert!(tick_cuts(&mut mgr, &fake).await.is_empty());
+            assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)));
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 40_000_000);
+        }
+
+        #[tokio::test]
+        async fn a_trade_waits_for_a_spend_still_to_be_cut() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // $30 at $100k; a 10,000-sat spend leaves books of 40,000, then 20,000 sats arrive that the books have not taken yet.
+            let (mut mgr, fake, _inbox) = fixture(30.0).await;
+            anchor(&mut mgr, &fake).await;
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spends(&[10_000_000]);
+            user_holds(&fake, 40_000_000);
+            spend_out_of_the_user(&mut mgr, &fake, 10_000_000).await;
+            user_holds(&fake, 60_000_000);
+            assert_eq!(money(&mgr), ((30.0, 29_999, 10_001), (30.0, 29_999, 10_001)));
+            // A 15,000-sat spend while the price is cold leaves its cut waiting.
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spends(&[10_000_000, 15_000_000]);
+            user_holds(&fake, 45_000_000);
+            spend_out_of_the_user_at(&mut mgr, &fake, 15_000_000, 0.0).await;
+            assert_eq!(booked(&mgr).unwrap().uncut, Some(UncutSpends { spent_msat: 15_000_000, overflow_msat: 4_999_000 }), "beyond the 10,001 spare sats");
+
+            // A buy to $40 quoted on the $25 the cut leaves: the waiting cut lands first, and the trade's $40 is set on it.
+            let request = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &fresh_hex_id(), 40.0, 100_000.0);
+            let fee = expected_trade_fee_msat(25.0, 40.0, 100_000.0).unwrap();
+            let payment_id = fresh_hex_id();
+            stable_channels::audit::enable_test_capture();
+            let handled = mgr.handle_trade_payment(&request, Some(&payment_id), Some(fee), &fake, 100_000.0).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert_eq!(handled, Handled::Done);
+            assert_eq!(mgr.db.trade_decision_summary(&payment_id).unwrap().unwrap().outcome, "accepted");
+            let cuts = spend_cuts(&events);
+            assert_eq!(cuts.len(), 1);
+            let cut_to = cuts[0]["new_expected_usd"].as_f64().unwrap();
+            assert_eq!((&cuts[0]["old_expected_usd"], format!("{cut_to:.2}")), (&serde_json::json!(30.0), "25.00".to_owned()));
+            assert_eq!(booked(&mgr).unwrap().uncut, None);
+            assert_eq!(money(&mgr).0 .0, 40.0);
+            assert_eq!(money(&mgr).1 .0, 40.0);
+            // The next tick has nothing left to cut, so the trade's $40 stands.
+            assert!(tick_cuts(&mut mgr, &fake).await.is_empty());
+            assert_eq!(money(&mgr).0 .0, 40.0);
+        }
+
+        #[tokio::test]
+        async fn a_trade_is_handled_again_while_a_waiting_spend_cannot_be_cut() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, inbox) = spent_while_cold().await;
+            // A sell to $30 quoted on the $40 the cut leaves.
+            let request = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &fresh_hex_id(), 30.0, 100_000.0);
+            let fee = expected_trade_fee_msat(40.0, 30.0, 100_000.0).unwrap();
+            let payment_id = fresh_hex_id();
+            let untouched = |mgr: &StableChannelManager| {
+                assert!(mgr.db.trade_decision_summary(&payment_id).unwrap().is_none(), "nothing is decided");
+                assert!(!mgr.db.has_booking(UID, BookReason::TradeFee, &payment_id).unwrap(), "no fee is booked");
+                assert_eq!(booked(mgr).unwrap().uncut, Some(UncutSpends { spent_msat: 10_000_000, overflow_msat: 10_000_000 }));
+            };
+            // A cut that cannot be saved holds the trade.
+            let conn = save_test_connection(&mgr);
+            conn.execute_batch("CREATE TRIGGER reject_book_save BEFORE UPDATE ON channels BEGIN SELECT RAISE(ABORT, 'forced channel failure'); END;").unwrap();
+            assert_eq!(mgr.handle_trade_payment(&request, Some(&payment_id), Some(fee), &fake, 100_000.0).await, Handled::Retry);
+            untouched(&mgr);
+            assert!(mgr.pending_book_updates.contains_key(&UID));
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            // The daemon restarts before the cut is saved, so the mark still holds the spend, and the trade handled again sets its $30 on the cut.
+            conn.execute_batch("DROP TRIGGER reject_book_save;").unwrap();
+            let mut mgr = restarted(&mgr);
+            mgr.reconcile_unless_hydrated(&fake as &dyn LdkServerCalls, 100_000.0).await;
+            mgr.attach_event_inbox(inbox);
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            assert_eq!(mgr.handle_trade_payment(&request, Some(&payment_id), Some(fee), &fake, 100_000.0).await, Handled::Done);
+            assert_eq!(mgr.db.trade_decision_summary(&payment_id).unwrap().unwrap().outcome, "accepted");
+            assert_eq!(money(&mgr).0 .0, 30.0);
+            assert_eq!(money(&mgr).1 .0, 30.0);
+            assert_eq!(booked(&mgr).unwrap().uncut, None);
+            assert!(tick_cuts(&mut mgr, &fake).await.is_empty(), "nothing is left to cut");
+            assert_eq!(money(&mgr).0 .0, 30.0);
+        }
+
+        #[tokio::test]
+        async fn an_operator_edit_waits_for_a_spend_still_to_be_cut() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = spent_while_cold().await;
+            // With no price a target edit is refused for the price, and nothing changes.
+            let edit = mgr.edit_stable_channel(CHANNEL_ID_HEX, Some(45.0), None, &fake as &dyn LdkServerCalls, 0.0).await;
+            assert_eq!((edit.ok, edit.status.as_str()), (false, "BTC price is unavailable; retry the target edit shortly"));
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            assert_eq!(booked(&mgr).unwrap().uncut, Some(UncutSpends { spent_msat: 10_000_000, overflow_msat: 10_000_000 }));
+            // With a price, a cut that cannot be saved refuses the edit until it is.
+            let conn = save_test_connection(&mgr);
+            conn.execute_batch("CREATE TRIGGER reject_book_save BEFORE UPDATE ON channels BEGIN SELECT RAISE(ABORT, 'forced channel failure'); END;").unwrap();
+            let edit = mgr.edit_stable_channel(CHANNEL_ID_HEX, Some(45.0), None, &fake as &dyn LdkServerCalls, 100_000.0).await;
+            assert_eq!((edit.ok, edit.status.as_str()), (false, "A spend on this channel is still to be cut. Try again shortly."));
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            conn.execute_batch("DROP TRIGGER reject_book_save;").unwrap();
+            // Once it can be saved the cut lands first, taking the target to $40, and the operator's $45 then stands.
+            assert!(mgr.edit_stable_channel(CHANNEL_ID_HEX, Some(45.0), None, &fake as &dyn LdkServerCalls, 100_000.0).await.ok);
+            assert_eq!(booked(&mgr).unwrap().uncut, None);
+            assert_eq!(money(&mgr).0 .0, 45.0);
+            assert!(tick_cuts(&mut mgr, &fake).await.is_empty(), "nothing is left to cut");
+            assert_eq!(money(&mgr).0 .0, 45.0);
+            assert_eq!(money(&mgr).1 .0, 45.0);
+        }
+
+        #[tokio::test]
+        async fn a_trade_is_checked_against_the_target_after_a_waiting_cut() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = spent_while_cold().await;
+            // A sell to $30 quoted on the $50 the wallet saw before the cut is checked against the $40 after it, so its fee does not match.
+            let stale = fresh_hex_id();
+            let stale_fee = expected_trade_fee_msat(50.0, 30.0, 100_000.0).unwrap();
+            fee_arrived(&fake, &stale, stale_fee);
+            user_holds(&fake, 40_000_000 - stale_fee);
+            let request = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &fresh_hex_id(), 30.0, 100_000.0);
+            assert_eq!(mgr.handle_trade_payment(&request, Some(&stale), Some(stale_fee), &fake, 100_000.0).await, Handled::Done);
+            assert_eq!(rejection_reason(&mgr, &stale).as_deref(), Some("invalid_fee"));
+            assert_eq!(fee_bookings(&mgr).len(), 1, "its fee is booked once, as refused");
+            assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)));
+            assert_eq!(booked(&mgr).unwrap().uncut, Some(UncutSpends { spent_msat: stale_fee, overflow_msat: stale_fee.div_ceil(1000) * 1000 }));
+            // The tick cuts the refused fee and publishes the target, and the wallet quotes again on it.
+            ticks(&mut mgr, &fake, 1).await;
+            assert_eq!(booked(&mgr).unwrap().uncut, None);
+            let target = money(&mgr).0 .0;
+            let fresh = fresh_hex_id();
+            let fresh_fee = expected_trade_fee_msat(target, 30.0, 100_000.0).unwrap();
+            fee_arrived(&fake, &fresh, fresh_fee);
+            user_holds(&fake, 40_000_000 - stale_fee - fresh_fee);
+            let request = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &fresh_hex_id(), 30.0, 100_000.0);
+            assert_eq!(mgr.handle_trade_payment(&request, Some(&fresh), Some(fresh_fee), &fake, 100_000.0).await, Handled::Done);
+            assert_eq!(mgr.db.trade_decision_summary(&fresh).unwrap().unwrap().outcome, "accepted");
+            assert_eq!(fee_bookings(&mgr).len(), 2, "each fee is booked once");
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 40_000_000 - stale_fee - fresh_fee);
+            assert_eq!(money(&mgr).0 .0, 30.0);
+            assert_eq!(money(&mgr).1 .0, 30.0);
+            assert!(tick_cuts(&mut mgr, &fake).await.is_empty(), "nothing is left to cut");
+            assert_eq!(money(&mgr).0 .0, 30.0);
+        }
+
+        #[tokio::test]
+        async fn a_trade_without_a_price_is_rejected_even_with_a_spend_waiting() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = spent_while_cold().await;
+            let payment_id = fresh_hex_id();
+            let fee = expected_trade_fee_msat(50.0, 40.0, 100_000.0).unwrap();
+            fee_arrived(&fake, &payment_id, fee);
+            user_holds(&fake, 40_000_000 - fee);
+            let request = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &fresh_hex_id(), 40.0, 100_000.0);
+            // With no price the trade is refused at once, so the event is done and nothing waits behind it.
+            assert_eq!(mgr.handle_trade_payment(&request, Some(&payment_id), Some(fee), &fake, 0.0).await, Handled::Done);
+            assert_eq!(rejection_reason(&mgr, &payment_id).as_deref(), Some("invalid_quote"));
+            assert_eq!(fee_bookings(&mgr).len(), 1);
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "nothing is set or cut without a price");
+            assert_eq!(booked(&mgr).unwrap().uncut, Some(UncutSpends { spent_msat: 10_000_000 + fee, overflow_msat: 10_000_000 + fee.div_ceil(1000) * 1000 }));
+            // Once the price is back the tick cuts the spend and the fee together, once.
+            let cuts = tick_cuts(&mut mgr, &fake).await;
+            assert_eq!((cuts.len(), &cuts[0]["total_sats_spent"]), (1, &serde_json::json!(10_000 + fee / 1000)));
+            assert_eq!(format!("{:.2}", money(&mgr).0 .0), "39.90");
+            assert_eq!(booked(&mgr).unwrap().uncut, None);
+            assert!(tick_cuts(&mut mgr, &fake).await.is_empty());
+        }
+
+        /// The $50 fixture with books of `books_msat` that cannot be read back, and the user left 40,000 sats by a 10,000-sat spend.
+        async fn unreadable_books(books_msat: u64) -> (StableChannelManager, FakeLdkServer, std::sync::Arc<Inbox>, rusqlite::Connection) {
+            let (mgr, fake, inbox) = fixture(50.0).await;
+            assert!(mgr.db.anchor_booked_balance(UID, CHANNEL_ID_HEX, books_msat, 100_000, cursor_so_far(), serde_json::json!({})).unwrap());
+            let conn = save_test_connection(&mgr);
+            conn.execute("UPDATE booked_balances SET booked_user_msat = 'unreadable'", []).unwrap();
+            assert!(mgr.db.booked_balance(UID).is_err());
+            user_holds(&fake, 40_000_000);
+            (mgr, fake, inbox, conn)
+        }
+
+        #[tokio::test]
+        async fn a_counted_forward_on_books_that_cannot_be_read_is_cut_once_by_the_catch_up() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Books equal to the user's 50,000 sats, and books 5,000 below them, as after a receipt they never took.
+            for books_msat in [50_000_000, 45_000_000] {
+                let (mut mgr, fake, _inbox, conn) = unreadable_books(books_msat).await;
+                *fake.forwarding_stats.lock().unwrap() = totals_after_spends(&[10_000_000]);
+                spend_out_of_the_user(&mut mgr, &fake, 10_000_000).await;
+                assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "left to the catch-up, books {books_msat}");
+                assert!(fake.sends.lock().unwrap().is_empty());
+
+                // Once the books read again, the tick books the spend from LDK's totals and cuts it once.
+                conn.execute("UPDATE booked_balances SET booked_user_msat = ?1", [books_msat as i64]).unwrap();
+                let cuts = tick_cuts(&mut mgr, &fake).await;
+                let cut = (cuts.len(), &cuts[0]["source"], &cuts[0]["stable_sats_spent"]);
+                assert_eq!(cut, (1, &serde_json::json!("forward_catch_up"), &serde_json::json!(10_000)), "books {books_msat}");
+                assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)), "books {books_msat}");
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.uncut), (books_msat - 10_000_000, None));
+                assert!(tick_cuts(&mut mgr, &fake).await.is_empty());
+                assert_eq!(money(&mgr).0, (40.0, 40_000, 0));
+            }
+        }
+
+        #[tokio::test]
+        async fn an_uncounted_forward_on_books_that_cannot_be_read_is_cut_from_the_live_balance() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox, conn) = unreadable_books(50_000_000).await;
+            // A forward the books take from its event alone, with LDK's totals left as they were, so no catch-up can find it.
+            mgr.handle_payment_forwarded(
+                USER_CHANNEL_ID_DECIMAL.to_string(), Some(OTHER_USER_CHANNEL_ID_DECIMAL.to_string()), CHANNEL_ID_HEX.to_string(), ROUTING_CHANNEL_HEX.to_string(),
+                "02aa".to_string(), "02bb".to_string(), 10_000_000, Some(0), None, false, &fake as &dyn LdkServerCalls, 100_000.0,
+            ).await;
+            assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)), "the live balance cuts it");
+
+            conn.execute("UPDATE booked_balances SET booked_user_msat = 50000000", []).unwrap();
+            assert!(tick_cuts(&mut mgr, &fake).await.is_empty(), "nothing more later");
+            assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)));
+            assert_eq!(booked(&mgr).unwrap().uncut, None);
         }
 
         #[tokio::test]
@@ -14960,12 +16791,8 @@ pub(crate) mod tests {
             anchor(&mut mgr, &fake).await;
             // The user's splice-out locked while the daemon was down: the listing is on the new funding and no Ready event is coming.
             spliced(&fake, 80_000, 30_000_000, SPLICE_OUT_TXID);
-            // An event still waiting could be the splice's own, so the tick leaves it to the event until the inbox drains.
+            // The first tick books it from the listing, though an event still waits.
             inbox.save(&[(unrelated_event(), 0)]).unwrap();
-            ticks(&mut mgr, &fake, 1).await;
-            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty());
-            let id = inbox.oldest().unwrap().unwrap().id;
-            inbox.finish(id).unwrap();
             ticks(&mut mgr, &fake, 1).await;
             let funding = format!("{SPLICE_OUT_TXID}:1");
             let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
@@ -14973,12 +16800,71 @@ pub(crate) mod tests {
             assert_eq!((&changes[0]["reason"], &changes[0]["evidence"], &changes[0]["delta_msat"]), (&serde_json::json!("splice"), &serde_json::json!(funding), &serde_json::json!(-20_000_000)));
             let books = booked(&mgr).unwrap();
             assert_eq!((books.booked_user_msat, books.channel_value_sats), (30_000_000, 80_000));
-            // A second tick, and a Ready event that does arrive after all, book nothing more.
+            // A second tick once the inbox drains, and a Ready event that does arrive after all, book nothing more.
+            let id = inbox.oldest().unwrap().unwrap().id;
+            inbox.finish(id).unwrap();
             ticks(&mut mgr, &fake, 1).await;
             splice_locked(&mut mgr, &fake, &funding).await;
             assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").len(), 1, "booked once");
             assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
             assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_splice_out_the_tick_books_is_cut_from_the_books() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // $50 backed by all of the user's 50,000 sats; they take 20,000 out on chain while the daemon is down.
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            spliced(&fake, 80_000, 30_000_000, SPLICE_OUT_TXID);
+            stable_channels::audit::enable_test_capture();
+            ticks(&mut mgr, &fake, 1).await;
+            let events = stable_channels::audit::drain_test_capture();
+            assert_eq!(money(&mgr), ((30.0, 30_000, 0), (30.0, 30_000, 0)), "cut in the tick that books it");
+            let cuts: Vec<_> = events.iter().filter(|(name, _)| name == "SPLICE_OUT_STABLE_DEDUCTED").map(|(_, data)| data.clone()).collect();
+            assert_eq!(cuts.len(), 1);
+            assert_eq!((&cuts[0]["source"], &cuts[0]["stable_sats_spent"]), (&serde_json::json!("splice"), &serde_json::json!(20_000)));
+            assert_eq!(fake.sends.lock().unwrap().len(), 1, "published with a SYNC");
+
+            // A later tick and a Ready event that does arrive cut nothing more.
+            ticks(&mut mgr, &fake, 1).await;
+            splice_locked(&mut mgr, &fake, &format!("{SPLICE_OUT_TXID}:1")).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert_eq!(money(&mgr), ((30.0, 30_000, 0), (30.0, 30_000, 0)));
+            assert_eq!(count_events(&events, "SPLICE_OUT_STABLE_DEDUCTED"), 0);
+        }
+
+        #[tokio::test]
+        async fn a_splice_whose_books_cannot_be_written_is_cut_later_from_its_booking() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // $50 backed by all of the user's 50,000 sats; they take 20,000 out on chain, and the books cannot be written when the lock arrives.
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            spliced(&fake, 80_000, 30_000_000, SPLICE_OUT_TXID);
+            let conn = save_test_connection(&mgr);
+            conn.execute_batch("CREATE TRIGGER refuse_books BEFORE UPDATE ON booked_balances BEGIN SELECT RAISE(ABORT, 'refused'); END;").unwrap();
+            stable_channels::audit::enable_test_capture();
+            splice_locked(&mut mgr, &fake, &format!("{SPLICE_OUT_TXID}:1")).await;
+            let events = stable_channels::audit::drain_test_capture();
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "no cut from the balance while the books have not taken the splice");
+            assert_eq!(count_events(&events, "SPLICE_OUT_STABLE_DEDUCTED"), 0);
+            assert!(events.iter().any(|(name, data)| name == "DB_WRITE_FAILED" && data["op"] == "book"));
+            assert!(fake.sends.lock().unwrap().is_empty());
+
+            // Once the books can be written, the tick books the splice from the listing and cuts it once.
+            conn.execute_batch("DROP TRIGGER refuse_books;").unwrap();
+            ticks(&mut mgr, &fake, 3).await;
+            mgr.reconcile_unless_hydrated(&fake as &dyn LdkServerCalls, 100_000.0).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            let cuts: Vec<_> = events.iter().filter(|(name, _)| name == "SPLICE_OUT_STABLE_DEDUCTED").map(|(_, data)| data.clone()).collect();
+            assert_eq!(cuts.len(), 1);
+            assert_eq!((&cuts[0]["source"], &cuts[0]["stable_sats_spent"]), (&serde_json::json!("splice"), &serde_json::json!(20_000)));
+            assert_eq!(money(&mgr), ((30.0, 30_000, 0), (30.0, 30_000, 0)));
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.channel_value_sats, books.uncut, books.check.state), (30_000_000, 80_000, None, CheckState::Ok));
+            assert_eq!(fake.sends.lock().unwrap().len(), 1, "published once");
         }
 
         #[tokio::test]
@@ -15034,6 +16920,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         async fn a_channel_missing_from_one_listing_keeps_its_books() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let (mut mgr, fake, _inbox) = fixture(10.0).await;
             anchor(&mut mgr, &fake).await;
             // One listing leaves the channel out, so reconcile soft-closes its row.
@@ -15102,6 +16989,2816 @@ pub(crate) mod tests {
             outcome(&mut mgr, &fake, &sync_id, Some(1), true).await;
             anchor(&mut mgr, &fake).await;
             assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty());
+        }
+
+        /// Ticks at `btc_price` with the cooldown cleared, so only the books and the stability rules decide a top-up.
+        async fn ticks_at(mgr: &mut StableChannelManager, fake: &FakeLdkServer, btc_price: f64, count: usize) {
+            for _ in 0..count {
+                mgr.stable_channels[0].last_stability_payment = 0;
+                mgr.run_tick_plan(fake as &dyn LdkServerCalls, btc_price, TickScope::All).await;
+            }
+        }
+
+        fn top_ups_held(events: &[(String, serde_json::Value)]) -> Vec<serde_json::Value> {
+            events.iter().filter(|(name, _)| name == "STABILITY_TOP_UP_HELD").map(|(_, data)| data.clone()).collect()
+        }
+
+        #[tokio::test]
+        async fn a_lasting_gap_pauses_top_ups_and_raises_an_alarm_without_a_cut() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            anchor(&mut mgr, &fake).await;
+            // 20,000 sats leave the user's side with no event, no forwarding total and nothing pending to explain them.
+            user_holds(&fake, 30_000_000);
+            ticks(&mut mgr, &fake, 2).await;
+            let check = booked(&mgr).unwrap().check;
+            assert_eq!((check.state, check.gap_msat), (CheckState::Paused, 20_000_000));
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "a gap is never cut");
+            // The price falls: the drift would be topped up, but payments to this user wait.
+            stable_channels::audit::enable_test_capture();
+            ticks_at(&mut mgr, &fake, 80_000.0, 2).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert!(top_up_sats_sent(&fake).is_empty());
+            assert!(fake.sends.lock().unwrap().is_empty(), "nor a SYNC: the target did not move");
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            let held = top_ups_held(&events);
+            assert_eq!(held.len(), 1, "once until what holds it changes");
+            assert_eq!(held[0]["reason"], "paused");
+            let mismatches = ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH");
+            assert_eq!(mismatches.len(), 1);
+            assert_eq!((&mismatches[0]["effect"], &mismatches[0]["gap_msat"]), (&serde_json::json!("paused"), &serde_json::json!(20_000_000)));
+            assert_eq!(mismatches[0]["categories"], serde_json::json!(["books_above_live"]));
+            let alarms = ledger_rows(&mgr, "BOOKED_BALANCE_PAUSED");
+            assert_eq!(alarms.len(), 1, "raised at the pause and kept to one a day");
+            assert_eq!((&alarms[0]["gap_msat"], &alarms[0]["since_ms"]), (&serde_json::json!(20_000_000), &serde_json::json!(check.first_seen_ms)));
+            let day = StableChannelManager::unix_time_secs() / STABILITY_TOP_UP_ALARM_REPEAT_SECS;
+            assert_eq!(alarms[0]["dedup_key"], format!("lsp:books-paused:{UID}:{}:{day}", check.first_seen_ms.unwrap()));
+            assert_eq!(count_events(&events, "BOOKED_BALANCE_PAUSED"), 2, "raised again each tick while paused");
+        }
+
+        #[tokio::test]
+        async fn a_first_sighting_holds_the_top_up_for_one_tick() {
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // A 10,000-sat spend has left the balance; LDK has not counted it yet and its event is still to come.
+            user_holds(&fake, 40_000_000);
+            ticks_at(&mut mgr, &fake, 80_000.0, 1).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Watching);
+            assert!(top_up_sats_sent(&fake).is_empty(), "no top-up for sats the user may have spent");
+            // LDK counts it: the tick books and cuts the spend at $80k, and the books agree again.
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spending(10_000_000);
+            ticks_at(&mut mgr, &fake, 80_000.0, 1).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+            assert_eq!(money(&mgr).1, (42.0, 40_000, 0));
+            assert!(top_up_sats_sent(&fake).is_empty(), "the cut starts its own cooldown");
+            ticks_at(&mut mgr, &fake, 80_000.0, 1).await;
+            assert_eq!(top_up_sats_sent(&fake), [12_500], "the $42 left is topped up to par at $80k");
+        }
+
+        #[tokio::test]
+        async fn a_channel_without_books_gets_no_top_up_until_anchored() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            stable_channels::audit::enable_test_capture();
+            ticks_at(&mut mgr, &fake, 80_000.0, 1).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert!(booked(&mgr).is_none());
+            assert!(top_up_sats_sent(&fake).is_empty());
+            let held = top_ups_held(&events);
+            assert_eq!((held.len(), &held[0]["reason"]), (1, &serde_json::json!("no_books")));
+            // The second matching reading anchors the books in the same tick, so the top-up goes out.
+            ticks_at(&mut mgr, &fake, 80_000.0, 1).await;
+            assert!(booked(&mgr).is_some());
+            assert_eq!(top_up_sats_sent(&fake), [12_500]);
+        }
+
+        #[tokio::test]
+        async fn a_lasting_surplus_is_booked_as_spare_btc_and_never_pauses() {
+            // $10 on 10,000 sats of backing, with 40,000 spare.
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            // 20,000 sats reach the user with nothing the LSP can attribute them to.
+            user_holds(&fake, 70_000_000);
+            ticks(&mut mgr, &fake, 1).await;
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.check.state), (50_000_000, CheckState::Ok), "one sighting books nothing");
+            ticks(&mut mgr, &fake, 1).await;
+            let books = booked(&mgr).unwrap();
+            assert_eq!(books.booked_user_msat, 70_000_000);
+            assert_eq!((books.check.state, books.check.direction), (CheckState::Ok, None));
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!(changes.len(), 1);
+            assert_eq!((&changes[0]["reason"], &changes[0]["delta_msat"]), (&serde_json::json!("unattributed_receipt"), &serde_json::json!(20_000_000)));
+            assert_eq!(money(&mgr), ((10.0, 10_000, 60_000), (10.0, 10_000, 60_000)), "booked as spare BTC");
+            assert_eq!((mgr.stable_channels[0].native_channel_btc.sats, mgr.stable_channels[0].stable_receiver_btc.sats), (60_000, 70_000), "from the books");
+            let mismatches = ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH");
+            assert_eq!(mismatches.len(), 1);
+            assert_eq!(
+                (&mismatches[0]["direction"], &mismatches[0]["excess_msat"], &mismatches[0]["effect"]),
+                (&serde_json::json!("above"), &serde_json::json!(20_000_000), &serde_json::json!("booked_as_spare"))
+            );
+            assert_eq!(mismatches[0]["categories"], serde_json::json!(["books_below_live"]), "what the check saw before the booking");
+            for _ in 0..3 {
+                ticks(&mut mgr, &fake, 1).await;
+                assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+            }
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").len(), 1, "booked once");
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").len(), 1);
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH_CLEARED").is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_surplus_that_lasted_before_the_upgrade_is_booked_at_the_first_tick() {
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            user_holds(&fake, 70_000_000);
+            // The first release saw this surplus last and only logged it.
+            let now_ms = StableChannelManager::unix_time_secs() * 1000;
+            let lasted = BooksCheck {
+                state: CheckState::Ok, direction: Some(GapDirection::Above), gap_msat: 20_000_000,
+                first_seen_ms: Some(now_ms - 600_000), sightings: 7, accepted_gap_msat: 0, accepted_backing_gap_msat: 0, checked_at_ms: Some(now_ms - 60_000), gap_kind: None,
+            };
+            mgr.db.save_books_check(UID, &lasted, None).unwrap();
+            ticks(&mut mgr, &fake, 1).await;
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.check.state, books.check.direction), (70_000_000, CheckState::Ok, None));
+            assert_eq!(money(&mgr).1, (10.0, 10_000, 60_000));
+            let mismatches = ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH");
+            assert_eq!((mismatches.len(), &mismatches[0]["effect"]), (1, &serde_json::json!("booked_as_spare")));
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_surplus_a_waiting_event_could_explain_is_not_booked() {
+            let (mut mgr, fake, inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            user_holds(&fake, 70_000_000);
+            inbox.save(&[(unrelated_event(), 0)]).unwrap();
+            ticks(&mut mgr, &fake, 3).await;
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty(), "the waiting event may book it");
+            let id = inbox.oldest().unwrap().unwrap().id;
+            inbox.finish(id).unwrap();
+            ticks(&mut mgr, &fake, 1).await;
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty(), "a first sighting with nothing pending");
+            ticks(&mut mgr, &fake, 1).await;
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 70_000_000);
+        }
+
+        #[tokio::test]
+        async fn a_gap_a_pending_pay_back_could_explain_is_watched_and_never_paused() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // $10 on 10,000 sats of backing, so the drift at $80k is a 2,500-sat top-up.
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            // A pay-back registered but not applied yet: its sats have left the balance and its booking is to come.
+            let settlement_id = "7b1e4d9a2c6f0b3e8d5a1c7f4b2e9d6a3c0f8b5e2d7a4c1f9e6b3d0a8c5f2e7b";
+            let payment_id = "c8f2a5d1e7b4c0f6a3d9e2b8c5f1a7d4e0b6c3f9a2d8e5b1c7f4a0d6e3b9c2f5";
+            mgr.db.register_inbound_stability_settlement(settlement_id, payment_id, CHANNEL_ID_HEX, 1_250_000, "user_to_lsp", "{}").unwrap();
+            user_holds(&fake, 50_000_000 - 1_250_000);
+            ticks(&mut mgr, &fake, 3).await;
+            let check = booked(&mgr).unwrap().check;
+            assert_eq!((check.state, check.direction), (CheckState::Watching, Some(GapDirection::Below)));
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+            ticks_at(&mut mgr, &fake, 80_000.0, 1).await;
+            assert!(top_up_sats_sent(&fake).is_empty(), "top-ups wait while it is watched");
+            // The pay-back is marked done without booking anything, so nothing explains the gap any more.
+            save_test_connection(&mgr).execute("UPDATE inbound_stability_settlements SET state = 'applied'", []).unwrap();
+            ticks(&mut mgr, &fake, 1).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Watching);
+            ticks(&mut mgr, &fake, 1).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+        }
+
+        #[tokio::test]
+        async fn a_gap_while_events_wait_is_watched_and_never_paused() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            user_holds(&fake, 30_000_000);
+            inbox.save(&[(unrelated_event(), 0)]).unwrap();
+            ticks(&mut mgr, &fake, 3).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Watching);
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+            let id = inbox.oldest().unwrap().unwrap().id;
+            inbox.finish(id).unwrap();
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+        }
+
+        #[tokio::test]
+        async fn a_fee_refund_to_a_paused_channel_is_refused() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            user_holds(&fake, 30_000_000);
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+            let trade_payment_id = "5d8a1e4b7c0f3a6d9e2b5c8f1a4d7e0b3c6f9a2d5e8b1c4f7a0d3e6b9c2f5a8d";
+            mgr.db.record_settlement(trade_payment_id, "trade").unwrap();
+            assert!(mgr.db.persist_trade_rejection(trade_payment_id, "trade-1", "hash", CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, "quote_expired", 100, "{}").unwrap());
+            fake.payments.lock().unwrap().push(GrpcPayment {
+                payment_id: trade_payment_id.into(),
+                amount_msat: Some(2_150_000),
+                direction: ldk_server_client::ldk_server_grpc::types::PaymentDirection::Inbound as i32,
+                status: PaymentStatus::Succeeded as i32,
+                ..Default::default()
+            });
+            let refused = crate::revenue::refund_trade_fee(&mgr.db, &fake, trade_payment_id, 200).await;
+            assert_eq!(refused, Err(crate::revenue::RefundError::Paused));
+            assert_eq!(refused.unwrap_err().message(), "Payments to this user are paused until the gap on their channel is resolved.");
+            assert!(fake.sends.lock().unwrap().is_empty());
+            assert!(mgr.db.list_trade_fee_refunds().unwrap().is_empty(), "nothing is claimed");
+            // The gap closes, so the refund goes out.
+            user_holds(&fake, 50_000_000);
+            ticks(&mut mgr, &fake, 1).await;
+            let (_, amount_msat) = crate::revenue::refund_trade_fee(&mgr.db, &fake, trade_payment_id, 201).await.unwrap();
+            assert_eq!(amount_msat, 2_150_000);
+        }
+
+        #[tokio::test]
+        async fn a_pause_saved_while_a_refund_asks_the_node_holds_the_refund() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            let trade_payment_id = "8c1f4a7d0e3b6c9f2a5d8e1b4c7f0a3d6e9b2c5f8a1d4e7b0c3f6a9d2e5b8c1f";
+            mgr.db.record_settlement(trade_payment_id, "trade").unwrap();
+            assert!(mgr.db.persist_trade_rejection(trade_payment_id, "trade-1", "hash", CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, "quote_expired", 100, "{}").unwrap());
+            fake.payments.lock().unwrap().push(GrpcPayment {
+                payment_id: trade_payment_id.into(),
+                amount_msat: Some(2_150_000),
+                direction: ldk_server_client::ldk_server_grpc::types::PaymentDirection::Inbound as i32,
+                status: PaymentStatus::Succeeded as i32,
+                ..Default::default()
+            });
+            // The books pause while the refund asks the node about the fee it would return.
+            let db = mgr.db.clone();
+            *fake.payment_lookup_hook.lock().unwrap() = Some(Box::new(move || {
+                let now_ms = StableChannelManager::unix_time_secs() * 1000;
+                let paused = BooksCheck { state: CheckState::Paused, direction: Some(GapDirection::Below), gap_msat: 20_000_000, first_seen_ms: Some(now_ms - 120_000), sightings: 2, accepted_gap_msat: 0, accepted_backing_gap_msat: 0, checked_at_ms: Some(now_ms), gap_kind: None };
+                db.save_books_check(UID, &paused, None).unwrap();
+            }));
+            let refused = crate::revenue::refund_trade_fee(&mgr.db, &fake, trade_payment_id, 200).await;
+            assert_eq!(refused, Err(crate::revenue::RefundError::Paused));
+            assert!(fake.sends.lock().unwrap().is_empty());
+            assert!(mgr.db.list_trade_fee_refunds().unwrap().is_empty(), "the claim is taken back");
+        }
+
+        #[tokio::test]
+        async fn a_refund_the_pause_holds_leaves_the_claim_another_refund_made() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            let trade_payment_id = "2b5e8d1a4c7f0b3e6d9a2c5f8b1e4d7a0c3f6b9e2d5a8c1f4b7e0d3a6c9f2b5e";
+            mgr.db.record_settlement(trade_payment_id, "trade").unwrap();
+            assert!(mgr.db.persist_trade_rejection(trade_payment_id, "trade-2", "hash", CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, "quote_expired", 100, "{}").unwrap());
+            fake.payments.lock().unwrap().push(GrpcPayment {
+                payment_id: trade_payment_id.into(),
+                amount_msat: Some(1_730_000),
+                direction: ldk_server_client::ldk_server_grpc::types::PaymentDirection::Inbound as i32,
+                status: PaymentStatus::Succeeded as i32,
+                ..Default::default()
+            });
+            // Another refund of the same fee has claimed it and not sent yet.
+            let (_, refund_payment_id) = stable_channels::trade::trade_fee_refund_preimage(trade_payment_id);
+            assert!(mgr.db.claim_trade_fee_refund(trade_payment_id, 1_730_000, COUNTERPARTY_HEX, 150, Some(&refund_payment_id)).unwrap().is_none());
+            // The books pause while this one asks the node about the fee.
+            let db = mgr.db.clone();
+            *fake.payment_lookup_hook.lock().unwrap() = Some(Box::new(move || {
+                let now_ms = StableChannelManager::unix_time_secs() * 1000;
+                let paused = BooksCheck { state: CheckState::Paused, direction: Some(GapDirection::Below), gap_msat: 20_000_000, first_seen_ms: Some(now_ms - 120_000), sightings: 2, accepted_gap_msat: 0, accepted_backing_gap_msat: 0, checked_at_ms: Some(now_ms), gap_kind: None };
+                db.save_books_check(UID, &paused, None).unwrap();
+            }));
+            let refused = crate::revenue::refund_trade_fee(&mgr.db, &fake, trade_payment_id, 200).await;
+            assert_eq!(refused, Err(crate::revenue::RefundError::Paused));
+            assert!(fake.sends.lock().unwrap().is_empty());
+            let claims = mgr.db.list_trade_fee_refunds().unwrap();
+            let held: Vec<_> = claims.iter().map(|claim| (claim.trade_payment_id.as_str(), claim.refund_payment_id.as_deref(), claim.created_at)).collect();
+            assert_eq!(held, [(trade_payment_id, Some(refund_payment_id.as_str()), 150)], "the other refund's claim stays");
+        }
+
+        #[tokio::test]
+        async fn a_top_up_held_below_the_stable_part_is_recorded_once_a_day() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            anchor(&mut mgr, &fake).await;
+            // 10,000 sats leave with no event, and the peer wakes twice before a regular tick checks the books against it.
+            user_holds(&fake, 40_000_000);
+            for _ in 0..2 {
+                mgr.run_tick_plan(&fake as &dyn LdkServerCalls, 80_000.0, TickScope::WokenPeer(COUNTERPARTY_HEX)).await;
+            }
+            assert!(top_up_sats_sent(&fake).is_empty());
+            let alarms = ledger_rows(&mgr, "STABILITY_TOP_UP_HELD_BELOW_BACKING");
+            assert_eq!(alarms.len(), 1, "one durable row a day");
+            let figures = (&alarms[0]["shortfall_msat"], &alarms[0]["kept_shortfall_msat"], &alarms[0]["backing_sats"], &alarms[0]["balance_msat"]);
+            let expected = (serde_json::json!(10_000_000), serde_json::json!(0), serde_json::json!(50_000), serde_json::json!(40_000_000));
+            assert_eq!(figures, (&expected.0, &expected.1, &expected.2, &expected.3));
+        }
+
+        /// A $50 position on 50,000 sats in a 300,000-sat channel where the user holds `user_sats`, its books at `booked_msat` and paused.
+        fn paused_trade_channel(mgr: &mut StableChannelManager, user_sats: u64, booked_msat: u64) -> FakeLdkServer {
+            let fake = FakeLdkServer::new(vec![make_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 300_000, (300_000 - user_sats) * 1000, true)]);
+            seed_channel(mgr, UID, COUNTERPARTY_HEX, CHANNEL_ID_HEX, 50.0, 50_000, user_sats - 50_000, user_sats, 100_000.0);
+            mgr.db.save_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, 50.0, 50_000, user_sats - 50_000, None).unwrap();
+            assert!(mgr.db.anchor_booked_balance(UID, CHANNEL_ID_HEX, booked_msat, 300_000, ForwardCursor::default(), serde_json::json!({})).unwrap());
+            let now_ms = StableChannelManager::unix_time_secs() * 1000;
+            let gap_msat = booked_msat.abs_diff(user_sats * 1000);
+            let paused = BooksCheck { state: CheckState::Paused, direction: Some(GapDirection::Below), gap_msat, first_seen_ms: Some(now_ms - 120_000), sightings: 2, accepted_gap_msat: 0, accepted_backing_gap_msat: 0, checked_at_ms: Some(now_ms - 60_000), gap_kind: None };
+            mgr.db.save_books_check(UID, &paused, None).unwrap();
+            fake
+        }
+
+        #[tokio::test]
+        async fn a_paused_channel_trade_is_checked_against_the_smaller_balance() {
+            // The books still hold 30,000 sats the user spent: spare BTC after the trade is what the user holds, not what the books say.
+            let mut mgr = make_manager();
+            let fake = paused_trade_channel(&mut mgr, 70_000, 100_000_000);
+            let request = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &"b".repeat(64), 60.0, 100_000.0);
+            let fee = expected_trade_fee_msat(50.0, 60.0, 100_000.0).unwrap();
+            let payment_id = "a4e7b0d3c6f9a2e5b8d1c4f7a0e3b6d9c2f5a8e1b4d7c0f3a6e9b2d5c8f1a4e7";
+            assert_eq!(mgr.handle_trade_payment(&request, Some(payment_id), Some(fee), &fake, 100_000.0).await, Handled::Done);
+            assert_eq!(money(&mgr), ((60.0, 59_999, 10_001), (60.0, 59_999, 10_001)));
+
+            // A receipt the books have not taken yet shows 90,000 sats, but the books hold 75,000: an $80 target is more than the smaller.
+            let mut mgr = make_manager();
+            let fake = paused_trade_channel(&mut mgr, 90_000, 75_000_000);
+            let request = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &"c".repeat(64), 80.0, 100_000.0);
+            let fee = expected_trade_fee_msat(50.0, 80.0, 100_000.0).unwrap();
+            let payment_id = "e9b2d5c8f1a4e7b0d3c6f9a2e5b8d1c4f7a0e3b6d9c2f5a8e1b4d7c0f3a6e9b2";
+            assert_eq!(mgr.handle_trade_payment(&request, Some(payment_id), Some(fee), &fake, 100_000.0).await, Handled::Done);
+            assert_eq!(money(&mgr).0 .0, 50.0, "the target stays");
+            assert_eq!(mgr.db.trade_decision_summary(payment_id).unwrap().unwrap().outcome, "rejected");
+        }
+
+        /// The LSP's side once a payment of `msat` to the user has left it, before the user's side shows it.
+        fn sent_to_the_user(fake: &FakeLdkServer, msat: u64) {
+            let mut channels = fake.channels.lock().unwrap();
+            channels[0].outbound_capacity_msat -= msat;
+            channels[0].next_outbound_htlc_limit_msat = channels[0].outbound_capacity_msat;
+        }
+
+        #[tokio::test]
+        async fn a_claim_that_closes_the_gap_lifts_the_pause() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            anchor(&mut mgr, &fake).await;
+            // The price falls 3%, and the drift is topped up with 1,546 sats, under the margin a splice shows above.
+            ticks_at(&mut mgr, &fake, 97_000.0, 1).await;
+            assert_eq!(top_up_sats_sent(&fake), [1_546]);
+            sent_to_the_user(&fake, 1_546_000);
+            // The wallet claims it, then goes offline before the channel update that credits it, so the user's side still shows the old balance.
+            outcome(&mut mgr, &fake, "fake-payment-id", Some(1_546_000), true).await;
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 51_546_000, "the claim is booked");
+            ticks_at(&mut mgr, &fake, 97_000.0, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+            assert_eq!(money(&mgr), ((50.0, 51_546, 0), (50.0, 51_546, 0)), "nothing is cut");
+            // The update completes and the user's side shows the claim: the pause lifts on its own.
+            user_holds(&fake, 51_546_000);
+            ticks_at(&mut mgr, &fake, 97_000.0, 1).await;
+            let check = booked(&mgr).unwrap().check;
+            assert_eq!((check.state, check.direction), (CheckState::Ok, None));
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH_CLEARED").len(), 1);
+            let claims: Vec<_> = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").into_iter().filter(|change| change["reason"] == "top_up_claimed").collect();
+            assert_eq!(claims.len(), 1);
+            assert_eq!(top_up_sats_sent(&fake), [1_546], "the claim covered the drift");
+            assert_eq!(money(&mgr), ((50.0, 51_546, 0), (50.0, 51_546, 0)));
+        }
+
+        #[tokio::test]
+        async fn a_claim_booked_during_a_pause_lifts_it() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            anchor(&mut mgr, &fake).await;
+            // An older daemon sent a 1,500-sat top-up the old way over an hour ago, raising backing before the claim, and the LSP's side no longer holds it.
+            book_top_up_the_old_way(&mut mgr, 50_000, 51_500);
+            save_test_connection(&mgr)
+                .execute("UPDATE settlement_payments SET recorded_at = ?1 WHERE payment_id = 'old-top-up'", [StableChannelManager::unix_time_secs() - 7_200])
+                .unwrap();
+            sent_to_the_user(&fake, 1_500_000);
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH")[0]["categories"], serde_json::json!(["backing_above_books"]));
+            // The wallet claims it during the pause, and the channel update credits it.
+            user_holds(&fake, 51_500_000);
+            outcome(&mut mgr, &fake, "old-top-up", Some(1_500_000), true).await;
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 51_500_000, "booked while paused");
+            ticks(&mut mgr, &fake, 1).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH_CLEARED").len(), 1);
+            assert_eq!(money(&mgr), ((50.0, 51_500, 0), (50.0, 51_500, 0)));
+        }
+
+        #[tokio::test]
+        async fn a_spend_with_no_event_while_a_top_up_is_on_the_way_pauses_and_its_claim_keeps_the_gap() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // The price falls 3%, and the drift is topped up with 1,546 sats, under the margin a splice shows above.
+            ticks_at(&mut mgr, &fake, 97_000.0, 1).await;
+            assert_eq!(top_up_sats_sent(&fake), [1_546]);
+            // While it is on the way the user spends 10,000 sats, with no event and nothing counted.
+            user_holds(&fake, 40_000_000);
+            sent_to_the_user(&fake, 1_546_000);
+            ticks_at(&mut mgr, &fake, 97_000.0, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "nothing is cut");
+
+            // The claim lands and is booked, which leaves the gap the spend made.
+            user_holds(&fake, 41_546_000);
+            outcome(&mut mgr, &fake, "fake-payment-id", Some(1_546_000), true).await;
+            ticks_at(&mut mgr, &fake, 97_000.0, 2).await;
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.check.state, books.check.gap_msat), (51_546_000, CheckState::Paused, 10_000_000));
+            assert_eq!(money(&mgr), ((50.0, 51_546, 0), (50.0, 51_546, 0)));
+            assert_eq!(top_up_sats_sent(&fake), [1_546]);
+        }
+
+        #[tokio::test]
+        async fn a_top_up_sent_before_the_upgrade_does_not_pause_the_channel() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            anchor(&mut mgr, &fake).await;
+            // An older daemon sent a 1,500-sat top-up the old way, raising backing before the claim, and the LSP's side no longer holds it.
+            book_top_up_the_old_way(&mut mgr, 50_000, 51_500);
+            sent_to_the_user(&fake, 1_500_000);
+            ticks(&mut mgr, &fake, 2).await;
+            let check = booked(&mgr).unwrap().check;
+            assert_eq!((check.state, check.direction), (CheckState::Watching, Some(GapDirection::Below)), "watched, so top-ups wait");
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_PAUSED").is_empty());
+            // Past the hour a payment is waited for, it no longer explains the gap.
+            save_test_connection(&mgr)
+                .execute("UPDATE settlement_payments SET recorded_at = ?1 WHERE payment_id = 'old-top-up'", [StableChannelManager::unix_time_secs() - 7_200])
+                .unwrap();
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_PAUSED").len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_pause_survives_a_restart_and_alarms_once_a_day() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, inbox) = fixture(50.0).await;
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            anchor(&mut mgr, &fake).await;
+            user_holds(&fake, 30_000_000);
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_PAUSED").len(), 1);
+            let since_ms = booked(&mgr).unwrap().check.first_seen_ms.unwrap();
+            // The daemon restarts on its own connection to the same database file.
+            let data_dir = mgr.data_dir.clone();
+            drop(mgr);
+            let db = std::sync::Arc::new(stable_channels::db::Database::open(&data_dir).unwrap());
+            stable_channels::audit::set_audit_ledger((*db).clone());
+            let mut mgr = StableChannelManager::new(db, data_dir);
+            mgr.reconcile_unless_hydrated(&fake as &dyn LdkServerCalls, 100_000.0).await;
+            mgr.attach_event_inbox(inbox);
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused, "the pause is on disk");
+            stable_channels::audit::enable_test_capture();
+            ticks_at(&mut mgr, &fake, 80_000.0, 2).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert!(top_up_sats_sent(&fake).is_empty(), "still held after the restart");
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            assert_eq!(count_events(&events, "BOOKED_BALANCE_PAUSED"), 2, "the alarm continues");
+            let alarms = ledger_rows(&mgr, "BOOKED_BALANCE_PAUSED");
+            assert_eq!(alarms.len(), 1, "with no second record the same day");
+            let day = StableChannelManager::unix_time_secs() / STABILITY_TOP_UP_ALARM_REPEAT_SECS;
+            assert_eq!(alarms[0]["dedup_key"], format!("lsp:books-paused:{UID}:{since_ms}:{day}"), "the next day's key is a new record");
+        }
+
+        /// The $50 fixture whose books started after 20,000 sats had left with no spend booked: they match the balance, and backing is still 50,000.
+        async fn books_below_an_old_backing() -> (StableChannelManager, FakeLdkServer, std::sync::Arc<Inbox>) {
+            let (mgr, fake, inbox) = fixture(50.0).await;
+            user_holds(&fake, 30_000_000);
+            assert!(mgr.db.anchor_booked_balance(UID, CHANNEL_ID_HEX, 30_000_000, 100_000, cursor_so_far(), serde_json::json!({})).unwrap());
+            (mgr, fake, inbox)
+        }
+
+        #[tokio::test]
+        async fn an_old_unreconciled_spend_holds_top_ups_and_pauses_without_a_cut() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = books_below_an_old_backing().await;
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            ticks_at(&mut mgr, &fake, 80_000.0, 1).await;
+            let check = booked(&mgr).unwrap().check;
+            assert_eq!((check.state, check.direction, check.gap_msat), (CheckState::Watching, Some(GapDirection::Below), 20_000_000));
+            assert!(top_up_sats_sent(&fake).is_empty());
+            ticks_at(&mut mgr, &fake, 80_000.0, 1).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+            assert!(top_up_sats_sent(&fake).is_empty());
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "never cut automatically");
+            let mismatches = ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH");
+            assert_eq!(mismatches.len(), 1);
+            assert_eq!(mismatches[0]["categories"], serde_json::json!(["backing_above_books"]));
+            assert_eq!((&mismatches[0]["backing_gap_msat"], &mismatches[0]["effect"]), (&serde_json::json!(20_000_000), &serde_json::json!("paused")));
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_PAUSED").len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_surplus_that_lifts_the_books_to_the_backing_clears_the_gap() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = books_below_an_old_backing().await;
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+            // The 20,000 sats come back with nothing to attribute them to, so the balance holds the backing again.
+            user_holds(&fake, 50_000_000);
+            ticks(&mut mgr, &fake, 1).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH_CLEARED").len(), 1);
+            ticks(&mut mgr, &fake, 1).await;
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.check.state, books.check.direction), (50_000_000, CheckState::Ok, None));
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED")[0]["reason"], "unattributed_receipt");
+            ticks_at(&mut mgr, &fake, 80_000.0, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok, "the books now hold the backing");
+            assert_eq!(top_up_sats_sent(&fake), [12_500]);
+            assert_eq!(money(&mgr).1, (50.0, 50_000, 0));
+        }
+
+        #[tokio::test]
+        async fn books_below_a_backing_the_balance_holds_are_booked_up_without_a_hold() {
+            // Books started during a small splice-out: they sit 20,000 sats below a balance that holds the backing.
+            let (mut mgr, fake, _inbox) = books_below_an_old_backing().await;
+            user_holds(&fake, 50_000_000);
+            ticks(&mut mgr, &fake, 1).await;
+            let check = booked(&mgr).unwrap().check;
+            assert_eq!((check.state, check.direction), (CheckState::Ok, Some(GapDirection::Above)), "no gap below to hold for");
+            ticks(&mut mgr, &fake, 1).await;
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000);
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").iter().all(|row| row["direction"] == "above"));
+        }
+
+        /// The node's record of a trade fee the user paid.
+        fn fee_arrived(fake: &FakeLdkServer, payment_id: &str, fee_msat: u64) {
+            fake.payments.lock().unwrap().push(GrpcPayment {
+                payment_id: payment_id.into(),
+                amount_msat: Some(fee_msat),
+                direction: ldk_server_client::ldk_server_grpc::types::PaymentDirection::Inbound as i32,
+                status: PaymentStatus::Succeeded as i32,
+                ..Default::default()
+            });
+        }
+
+        /// A signed trade from $50 to `new_usd` at `quote_price`, its fee paid out of the user's 50,000 sats; returns the fee.
+        async fn trade_from_fifty(mgr: &mut StableChannelManager, fake: &FakeLdkServer, payment_id: &str, trade_id: &str, new_usd: f64, quote_price: f64) -> u64 {
+            let fee = expected_trade_fee_msat(50.0, new_usd, quote_price).unwrap();
+            fee_arrived(fake, payment_id, fee);
+            user_holds(fake, 50_000_000 - fee);
+            let request = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, trade_id, new_usd, quote_price);
+            assert_eq!(mgr.handle_trade_payment(&request, Some(payment_id), Some(fee), fake, 100_000.0).await, Handled::Done);
+            fee
+        }
+
+        #[tokio::test]
+        async fn a_refused_trade_fee_is_cut_once_by_the_tick_and_never_pauses() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            anchor(&mut mgr, &fake).await;
+            // A $10 sell quoted far from the LSP's price is refused, but its 125-sat fee has arrived.
+            let payment_id = "b7e0a3d6c9f2b5e8a1d4c7f0b3e6a9d2c5f8b1e4a7d0c3f6b9e2a5d8c1f4b7e0";
+            let fee = trade_from_fifty(&mut mgr, &fake, payment_id, &"d4".repeat(32), 40.0, 80_000.0).await;
+            assert_eq!(fee, 125_000);
+            assert_eq!(mgr.db.trade_decision_summary(payment_id).unwrap().unwrap().outcome, "rejected");
+            assert_eq!(booked(&mgr).unwrap().uncut, Some(UncutSpends { spent_msat: 125_000, overflow_msat: 125_000 }), "a spend the tick cuts");
+            stable_channels::audit::enable_test_capture();
+            ticks(&mut mgr, &fake, 3).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            let cuts = spend_cuts(&events);
+            assert_eq!(cuts.len(), 1);
+            assert_eq!((&cuts[0]["source"], &cuts[0]["stable_sats_spent"]), (&serde_json::json!("deferred"), &serde_json::json!(125)));
+            assert_eq!(money(&mgr), ((49.875, 49_875, 0), (49.875, 49_875, 0)));
+            assert_eq!(count_events(&events, "SYNC_MESSAGE_SENT"), 1);
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_PAUSED").is_empty());
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+            // The operator refunds the fee: a receipt, so it is spare BTC.
+            let (refund_id, amount_msat) = crate::revenue::refund_trade_fee(&mgr.db, &fake, payment_id, StableChannelManager::unix_time_secs()).await.unwrap();
+            assert_eq!(amount_msat, 125_000);
+            user_holds(&fake, 50_000_000);
+            outcome(&mut mgr, &fake, &refund_id, Some(125_000), true).await;
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000);
+            assert_eq!(money(&mgr), ((49.875, 49_875, 125), (49.875, 49_875, 125)));
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(money(&mgr), ((49.875, 49_875, 125), (49.875, 49_875, 125)));
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_PAUSED").is_empty());
+        }
+
+        /// The rejection reason a trade decision recorded.
+        fn rejection_reason(mgr: &StableChannelManager, payment_id: &str) -> Option<String> {
+            save_test_connection(mgr)
+                .query_row("SELECT reason_code FROM trade_decisions WHERE inbound_payment_id = ?1", [payment_id], |row| row.get(0))
+                .unwrap()
+        }
+
+        /// The trade fee bookings in the ledger.
+        fn fee_bookings(mgr: &StableChannelManager) -> Vec<serde_json::Value> {
+            ledger_rows(mgr, "BOOKED_BALANCE_CHANGED").into_iter().filter(|row| row["reason"] == "trade_fee").collect()
+        }
+
+        /// A trade request's payment as the event inbox saves it, still waiting to be handled.
+        fn trade_payment_waiting(payment_id: &str) -> Entry {
+            use ldk_server_client::ldk_server_grpc::events::{event_envelope::Event, EventEnvelope, PaymentReceived};
+            Entry::Event(EventEnvelope { event: Some(Event::PaymentReceived(PaymentReceived { payment_id: payment_id.into(), ..Default::default() })) })
+        }
+
+        #[tokio::test]
+        async fn a_trade_request_that_cannot_be_decided_books_its_fee_as_refused() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // A signed request whose trade id is malformed can never be decided, and its 100-sat fee has arrived.
+            let payment_id = "6a9d2c5f8b1e4a7d0c3f6b9e2a5d8c1f4b7e0a3d6c9f2b5e8a1d4c7f0b3e6a9d";
+            let fee = 100_000;
+            fee_arrived(&fake, payment_id, fee);
+            user_holds(&fake, 50_000_000 - fee);
+            let request = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, "not-a-trade-id", 40.0, 100_000.0);
+            assert_eq!(mgr.handle_trade_payment(&request, Some(payment_id), Some(fee), &fake, 100_000.0).await, Handled::Done);
+            assert_eq!(rejection_reason(&mgr, payment_id).as_deref(), Some("correlation_invalid"), "refused for good");
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.uncut), (50_000_000 - fee, Some(UncutSpends { spent_msat: fee, overflow_msat: fee })), "booked and marked at once");
+            assert_eq!(fee_bookings(&mgr).len(), 1);
+            // Meanwhile the user spends 5,000 sats, which only LDK's totals show.
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spending(5_000_000);
+            user_holds(&fake, 50_000_000 - fee - 5_000_000);
+            stable_channels::audit::enable_test_capture();
+            ticks(&mut mgr, &fake, 1).await;
+            let events = stable_channels::audit::drain_test_capture();
+            // The next tick cuts the fee once, and the spend with it: neither is held.
+            assert!(deferrals(&events).is_empty());
+            let cuts = spend_cuts(&events);
+            assert_eq!((cuts.len(), &cuts[0]["total_sats_spent"], &cuts[0]["stable_sats_spent"]), (1, &serde_json::json!(5_100), &serde_json::json!(5_100)));
+            assert_eq!(money(&mgr), ((44.9, 44_900, 0), (44.9, 44_900, 0)));
+            assert_eq!(booked(&mgr).unwrap().uncut, None);
+            ticks(&mut mgr, &fake, 2).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert!(spend_cuts(&events).is_empty());
+            assert_eq!(money(&mgr), ((44.9, 44_900, 0), (44.9, 44_900, 0)));
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+        }
+
+        #[tokio::test]
+        async fn a_trade_refused_for_a_malformed_request_is_never_accepted_later() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // A request with a malformed trade id, and a $10 sell quoted on $50 whose rejection signing is refused, each pay a 100-sat fee.
+            let malformed = "3e6a9d2c5f8b1e4a7d0c3f6b9e2a5d8c1f4b7e0a3d6c9f2b5e8a1d4c7f0b3e6a";
+            let unsigned = "f0b3e6a9d2c5f8b1e4a7d0c3f6b9e2a5d8c1f4b7e0a3d6c9f2b5e8a1d4c7f0b3";
+            let fee = expected_trade_fee_msat(50.0, 40.0, 100_000.0).unwrap();
+            for payment_id in [malformed, unsigned] {
+                fee_arrived(&fake, payment_id, fee);
+            }
+            user_holds(&fake, 50_000_000 - 2 * fee);
+            let bad = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, "not-a-trade-id", 40.0, 100_000.0);
+            assert_eq!(mgr.handle_trade_payment(&bad, Some(malformed), Some(fee), &fake, 100_000.0).await, Handled::Done);
+            let sell = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &"d9".repeat(32), 40.0, 100_000.0);
+            *fake.failure_code.lock().unwrap() = LdkServerErrorCode::InvalidRequestError;
+            fake.sign_failures.store(1, Ordering::SeqCst);
+            // The first fee is cut before the sell is checked, so the sell's fee no longer matches its target.
+            assert_eq!(mgr.handle_trade_payment(&sell, Some(unsigned), Some(fee), &fake, 100_000.0).await, Handled::Done);
+            for (payment_id, reason) in [(malformed, "correlation_invalid"), (unsigned, "invalid_fee")] {
+                assert_eq!(mgr.db.trade_decision_summary(payment_id).unwrap().unwrap().outcome, "rejected");
+                assert_eq!(rejection_reason(&mgr, payment_id).as_deref(), Some(reason));
+            }
+            assert_eq!(fee_bookings(&mgr).len(), 2);
+            // Handled again with requests that would be accepted, neither payment is, and neither books its fee again.
+            for payment_id in [malformed, unsigned] {
+                let valid = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &fresh_hex_id(), 40.0, 100_000.0);
+                for request in [&valid, &sell] {
+                    assert_eq!(mgr.handle_trade_payment(request, Some(payment_id), Some(fee), &fake, 100_000.0).await, Handled::Done);
+                    assert_eq!(mgr.db.trade_decision_summary(payment_id).unwrap().unwrap().outcome, "rejected");
+                }
+            }
+            assert!(mgr.db.trade_decision_by_trade_id(&"d9".repeat(32)).unwrap().is_none(), "a refused payment takes no trade id");
+            assert_eq!(fee_bookings(&mgr).len(), 2);
+            // The first fee was cut before the sell was checked, and the second waits for the tick.
+            assert_eq!(money(&mgr), ((49.9, 49_900, 0), (49.9, 49_900, 0)));
+            assert_eq!(booked(&mgr).unwrap().uncut, Some(UncutSpends { spent_msat: fee, overflow_msat: fee }));
+            let cuts = tick_cuts(&mut mgr, &fake).await;
+            assert_eq!((cuts.len(), &cuts[0]["stable_sats_spent"]), (1, &serde_json::json!(100)));
+            assert_eq!(money(&mgr), ((49.8, 49_800, 0), (49.8, 49_800, 0)));
+            assert!(tick_cuts(&mut mgr, &fake).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_retried_trade_books_its_fee_only_with_its_decision() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, inbox) = fixture(50.0).await;
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            anchor(&mut mgr, &fake).await;
+            // A $10 sell whose acceptance signing gets no answer, so its event stays in the inbox to be handled again.
+            let payment_id = "9d2c5f8b1e4a7d0c3f6b9e2a5d8c1f4b7e0a3d6c9f2b5e8a1d4c7f0b3e6a9d2c";
+            let fee = expected_trade_fee_msat(50.0, 40.0, 100_000.0).unwrap();
+            fee_arrived(&fake, payment_id, fee);
+            user_holds(&fake, 50_000_000 - fee);
+            inbox.save(&[(trade_payment_waiting(payment_id), 0)]).unwrap();
+            let request = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &"f6".repeat(32), 40.0, 100_000.0);
+            fake.sign_failures.store(1, Ordering::SeqCst);
+            assert_eq!(mgr.handle_trade_payment(&request, Some(payment_id), Some(fee), &fake, 100_000.0).await, Handled::Retry);
+            assert!(fee_bookings(&mgr).is_empty(), "nothing is booked before the decision");
+            assert_eq!((booked(&mgr).unwrap().booked_user_msat, booked(&mgr).unwrap().uncut), (50_000_000, None));
+            // The waiting event explains the gap: the channel is watched with its top-ups held, and never paused.
+            ticks(&mut mgr, &fake, 3).await;
+            let check = booked(&mgr).unwrap().check;
+            assert_eq!((check.state, check.direction), (CheckState::Watching, Some(GapDirection::Below)));
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_PAUSED").is_empty());
+            assert_eq!(top_ups_sent(&fake), 0);
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+
+            // Handled again, the trade is accepted and its fee booked with the acceptance, unmarked.
+            assert_eq!(mgr.handle_trade_payment(&request, Some(payment_id), Some(fee), &fake, 100_000.0).await, Handled::Done);
+            inbox.finish(inbox.oldest().unwrap().unwrap().id).unwrap();
+            assert_eq!(mgr.db.trade_decision_summary(payment_id).unwrap().unwrap().outcome, "accepted");
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.uncut), (50_000_000 - fee, None));
+            let bookings = fee_bookings(&mgr);
+            assert_eq!(bookings.len(), 1);
+            assert!(bookings[0].get("uncut_spend_msat").is_none(), "the accepted allocation already takes the fee");
+            assert_eq!(money(&mgr), ((40.0, 40_000, 9_900), (40.0, 40_000, 9_900)));
+            stable_channels::audit::enable_test_capture();
+            ticks(&mut mgr, &fake, 2).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert!(spend_cuts(&events).is_empty());
+            assert_eq!(money(&mgr), ((40.0, 40_000, 9_900), (40.0, 40_000, 9_900)), "the fee is charged once, by the trade");
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+        }
+
+        #[tokio::test]
+        async fn a_retried_trade_that_ends_without_a_decision_refuses_its_fee() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            for ending in ["channel list refused", "signature check refused", "channel gone"] {
+                let (mut mgr, fake, _inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                // A $10 sell whose payment lookup gets no answer, so it is handled again, and its 100-sat fee has arrived.
+                let payment_id = "5e8a1d4c7f0b3e6a9d2c5f8b1e4a7d0c3f6b9e2a5d8c1f4b7e0a3d6c9f2b5e8a";
+                let fee = expected_trade_fee_msat(50.0, 40.0, 100_000.0).unwrap();
+                fee_arrived(&fake, payment_id, fee);
+                user_holds(&fake, 50_000_000 - fee);
+                let request = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &"a7".repeat(32), 40.0, 100_000.0);
+                fake.payment_lookup_failures.store(1, Ordering::SeqCst);
+                assert_eq!(mgr.handle_trade_payment(&request, Some(payment_id), Some(fee), &fake, 100_000.0).await, Handled::Retry, "{ending}");
+                assert!(fee_bookings(&mgr).is_empty(), "{ending}");
+                // Handled again, it ends before any decision can take it.
+                let listed = fake.channels.lock().unwrap().clone();
+                *fake.failure_code.lock().unwrap() = LdkServerErrorCode::InvalidRequestError;
+                match ending {
+                    "channel list refused" => fake.list_channels_fails.store(true, Ordering::SeqCst),
+                    "signature check refused" => *fake.verify_failure.lock().unwrap() = Some(LdkServerErrorCode::InvalidRequestError),
+                    _ => fake.channels.lock().unwrap()[0].channel_id = ROUTING_CHANNEL_HEX.to_owned(),
+                }
+                assert_eq!(mgr.handle_trade_payment(&request, Some(payment_id), Some(fee), &fake, 100_000.0).await, Handled::Done, "{ending}");
+                fake.list_channels_fails.store(false, Ordering::SeqCst);
+                *fake.verify_failure.lock().unwrap() = None;
+                *fake.channels.lock().unwrap() = listed;
+                // Its fee is refused for good, booked once and marked for the tick.
+                assert_eq!(mgr.db.trade_decision_summary(payment_id).unwrap().unwrap().outcome, "rejected", "{ending}");
+                assert_eq!(rejection_reason(&mgr, payment_id).as_deref(), Some("undecidable"), "{ending}");
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.uncut), (50_000_000 - fee, Some(UncutSpends { spent_msat: fee, overflow_msat: fee })), "{ending}");
+                assert_eq!(fee_bookings(&mgr).len(), 1, "{ending}");
+                // Handled once more, nothing is decided or booked again.
+                assert_eq!(mgr.handle_trade_payment(&request, Some(payment_id), Some(fee), &fake, 100_000.0).await, Handled::Done, "{ending}");
+                assert_eq!(mgr.db.trade_decision_summary(payment_id).unwrap().unwrap().outcome, "rejected", "{ending}");
+                assert_eq!(fee_bookings(&mgr).len(), 1, "{ending}");
+                let cuts = tick_cuts(&mut mgr, &fake).await;
+                assert_eq!((cuts.len(), &cuts[0]["stable_sats_spent"]), (1, &serde_json::json!(100)), "{ending}");
+                assert_eq!(money(&mgr), ((49.9, 49_900, 0), (49.9, 49_900, 0)), "{ending}");
+                assert!(tick_cuts(&mut mgr, &fake).await.is_empty(), "{ending}");
+                assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok, "{ending}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_rejected_trade_books_and_cuts_its_fee_once() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // A $10 sell that pays half its fee is rejected, and the 50 sats it paid have arrived.
+            let payment_id = "1c4f7b0e3a6d9c2f5b8e1a4d7c0f3b6e9a2d5c8f1b4e7a0d3c6f9b2e5a8d1c4f";
+            let paid = expected_trade_fee_msat(50.0, 40.0, 100_000.0).unwrap() / 2;
+            fee_arrived(&fake, payment_id, paid);
+            user_holds(&fake, 50_000_000 - paid);
+            let request = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &"c3".repeat(32), 40.0, 100_000.0);
+            // Its rejection's signing first gets no answer, so nothing is decided or booked until it is handled again.
+            fake.sign_failures.store(1, Ordering::SeqCst);
+            assert_eq!(mgr.handle_trade_payment(&request, Some(payment_id), Some(paid), &fake, 100_000.0).await, Handled::Retry);
+            assert!(fee_bookings(&mgr).is_empty());
+            assert_eq!(mgr.handle_trade_payment(&request, Some(payment_id), Some(paid), &fake, 100_000.0).await, Handled::Done);
+            assert_eq!(mgr.db.trade_decision_summary(payment_id).unwrap().unwrap().outcome, "rejected");
+            assert_eq!(rejection_reason(&mgr, payment_id).as_deref(), Some("invalid_fee"));
+            assert_eq!(booked(&mgr).unwrap().uncut, Some(UncutSpends { spent_msat: paid, overflow_msat: paid }), "booked with the rejection, marked for the tick");
+            assert_eq!(fee_bookings(&mgr).len(), 1);
+            stable_channels::audit::enable_test_capture();
+            ticks(&mut mgr, &fake, 3).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            let cuts = spend_cuts(&events);
+            assert_eq!((cuts.len(), &cuts[0]["source"], &cuts[0]["stable_sats_spent"]), (1, &serde_json::json!("deferred"), &serde_json::json!(50)));
+            assert_eq!(money(&mgr), ((49.95, 49_950, 0), (49.95, 49_950, 0)));
+            assert_eq!(booked(&mgr).unwrap().uncut, None);
+        }
+
+        #[tokio::test]
+        async fn a_fee_booked_before_the_upgrade_is_cut_once_when_its_trade_is_rejected() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // A $10 sell that pays half its fee, and a request whose trade id is malformed, each retried across the upgrade: the release before booked both fees on arrival, unmarked.
+            let rejected = "5a8d1c4f7b0e3a6d9c2f5b8e1a4d7c0f3b6e9a2d5c8f1b4e7a0d3c6f9b2e5a8d";
+            let refused = "c0f3b6e9a2d5c8f1b4e7a0d3c6f9b2e5a8d1c4f7b0e3a6d9c2f5b8e1a4d7c0f3";
+            let paid = expected_trade_fee_msat(50.0, 40.0, 100_000.0).unwrap() / 2;
+            let refused_fee = 100_000;
+            for (payment_id, fee_msat) in [(rejected, paid), (refused, refused_fee)] {
+                fee_arrived(&fake, payment_id, fee_msat);
+                let booked_on_arrival = BookChange {
+                    user_channel_id: UID,
+                    delta_msat: -(fee_msat as i64),
+                    reason: BookReason::TradeFee,
+                    evidence: payment_id.to_owned(),
+                    cursor: None,
+                    channel_value_sats: None,
+                    detail: serde_json::json!({ "amount_msat": fee_msat }),
+                    marks_uncut: false,
+                    listed_after_msat: None,
+                };
+                assert!(matches!(mgr.db.book(&booked_on_arrival).unwrap(), BookOutcome::Applied { .. }));
+            }
+            user_holds(&fake, 50_000_000 - paid - refused_fee);
+            assert_eq!((booked(&mgr).unwrap().booked_user_msat, booked(&mgr).unwrap().uncut), (50_000_000 - paid - refused_fee, None));
+            let underpaid = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &"e4".repeat(32), 40.0, 100_000.0);
+            let malformed = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, "not-a-trade-id", 40.0, 100_000.0);
+            // Each is decided once, and handled again books and marks nothing more.
+            for _ in 0..2 {
+                assert_eq!(mgr.handle_trade_payment(&underpaid, Some(rejected), Some(paid), &fake, 100_000.0).await, Handled::Done);
+                assert_eq!(mgr.handle_trade_payment(&malformed, Some(refused), Some(refused_fee), &fake, 100_000.0).await, Handled::Done);
+            }
+            assert_eq!(rejection_reason(&mgr, rejected).as_deref(), Some("invalid_fee"));
+            assert_eq!(rejection_reason(&mgr, refused).as_deref(), Some("correlation_invalid"));
+            assert_eq!(fee_bookings(&mgr).len(), 2, "booked once each, before the upgrade");
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.uncut), (50_000_000 - paid - refused_fee, Some(UncutSpends { spent_msat: paid + refused_fee, overflow_msat: paid + refused_fee })));
+            stable_channels::audit::enable_test_capture();
+            ticks(&mut mgr, &fake, 3).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            let cuts = spend_cuts(&events);
+            assert_eq!((cuts.len(), &cuts[0]["source"], &cuts[0]["stable_sats_spent"]), (1, &serde_json::json!("deferred"), &serde_json::json!(150)));
+            assert_eq!(money(&mgr), ((49.85, 49_850, 0), (49.85, 49_850, 0)));
+            assert_eq!(booked(&mgr).unwrap().uncut, None);
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_PAUSED").is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_redelivered_trade_event_books_its_fee_once() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // Three requests, each delivered twice: a $10 sell that is accepted, then one that underpays and one with a malformed trade id, 50 sats each.
+            let accepted = "7e0a3d6c9f2b5e8a1d4c7f0b3e6a9d2c5f8b1e4a7d0c3f6b9e2a5d8c1f4b7e0a";
+            let rejected = "0b3e6a9d2c5f8b1e4a7d0c3f6b9e2a5d8c1f4b7e0a3d6c9f2b5e8a1d4c7f0b3e";
+            let undecidable = "d8c1f4b7e0a3d6c9f2b5e8a1d4c7f0b3e6a9d2c5f8b1e4a7d0c3f6b9e2a5d8c1";
+            let fee = expected_trade_fee_msat(50.0, 40.0, 100_000.0).unwrap();
+            for (payment_id, paid) in [(accepted, fee), (rejected, 50_000), (undecidable, 50_000)] {
+                fee_arrived(&fake, payment_id, paid);
+            }
+            user_holds(&fake, 50_000_000 - fee - 100_000);
+            let requests = [
+                (accepted, fee, correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &"a7".repeat(32), 40.0, 100_000.0)),
+                (rejected, 50_000, correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &"b7".repeat(32), 30.0, 100_000.0)),
+                (undecidable, 50_000, correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, "not-a-trade-id", 30.0, 100_000.0)),
+            ];
+            for _ in 0..2 {
+                for (payment_id, paid, request) in &requests {
+                    assert_eq!(mgr.handle_trade_payment(request, Some(payment_id), Some(*paid), &fake, 100_000.0).await, Handled::Done);
+                }
+            }
+            assert_eq!(mgr.db.trade_decision_summary(accepted).unwrap().unwrap().outcome, "accepted");
+            assert_eq!(mgr.db.trade_decision_summary(rejected).unwrap().unwrap().outcome, "rejected");
+            let evidence: Vec<_> = fee_bookings(&mgr).iter().map(|row| row["evidence"].clone()).collect();
+            assert_eq!(evidence, [accepted, rejected, undecidable].map(|id| serde_json::json!(id)), "one booking each");
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.uncut), (50_000_000 - fee - 100_000, Some(UncutSpends { spent_msat: 100_000, overflow_msat: 0 })), "the spare BTC the trade left covers them");
+            // The tick takes the two refused fees from the spare BTC the trade left, once.
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().uncut, None);
+            assert_eq!(money(&mgr), ((40.0, 40_000, 9_800), (40.0, 40_000, 9_800)));
+        }
+
+        #[tokio::test]
+        async fn an_acceptance_that_cannot_be_saved_writes_neither_its_decision_nor_its_fee() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // The fee's booking fails inside the acceptance's transaction, so the acceptance fails with it.
+            save_test_connection(&mgr)
+                .execute_batch(
+                    "CREATE TRIGGER fail_accepted_fee BEFORE INSERT ON ledger_events
+                     WHEN NEW.dedup_key LIKE 'booked:%:trade_fee:%' AND EXISTS(SELECT 1 FROM trade_decisions
+                         WHERE inbound_payment_id = json_extract(NEW.detail_json, '$.evidence') AND outcome = 'accepted')
+                     BEGIN SELECT RAISE(ABORT, 'injected booking failure'); END;",
+                )
+                .unwrap();
+            let payment_id = "4a7d0c3f6b9e2a5d8c1f4b7e0a3d6c9f2b5e8a1d4c7f0b3e6a9d2c5f8b1e4a7d";
+            let fee = trade_from_fifty(&mut mgr, &fake, payment_id, &"b8".repeat(32), 40.0, 100_000.0).await;
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "the target is not traded");
+            // The request is rejected instead, and that rejection books the fee marked for the tick, once.
+            assert_eq!(mgr.db.trade_decision_summary(payment_id).unwrap().unwrap().outcome, "rejected");
+            assert_eq!(rejection_reason(&mgr, payment_id).as_deref(), Some("internal_failure"));
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.uncut), (50_000_000 - fee, Some(UncutSpends { spent_msat: fee, overflow_msat: fee })));
+            assert_eq!(fee_bookings(&mgr).len(), 1);
+            let cuts = tick_cuts(&mut mgr, &fake).await;
+            assert_eq!((cuts.len(), &cuts[0]["stable_sats_spent"]), (1, &serde_json::json!(100)));
+            assert_eq!(money(&mgr), ((49.9, 49_900, 0), (49.9, 49_900, 0)));
+            assert!(tick_cuts(&mut mgr, &fake).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_fee_for_a_trade_already_decided_is_cut_at_once() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // A $10 sell is accepted, then the same request arrives again with a second payment, which no decision can take.
+            let trade_id = "a1".repeat(32);
+            let fee = trade_from_fifty(&mut mgr, &fake, "4d7a0c3f6e9b2d5a8c1f4e7b0d3a6c9f2e5b8d1a4c7f0e3b6d9a2c5f8e1b4d7a", &trade_id, 40.0, 100_000.0).await;
+            let second = "8f1e4b7d0a3c6f9e2b5d8a1c4f7e0b3d6a9c2f5e8b1d4a7c0f3e6b9d2a5c8f1e";
+            fee_arrived(&fake, second, fee);
+            user_holds(&fake, 50_000_000 - 2 * fee);
+            let request = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &trade_id, 40.0, 100_000.0);
+            mgr.handle_trade_payment(&request, Some(second), Some(fee), &fake, 100_000.0).await;
+            assert_eq!(mgr.db.trade_decision_summary(second).unwrap().unwrap().outcome, "rejected");
+            assert_eq!(rejection_reason(&mgr, second).as_deref(), Some("trade_id_reused"));
+            // Its fee is the user's spend and is cut by the next tick, from the spare BTC the accepted trade left.
+            stable_channels::audit::enable_test_capture();
+            ticks(&mut mgr, &fake, 1).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert!(deferrals(&events).is_empty(), "no decision is waited for");
+            assert_eq!(booked(&mgr).unwrap().uncut, None);
+            assert_eq!(money(&mgr), ((40.0, 40_000, 9_800), (40.0, 40_000, 9_800)));
+        }
+
+        #[tokio::test]
+        async fn an_accepted_trade_leaves_no_mark_and_no_extra_cut() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            let payment_id = "3c6f9b2e5a8d1c4f7b0e3a6d9c2f5b8e1a4d7c0f3b6e9a2d5c8f1b4e7a0d3c6f";
+            let fee = trade_from_fifty(&mut mgr, &fake, payment_id, &"e5".repeat(32), 40.0, 100_000.0).await;
+            assert_eq!(fee, 100_000);
+            assert_eq!(mgr.db.trade_decision_summary(payment_id).unwrap().unwrap().outcome, "accepted");
+            assert_eq!(booked(&mgr).unwrap().uncut, None, "the accepted allocation already takes the fee");
+            assert_eq!(money(&mgr), ((40.0, 40_000, 9_900), (40.0, 40_000, 9_900)));
+            stable_channels::audit::enable_test_capture();
+            ticks(&mut mgr, &fake, 2).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert!(spend_cuts(&events).is_empty());
+            assert_eq!(money(&mgr), ((40.0, 40_000, 9_900), (40.0, 40_000, 9_900)));
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_expired_pay_back_still_pauses_for_the_operator() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            anchor(&mut mgr, &fake).await;
+            // The user pays back 5,000 sats under an authorisation that ran out: it is booked and refused, so backing stays above the books.
+            let settlement_id = "4f7a0d3c6b9e2f5a8d1c4b7e0a3f6d9c2b5e8a1f4d7c0b3e6a9f2d5c8b1e4a7f";
+            let payment_id = "8e1b4d7a0c3f6e9b2d5a8c1f4e7b0d3a6c9f2e5b8d1a4c7f0e3b6d9a2c5f8e1b";
+            user_holds(&fake, 45_000_000);
+            mgr.handle_payment_received(vec![expired_signed_pay_back(settlement_id, 5_000_000)], Some(payment_id.to_owned()), Some(5_000_000), &fake, 100_000.0).await;
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.uncut), (45_000_000, None), "booked, and not marked for a cut");
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "the operator decides");
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH")[0]["categories"], serde_json::json!(["backing_above_books"]));
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_PAUSED").len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_channel_whose_balance_sits_inside_the_reserve_keeps_its_top_ups() {
+            // A $10 position on 10,000 sats that all sit in the reserve LDK holds for the user, so no spendable balance shows to start books from.
+            let mut channel = make_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 100_000, 90_000_000, true);
+            channel.counterparty_unspendable_punishment_reserve = 10_000;
+            channel.inbound_capacity_msat = 0;
+            let fake = FakeLdkServer::new(vec![channel]).with_forwarding_stats(totals_so_far());
+            let mut mgr = make_manager();
+            assert!(mgr.edit_stable_channel(CHANNEL_ID_HEX, Some(10.0), None, &fake as &dyn LdkServerCalls, 100_000.0).await.ok);
+            mgr.attach_event_inbox(std::sync::Arc::new(Inbox::in_memory()));
+            ticks_at(&mut mgr, &fake, 80_000.0, 1).await;
+            assert!(booked(&mgr).is_none());
+            assert_eq!(top_up_sats_sent(&fake), [2_500], "today's top-up, since books could never start");
+        }
+
+        #[tokio::test]
+        async fn a_channel_inside_the_reserve_never_alarms_that_its_books_have_not_started() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // The same $10 position inside the reserve, whose top-up the node never reports on, so it stays on the way past the wait.
+            let mut channel = make_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 100_000, 90_000_000, true);
+            channel.counterparty_unspendable_punishment_reserve = 10_000;
+            channel.inbound_capacity_msat = 0;
+            let fake = FakeLdkServer::new(vec![channel]).with_forwarding_stats(totals_so_far());
+            let mut mgr = make_manager();
+            assert!(mgr.edit_stable_channel(CHANNEL_ID_HEX, Some(10.0), None, &fake as &dyn LdkServerCalls, 100_000.0).await.ok);
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            mgr.attach_event_inbox(std::sync::Arc::new(Inbox::in_memory()));
+            ticks_at(&mut mgr, &fake, 80_000.0, 62).await;
+            assert_eq!(top_up_sats_sent(&fake), [2_500]);
+            assert_eq!(mgr.db.stability_top_ups_in_flight().unwrap().len(), 1, "still on the way");
+            assert!(booked(&mgr).is_none());
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_NOT_STARTED").is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_channel_without_books_gets_no_top_up_until_the_inbox_attaches() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // A $50 position on the user's 50,000 sats, on a daemon whose event inbox could not be opened.
+            let mut channel = make_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, 100_000, 50_000_000, true);
+            channel.counterparty_unspendable_punishment_reserve = RESERVE_SATS;
+            channel.inbound_capacity_msat -= RESERVE_SATS * 1000;
+            let fake = FakeLdkServer::new(vec![channel]).with_forwarding_stats(totals_so_far());
+            let mut mgr = make_manager();
+            assert!(mgr.edit_stable_channel(CHANNEL_ID_HEX, Some(50.0), None, &fake as &dyn LdkServerCalls, 100_000.0).await.ok);
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            // The price falls, so the position is below its target for an hour of ticks.
+            ticks_at(&mut mgr, &fake, 80_000.0, 59).await;
+            assert!(booked(&mgr).is_none());
+            assert!(top_up_sats_sent(&fake).is_empty(), "no top-up before the books start");
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_NOT_STARTED").is_empty());
+            ticks_at(&mut mgr, &fake, 80_000.0, 2).await;
+            let alarms = ledger_rows(&mgr, "BOOKED_BALANCE_NOT_STARTED");
+            assert_eq!(alarms.len(), 1, "one a day");
+            assert_eq!((&alarms[0]["blocking"], &alarms[0]["ticks_waiting"]), (&serde_json::json!(["inbox_unavailable"]), &serde_json::json!(60)));
+            assert!(top_up_sats_sent(&fake).is_empty());
+            // Once the inbox attaches, the books start and the top-up follows.
+            mgr.attach_event_inbox(std::sync::Arc::new(Inbox::in_memory()));
+            ticks_at(&mut mgr, &fake, 80_000.0, 2).await;
+            assert!(booked(&mgr).is_some());
+            assert_eq!(top_up_sats_sent(&fake).len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_channel_whose_books_never_start_raises_a_daily_alarm() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, inbox) = fixture(50.0).await;
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            // An event the inbox never lets go of keeps the books from starting.
+            inbox.save(&[(unrelated_event(), 0)]).unwrap();
+            ticks(&mut mgr, &fake, 59).await;
+            assert!(booked(&mgr).is_none());
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_NOT_STARTED").is_empty());
+            ticks(&mut mgr, &fake, 2).await;
+            let alarms = ledger_rows(&mgr, "BOOKED_BALANCE_NOT_STARTED");
+            assert_eq!(alarms.len(), 1, "one a day");
+            assert_eq!((&alarms[0]["blocking"], &alarms[0]["ticks_waiting"]), (&serde_json::json!(["events_waiting"]), &serde_json::json!(60)));
+            let day = StableChannelManager::unix_time_secs() / STABILITY_TOP_UP_ALARM_REPEAT_SECS;
+            assert_eq!(alarms[0]["dedup_key"], format!("lsp:books-not-started:{UID}:{day}"));
+        }
+
+        #[tokio::test]
+        async fn a_splice_still_to_be_booked_is_not_taken_for_a_surplus() {
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            // The user's 50,000-sat splice-in locked while the daemon was away, and a 5,000-sat payment to them the node does not report is still in flight, so the listing looks short.
+            spliced(&fake, 150_000, 100_000_000, "a3f6c9e2b5d8a1f4c7e0b3d6a9f2c5e8b1d4a7f0c3e6b9d2a5f8c1e4b7d0a3f6");
+            sent_to_the_user(&fake, 5_000_000);
+            ticks(&mut mgr, &fake, 3).await;
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!((changes.len(), &changes[0]["reason"]), (1, &serde_json::json!("splice")), "the splice is not a receipt");
+            // The payment lands, the listing adds up, and nothing more is booked.
+            fake.channels.lock().unwrap()[0].outbound_capacity_msat += 5_000_000;
+            ticks(&mut mgr, &fake, 2).await;
+            let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+            assert_eq!(changes.len(), 1);
+            assert_eq!((&changes[0]["reason"], &changes[0]["delta_msat"]), (&serde_json::json!("splice"), &serde_json::json!(50_000_000)));
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.check.state, books.check.direction), (100_000_000, CheckState::Ok, None));
+        }
+
+        #[tokio::test]
+        async fn a_second_pause_the_same_day_raises_its_own_alarm() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            anchor(&mut mgr, &fake).await;
+            user_holds(&fake, 30_000_000);
+            ticks(&mut mgr, &fake, 2).await;
+            user_holds(&fake, 50_000_000);
+            ticks(&mut mgr, &fake, 1).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            user_holds(&fake, 30_000_000);
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+            let alarms = ledger_rows(&mgr, "BOOKED_BALANCE_PAUSED");
+            assert_eq!(alarms.len(), 2);
+            assert_ne!(alarms[0]["since_ms"], alarms[1]["since_ms"]);
+        }
+
+        #[tokio::test]
+        async fn a_pay_back_pending_past_the_hour_no_longer_explains_a_gap() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            let settlement_id = "1d4a7c0f3e6b9d2a5c8f1e4b7d0a3c6f9e2b5d8a1c4f7e0b3d6a9c2f5e8b1d4a";
+            let payment_id = "6b9e2d5a8c1f4b7e0d3a6c9f2e5b8d1a4c7f0e3b6d9a2c5f8e1b4d7a0c3f6e9b";
+            mgr.db.register_inbound_stability_settlement(settlement_id, payment_id, CHANNEL_ID_HEX, 1_250_000, "user_to_lsp", "{}").unwrap();
+            save_test_connection(&mgr)
+                .execute("UPDATE inbound_stability_settlements SET created_at = ?1", [StableChannelManager::unix_time_secs() - 7_200])
+                .unwrap();
+            user_holds(&fake, 50_000_000 - 1_250_000);
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+        }
+
+        #[tokio::test]
+        async fn a_refund_already_sent_is_reported_before_the_pause() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            let refund_id = refund_a_rejected_trade_fee(&mgr, &fake, 2_150_000).await;
+            let trade_payment_id = "3f9a6c1e8b2d7f4a0c5e9b3d1f6a8c2e4b7d0f9a3c6e1b8d5f2a7c4e0b9d6f13";
+            user_holds(&fake, 30_000_000);
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+            use crate::revenue::{refund_trade_fee, RefundError};
+            assert_eq!(refund_trade_fee(&mgr.db, &fake, trade_payment_id, 300).await, Err(RefundError::RefundPending), "the refund on its way is reported");
+            // It failed: a new one would be money to the user, so it waits, and the claim keeps the failed attempt.
+            let failed = |status| GrpcPayment { payment_id: refund_id.clone(), amount_msat: Some(2_150_000), direction: 1, status: status as i32, ..Default::default() };
+            fake.payments.lock().unwrap().push(failed(PaymentStatus::Failed));
+            assert_eq!(refund_trade_fee(&mgr.db, &fake, trade_payment_id, 301).await, Err(RefundError::Paused));
+            assert_eq!(mgr.db.list_trade_fee_refunds().unwrap()[0].refund_payment_id.as_deref(), Some(refund_id.as_str()));
+            fake.payments.lock().unwrap().last_mut().unwrap().status = PaymentStatus::Succeeded as i32;
+            assert_eq!(refund_trade_fee(&mgr.db, &fake, trade_payment_id, 302).await, Err(RefundError::AlreadyRefunded));
+            assert_eq!(fake.sends.lock().unwrap().iter().filter(|send| send.amount_msat == 2_150_000).count(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_wake_pass_holds_the_top_up_of_a_paused_channel() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // $10 on 10,000 sats of backing, so the 30,000 sats left still cover it and only the books hold the top-up.
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            user_holds(&fake, 30_000_000);
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+            mgr.stable_channels[0].last_stability_payment = 0;
+            mgr.run_tick_plan(&fake as &dyn LdkServerCalls, 80_000.0, TickScope::WokenPeer(COUNTERPARTY_HEX)).await;
+            assert!(top_up_sats_sent(&fake).is_empty());
+            user_holds(&fake, 50_000_000);
+            ticks(&mut mgr, &fake, 1).await;
+            mgr.stable_channels[0].last_stability_payment = 0;
+            mgr.run_tick_plan(&fake as &dyn LdkServerCalls, 80_000.0, TickScope::WokenPeer(COUNTERPARTY_HEX)).await;
+            assert_eq!(top_up_sats_sent(&fake), [2_500], "the pause lifted");
+        }
+
+        #[tokio::test]
+        async fn unreadable_books_hold_top_ups_and_are_reported_daily() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox, _conn) = unreadable_books(50_000_000).await;
+            stable_channels::audit::enable_test_capture();
+            ticks_at(&mut mgr, &fake, 80_000.0, 2).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert!(top_up_sats_sent(&fake).is_empty());
+            assert_eq!(money(&mgr).1, (50.0, 50_000, 0), "and no cut from the gap");
+            let held = top_ups_held(&events);
+            assert_eq!((held.len(), &held[0]["reason"]), (1, &serde_json::json!("books_unreadable")));
+            let day = StableChannelManager::unix_time_secs() / STABILITY_TOP_UP_ALARM_REPEAT_SECS;
+            let failed: Vec<_> = events.iter().filter(|(name, data)| name == "DB_READ_FAILED" && data["op"] == "booked_balance").map(|(_, data)| data.clone()).collect();
+            assert!(!failed.is_empty());
+            assert!(failed.iter().all(|row| row["dedup_key"] == format!("lsp:books-db:booked_balance:{UID}:{day}")));
+        }
+
+        #[tokio::test]
+        async fn books_the_pass_cannot_check_raise_the_daily_alarm_with_what_stops_it() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            for blocking in ["stats_unavailable", "inbox_unreadable"] {
+                let (mut mgr, fake, inbox) = fixture(50.0).await;
+                stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+                // LDK's forwarding totals, or the event inbox, can never be read, so the books can never start and top-ups stay held.
+                if blocking == "stats_unavailable" {
+                    fake.stats_fail.store(true, Ordering::SeqCst);
+                } else {
+                    inbox.lock_for_test().execute_batch("DROP TABLE events;").unwrap();
+                }
+                ticks(&mut mgr, &fake, 59).await;
+                assert!(booked(&mgr).is_none());
+                assert!(ledger_rows(&mgr, "BOOKED_BALANCE_NOT_STARTED").is_empty(), "{blocking}");
+                ticks(&mut mgr, &fake, 2).await;
+                let alarms = ledger_rows(&mgr, "BOOKED_BALANCE_NOT_STARTED");
+                assert_eq!(alarms.len(), 1, "one a day: {blocking}");
+                assert_eq!((&alarms[0]["blocking"], &alarms[0]["ticks_waiting"]), (&serde_json::json!([blocking]), &serde_json::json!(60)));
+            }
+        }
+
+        #[tokio::test]
+        async fn a_surplus_whose_native_cannot_be_saved_is_not_booked() {
+            let (mut mgr, fake, _inbox) = fixture(10.0).await;
+            anchor(&mut mgr, &fake).await;
+            user_holds(&fake, 70_000_000);
+            let conn = save_test_connection(&mgr);
+            conn.execute_batch("CREATE TRIGGER refuse_saves BEFORE UPDATE ON channels BEGIN SELECT RAISE(ABORT, 'refused'); END;").unwrap();
+            ticks(&mut mgr, &fake, 3).await;
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000, "the booking goes with the save");
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").is_empty());
+            conn.execute_batch("DROP TRIGGER refuse_saves;").unwrap();
+            ticks(&mut mgr, &fake, 1).await;
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 70_000_000);
+            assert_eq!(money(&mgr), ((10.0, 10_000, 60_000), (10.0, 10_000, 60_000)));
+        }
+
+        /// The $50 fixture with its books paused: 20,000 sats left the user's side with nothing to explain them.
+        async fn paused_on_a_gap(mgr: &mut StableChannelManager, fake: &FakeLdkServer) {
+            anchor(mgr, fake).await;
+            user_holds(fake, 30_000_000);
+            ticks(mgr, fake, 2).await;
+            assert_eq!(booked(mgr).unwrap().check.state, CheckState::Paused);
+        }
+
+        /// A preview, or a confirm that carries the figures a preview just returned, as the GUI sends it.
+        async fn resolve(mgr: &mut StableChannelManager, fake: &FakeLdkServer, choice: GapChoice, acknowledged: bool) -> ResolveOutcome {
+            let (figures, new) = if acknowledged {
+                let preview = resolve_with(mgr, fake, choice, false, None, (None, None)).await;
+                (Some((preview.actual_sats, preview.gap_sats)), (preview.new_expected_usd, preview.new_backing_sats))
+            } else {
+                (None, (None, None))
+            };
+            resolve_with(mgr, fake, choice, acknowledged, figures, new).await
+        }
+
+        /// A resolution carrying `figures`, the live balance and gap the operator confirms, in sats, and `new`, the target and backing they confirm.
+        async fn resolve_with(
+            mgr: &mut StableChannelManager,
+            fake: &FakeLdkServer,
+            choice: GapChoice,
+            acknowledged: bool,
+            figures: Option<(u64, u64)>,
+            new: (Option<f64>, Option<u64>),
+        ) -> ResolveOutcome {
+            let reason = Some("compared with the wallet's history".to_owned());
+            let (actual_sats, gap_sats) = (figures.map(|(actual, _)| actual), figures.map(|(_, gap)| gap));
+            mgr.resolve_books_gap(CHANNEL_ID_HEX, choice, acknowledged, actual_sats, gap_sats, new.0, new.1, reason, fake as &dyn LdkServerCalls, 100_000.0).await
+        }
+
+        #[tokio::test]
+        async fn a_forward_the_books_have_not_caught_up_is_cut_once_around_a_resolution() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            paused_on_a_gap(&mut mgr, &fake).await;
+            let paused = booked(&mgr).unwrap();
+            // A 5,000-sat spend settles and LDK counts it, but its event never reaches the inbox.
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spending(5_000_000);
+            user_holds(&fake, 25_000_000);
+            for acknowledged in [false, true] {
+                let refused = resolve(&mut mgr, &fake, GapChoice::Spend, acknowledged).await;
+                assert!(!refused.ok && !refused.needs_acknowledgement && refused.status.contains("a forward on it is still to be booked"), "{}", refused.status);
+            }
+            assert_eq!(booked(&mgr).unwrap(), paused);
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            // The next check books it from LDK's totals and cuts it.
+            ticks(&mut mgr, &fake, 1).await;
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.check.state), (45_000_000, CheckState::Paused));
+            assert_eq!(money(&mgr), ((45.0, 45_000, 0), (45.0, 45_000, 0)));
+            let done = resolve(&mut mgr, &fake, GapChoice::Spend, true).await;
+            assert!(done.ok, "{}", done.status);
+            assert_eq!(money(&mgr), ((25.0, 25_000, 0), (25.0, 25_000, 0)), "the spend cut once, then the gap");
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(money(&mgr), ((25.0, 25_000, 0), (25.0, 25_000, 0)), "and nothing more");
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.check.state), (25_000_000, CheckState::Ok));
+        }
+
+        #[tokio::test]
+        async fn a_confirm_applies_only_the_figures_its_preview_showed() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            paused_on_a_gap(&mut mgr, &fake).await;
+            let paused = booked(&mgr).unwrap();
+            let preview = resolve(&mut mgr, &fake, GapChoice::Spend, false).await;
+            assert_eq!((preview.actual_sats, preview.gap_sats), (30_000, 20_000));
+            let unpreviewed = resolve_with(&mut mgr, &fake, GapChoice::Spend, true, None, (None, None)).await;
+            assert!(!unpreviewed.ok && unpreviewed.needs_acknowledgement && unpreviewed.status.starts_with("Preview first."), "{}", unpreviewed.status);
+            let off = resolve_with(&mut mgr, &fake, GapChoice::Spend, true, Some((30_000, 20_006)), (Some(30.0), Some(30_000))).await;
+            assert!(!off.ok && off.needs_acknowledgement && off.status.contains("changed since the preview"), "{}", off.status);
+            assert_eq!((off.actual_sats, off.gap_sats, off.new_expected_usd), (30_000, 20_000, Some(30.0)), "the fresh figures");
+            // Another 1,000 sats leave before the operator confirms what they saw.
+            user_holds(&fake, 29_000_000);
+            let moved = resolve_with(&mut mgr, &fake, GapChoice::Spend, true, Some((30_000, 20_000)), (Some(30.0), Some(30_000))).await;
+            assert!(!moved.ok && moved.needs_acknowledgement && moved.status.contains("changed since the preview"), "{}", moved.status);
+            assert_eq!((moved.actual_sats, moved.gap_sats, moved.new_expected_usd), (29_000, 21_000, Some(29.0)));
+            assert_eq!(booked(&mgr).unwrap(), paused, "nothing changed");
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            assert!(fake.sends.lock().unwrap().is_empty());
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_RESOLVED").is_empty());
+            // Within the tolerance of the fresh figures, the confirm applies.
+            let done = resolve_with(&mut mgr, &fake, GapChoice::Spend, true, Some((29_000, 20_995)), (Some(29.0), Some(29_000))).await;
+            assert!(done.ok, "{}", done.status);
+            assert_eq!(money(&mgr), ((29.0, 29_000, 0), (29.0, 29_000, 0)));
+        }
+
+        #[tokio::test]
+        async fn a_confirm_applies_only_the_target_and_backing_its_preview_showed() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            paused_on_a_gap(&mut mgr, &fake).await;
+            let preview = resolve_with(&mut mgr, &fake, GapChoice::Spend, false, None, (None, None)).await;
+            assert_eq!((preview.actual_sats, preview.gap_sats, preview.new_expected_usd, preview.new_backing_sats), (30_000, 20_000, Some(30.0), Some(30_000)));
+            // The operator lowers the target before confirming: the gap stays the same, the target and backing the confirm would apply do not.
+            assert!(mgr.edit_stable_channel(CHANNEL_ID_HEX, Some(25.0), None, &fake as &dyn LdkServerCalls, 100_000.0).await.ok);
+            let (paused, edited, sent) = (booked(&mgr).unwrap(), money(&mgr), fake.sends.lock().unwrap().len());
+            let stale = resolve_with(&mut mgr, &fake, GapChoice::Spend, true, Some((30_000, 20_000)), (Some(30.0), Some(30_000))).await;
+            assert!(!stale.ok && stale.needs_acknowledgement && stale.status.starts_with("The figures changed since the preview."), "{}", stale.status);
+            assert_eq!((stale.actual_sats, stale.gap_sats, stale.new_expected_usd, stale.new_backing_sats), (30_000, 20_000, Some(25.0), Some(25_000)), "the fresh figures");
+            // A confirm that leaves them out changes nothing either.
+            let unechoed = resolve_with(&mut mgr, &fake, GapChoice::Spend, true, Some((30_000, 20_000)), (None, None)).await;
+            assert!(!unechoed.ok && unechoed.needs_acknowledgement && unechoed.status.starts_with("Preview first."), "{}", unechoed.status);
+            assert_eq!(booked(&mgr).unwrap(), paused, "nothing changed");
+            assert_eq!(money(&mgr), edited);
+            assert_eq!(fake.sends.lock().unwrap().len(), sent);
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_RESOLVED").is_empty());
+            // Within $0.01 and 5 sats of the fresh figures, the confirm applies.
+            let done = resolve_with(&mut mgr, &fake, GapChoice::Spend, true, Some((30_000, 20_000)), (Some(25.005), Some(25_004))).await;
+            assert!(done.ok, "{}", done.status);
+            let ((target, backing, _), _) = money(&mgr);
+            assert_eq!((target, backing), (25.0, 25_000));
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+        }
+
+        #[tokio::test]
+        async fn a_spend_resolution_previews_then_cuts_once_confirmed() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            paused_on_a_gap(&mut mgr, &fake).await;
+            let paused = booked(&mgr).unwrap();
+            stable_channels::audit::enable_test_capture();
+            let preview = resolve(&mut mgr, &fake, GapChoice::Spend, false).await;
+            let events = stable_channels::audit::drain_test_capture();
+            assert_eq!(count_events(&events, "RECONCILE_FORWARDED_COOLDOWN_SET"), 0, "a preview writes no log line");
+            assert!(!preview.ok && preview.needs_acknowledgement, "{}", preview.status);
+            assert_eq!((preview.booked_sats, preview.actual_sats, preview.gap_sats), (50_000, 30_000, 20_000));
+            assert_eq!((preview.new_expected_usd, preview.new_backing_sats), (Some(30.0), Some(30_000)));
+            assert!(preview.status.contains("from $50.00 to $30.00"), "{}", preview.status);
+            assert_eq!(booked(&mgr).unwrap(), paused, "a preview changes nothing");
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            assert!(fake.sends.lock().unwrap().is_empty());
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_RESOLVED").is_empty());
+
+            let done = resolve(&mut mgr, &fake, GapChoice::Spend, true).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert_eq!(count_events(&events, "RECONCILE_FORWARDED_COOLDOWN_SET"), 1, "the applied cut writes its line once");
+            assert!(done.ok && !done.needs_acknowledgement, "{}", done.status);
+            assert_eq!((done.booked_sats, done.actual_sats, done.new_expected_usd, done.new_backing_sats), (50_000, 30_000, Some(30.0), Some(30_000)));
+            assert_eq!(money(&mgr), ((30.0, 30_000, 0), (30.0, 30_000, 0)));
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.check.state, books.check.accepted_gap_msat), (30_000_000, CheckState::Ok, 0));
+            let resolved = ledger_rows(&mgr, "BOOKED_BALANCE_RESOLVED");
+            assert_eq!(resolved.len(), 1);
+            assert_eq!((&resolved[0]["choice"], &resolved[0]["operator"]), (&serde_json::json!("spend"), &serde_json::json!("operator")));
+            assert_eq!((&resolved[0]["reason"], &resolved[0]["actual_msat"]), (&serde_json::json!("compared with the wallet's history"), &serde_json::json!(30_000_000)));
+            assert_eq!(fake.sends.lock().unwrap().len(), 1, "a SYNC for the new target");
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+            assert_eq!(money(&mgr), ((30.0, 30_000, 0), (30.0, 30_000, 0)));
+        }
+
+        #[tokio::test]
+        async fn a_spend_resolution_cuts_a_backing_above_books_that_match_the_balance() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = books_below_an_old_backing().await;
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+            let done = resolve(&mut mgr, &fake, GapChoice::Spend, true).await;
+            assert!(done.ok, "{}", done.status);
+            assert_eq!((done.booked_sats, done.actual_sats, done.gap_sats), (30_000, 30_000, 20_000));
+            assert_eq!(money(&mgr), ((30.0, 30_000, 0), (30.0, 30_000, 0)));
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 30_000_000);
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+        }
+
+        #[tokio::test]
+        async fn a_confirm_is_refused_when_the_balance_moves_while_it_is_checked() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            paused_on_a_gap(&mut mgr, &fake).await;
+            let paused = booked(&mgr).unwrap();
+            let preview = resolve(&mut mgr, &fake, GapChoice::Spend, false).await;
+            assert_eq!((preview.actual_sats, preview.gap_sats, preview.new_backing_sats), (30_000, 20_000, Some(30_000)));
+            // A 100-sat payment leaves the user's side once the confirm has listed the channel, and its event reaches the inbox only after the confirm checks it.
+            let mut after = fake.channels.lock().unwrap().clone();
+            after[0].inbound_capacity_msat -= 100_000;
+            after[0].outbound_capacity_msat += 100_000;
+            after[0].next_outbound_htlc_limit_msat = after[0].outbound_capacity_msat;
+            *fake.channels_after_listing.lock().unwrap() = Some(after);
+            let moved = resolve_with(&mut mgr, &fake, GapChoice::Spend, true, Some((30_000, 20_000)), (preview.new_expected_usd, preview.new_backing_sats)).await;
+            assert!(!moved.ok && moved.needs_acknowledgement && moved.status.starts_with("The figures changed since the preview."), "{}", moved.status);
+            assert_eq!((moved.actual_sats, moved.gap_sats, moved.new_backing_sats), (29_900, 20_100, Some(29_900)), "the fresh figures");
+            assert_eq!(booked(&mgr).unwrap(), paused, "nothing changed");
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            assert!(fake.sends.lock().unwrap().is_empty());
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_RESOLVED").is_empty());
+            // A confirm of the fresh figures applies them.
+            let done = resolve_with(&mut mgr, &fake, GapChoice::Spend, true, Some((moved.actual_sats, moved.gap_sats)), (moved.new_expected_usd, moved.new_backing_sats)).await;
+            assert!(done.ok, "{}", done.status);
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 29_900_000);
+            assert_eq!(mgr.stable_channels[0].backing_sats, 29_900);
+        }
+
+        #[tokio::test]
+        async fn a_payment_to_the_lsp_lowers_backing_and_keeps_the_target() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            anchor(&mut mgr, &fake).await;
+            // The user pays back 5,000 sats under an authorisation that ran out: it is booked and refused, so backing stays above the books.
+            let settlement_id = "9c2f5e8b1d4a7c0f3e6b9d2a5c8f1e4b7d0a3c6f9e2b5d8a1c4f7e0b3d6a9c2f";
+            let payment_id = "2e5b8d1a4c7f0e3b6d9a2c5f8e1b4d7a0c3f6e9b2d5a8c1f4e7b0d3a6c9f2e5b";
+            user_holds(&fake, 45_000_000);
+            mgr.handle_payment_received(vec![expired_signed_pay_back(settlement_id, 5_000_000)], Some(payment_id.to_owned()), Some(5_000_000), &fake, 100_000.0).await;
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+            let preview = resolve(&mut mgr, &fake, GapChoice::PaymentToLsp, false).await;
+            assert!(preview.needs_acknowledgement, "{}", preview.status);
+            assert_eq!((preview.booked_sats, preview.actual_sats, preview.gap_sats), (45_000, 45_000, 5_000));
+            assert_eq!((preview.new_expected_usd, preview.new_backing_sats), (Some(50.0), Some(45_000)));
+            let sent_before = fake.sends.lock().unwrap().len();
+            let done = resolve(&mut mgr, &fake, GapChoice::PaymentToLsp, true).await;
+            assert!(done.ok, "{}", done.status);
+            assert_eq!(money(&mgr), ((50.0, 45_000, 0), (50.0, 45_000, 0)));
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 45_000_000);
+            assert_eq!(fake.sends.lock().unwrap().len(), sent_before + 1, "a SYNC for the lower backing");
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_RESOLVED")[0]["choice"], "payment_to_lsp");
+        }
+
+        #[tokio::test]
+        async fn a_payment_to_the_lsp_lowers_backing_by_the_gap_when_the_user_holds_spare() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // $50 on 50,000 sats of backing with 10,000 spare: the books start on the user's 60,000 sats.
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            mgr.stable_channels[0].native_sats = 10_000;
+            mgr.db.save_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, 50.0, 50_000, 10_000, None).unwrap();
+            user_holds(&fake, 60_000_000);
+            anchor(&mut mgr, &fake).await;
+            // At $110k the user pays the LSP the 4,545 sats above their $50, and nothing books it.
+            user_holds(&fake, 55_455_000);
+            ticks_at(&mut mgr, &fake, 110_000.0, 2).await;
+            let check = booked(&mgr).unwrap().check;
+            assert_eq!((check.state, check.gap_kind), (CheckState::Paused, Some(stable_channels::db::GapKind::Balance)));
+            let reason = || Some("paid the LSP".to_owned());
+            let preview = mgr.resolve_books_gap(CHANNEL_ID_HEX, GapChoice::PaymentToLsp, false, None, None, None, None, reason(), &fake, 110_000.0).await;
+            assert_eq!((preview.booked_sats, preview.actual_sats, preview.gap_sats), (60_000, 55_455, 4_545));
+            assert_eq!((preview.new_expected_usd, preview.new_backing_sats), (Some(50.0), Some(45_455)));
+            let done = mgr.resolve_books_gap(CHANNEL_ID_HEX, GapChoice::PaymentToLsp, true, Some(55_455), Some(4_545), Some(50.0), Some(45_455), reason(), &fake, 110_000.0).await;
+            assert!(done.ok, "{}", done.status);
+            // Backing comes down by the gap, as the wallet lowered its own, and the spare BTC stays the user's.
+            assert_eq!(money(&mgr), ((50.0, 45_455, 10_000), (50.0, 45_455, 10_000)));
+            assert_eq!(booked(&mgr).unwrap().booked_user_msat, 55_455_000);
+            let last = fake.sends.lock().unwrap().len() - 1;
+            assert_eq!((sent_sync_payload(&fake, last)["expected_usd"].clone(), sent_sync_payload(&fake, last)["backing_sats"].clone()), (serde_json::json!(50.0), serde_json::json!(45_455)));
+            ticks_at(&mut mgr, &fake, 110_000.0, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+            assert_eq!(money(&mgr), ((50.0, 45_455, 10_000), (50.0, 45_455, 10_000)));
+        }
+
+        #[tokio::test]
+        async fn a_payment_to_the_lsp_never_leaves_backing_above_the_balance() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // $60 on 60,000 sats of backing; a pay-back booked and refused leaves the books under it, then more leaves unbooked down to 50,000 sats: both gaps at once.
+            for books_sats in [55_000, 54_000] {
+                let (mut mgr, fake, _inbox) = fixture(50.0).await;
+                user_holds(&fake, 60_000_000);
+                assert!(mgr.edit_stable_channel(CHANNEL_ID_HEX, Some(60.0), None, &fake as &dyn LdkServerCalls, 100_000.0).await.ok);
+                anchor(&mut mgr, &fake).await;
+                let paid_msat = (60_000 - books_sats) * 1000;
+                user_holds(&fake, books_sats * 1000);
+                let (settlement_id, payment_id) = ("8b1e4a7d0c3f6b9e2a5d8c1f4b7e0a3d6c9f2b5e8a1d4c7f0b3e6a9d2c5f8b1e", "a3d6c9f2b5e8a1d4c7f0b3e6a9d2c5f8b1e4a7d0c3f6b9e2a5d8c1f4b7e0a3d6");
+                mgr.handle_payment_received(vec![expired_signed_pay_back(settlement_id, paid_msat)], Some(payment_id.to_owned()), Some(paid_msat), &fake, 100_000.0).await;
+                user_holds(&fake, 50_000_000);
+                ticks(&mut mgr, &fake, 2).await;
+                assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused, "books {books_sats}");
+                let preview = resolve(&mut mgr, &fake, GapChoice::PaymentToLsp, false).await;
+                assert_eq!((preview.booked_sats, preview.actual_sats), (books_sats, 50_000));
+                assert_eq!((preview.new_expected_usd, preview.new_backing_sats), (Some(60.0), Some(50_000)), "books {books_sats}");
+                let done = resolve(&mut mgr, &fake, GapChoice::PaymentToLsp, true).await;
+                assert!(done.ok, "{}", done.status);
+                assert_eq!(money(&mgr), ((60.0, 50_000, 0), (60.0, 50_000, 0)), "books {books_sats}");
+                assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000);
+                let last = fake.sends.lock().unwrap().len() - 1;
+                assert_eq!(sent_sync_payload(&fake, last)["backing_sats"], 50_000, "the wallet's balance holds the lower backing");
+            }
+        }
+
+        #[tokio::test]
+        async fn keeping_the_books_lifts_the_pause_and_alarms_only_if_the_gap_grows() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            stable_channels::audit::set_audit_ledger((*mgr.db).clone());
+            paused_on_a_gap(&mut mgr, &fake).await;
+            let done = resolve(&mut mgr, &fake, GapChoice::Keep, true).await;
+            assert!(done.ok, "{}", done.status);
+            assert_eq!((done.gap_sats, done.new_expected_usd, done.new_backing_sats), (20_000, None, None));
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.check.state, books.check.accepted_gap_msat), (50_000_000, CheckState::Ok, 20_000_000));
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "nothing is cut");
+            assert!(fake.sends.lock().unwrap().is_empty(), "nothing to sync");
+            ticks(&mut mgr, &fake, 3).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok, "the gap kept is no gap");
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_PAUSED").len(), 1, "no alarm while it holds");
+            // Another 1,000 sats leave with nothing to explain them.
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            user_holds(&fake, 29_000_000);
+            ticks(&mut mgr, &fake, 2).await;
+            let check = booked(&mgr).unwrap().check;
+            assert_eq!((check.state, check.gap_msat), (CheckState::Paused, 21_000_000));
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_PAUSED").len(), 2, "the grown gap raises its own alarm");
+        }
+
+        #[tokio::test]
+        async fn keeping_books_under_a_higher_backing_pauses_again_only_if_the_backing_grows() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = books_below_an_old_backing().await;
+            ticks(&mut mgr, &fake, 2).await;
+            let done = resolve(&mut mgr, &fake, GapChoice::Keep, true).await;
+            assert!(done.ok, "{}", done.status);
+            let check = booked(&mgr).unwrap().check;
+            assert_eq!((check.state, check.accepted_gap_msat, check.accepted_backing_gap_msat), (CheckState::Ok, 0, 20_000_000));
+            ticks(&mut mgr, &fake, 3).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            // The operator raises the target by $1.50, which the books do not hold either.
+            assert!(mgr.edit_stable_channel(CHANNEL_ID_HEX, Some(51.5), None, &fake as &dyn LdkServerCalls, 100_000.0).await.ok);
+            ticks(&mut mgr, &fake, 2).await;
+            let check = booked(&mgr).unwrap().check;
+            assert_eq!((check.state, check.gap_msat), (CheckState::Paused, 21_500_000));
+        }
+
+        #[tokio::test]
+        async fn keeping_the_books_lets_top_ups_resume_while_the_gap_stays_the_same() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            paused_on_a_gap(&mut mgr, &fake).await;
+            assert!(resolve(&mut mgr, &fake, GapChoice::Keep, true).await.ok);
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.check.accepted_gap_msat, books.accepted_shortfall_msat), (20_000_000, 20_000_000), "the operator saw the balance 20,000 sats below the backing");
+
+            // At $80k the $50 target on 50,000 sats of backing calls for 12,500 sats; the balance is 20,000 below the backing, all of it the shortfall kept.
+            ticks_at(&mut mgr, &fake, 80_000.0, 1).await;
+            assert_eq!(top_up_sats_sent(&fake), [12_500], "the regular tick tops up");
+            outcome(&mut mgr, &fake, "fake-payment-id", Some(12_500_000), false).await;
+            mgr.stable_channels[0].last_stability_payment = 0;
+            mgr.run_tick_plan(&fake as &dyn LdkServerCalls, 80_000.0, TickScope::WokenPeer(COUNTERPARTY_HEX)).await;
+            assert_eq!(top_up_sats_sent(&fake), [12_500, 12_500], "a wake pass tops up too");
+            outcome(&mut mgr, &fake, "fake-payment-id-2", Some(12_500_000), false).await;
+
+            // Another 1,000 sats leave, beyond the shortfall kept: the next wake pass holds the top-up before any tick has checked the books, and the regular tick after it holds it too.
+            user_holds(&fake, 29_000_000);
+            stable_channels::audit::enable_test_capture();
+            mgr.stable_channels[0].last_stability_payment = 0;
+            mgr.run_tick_plan(&fake as &dyn LdkServerCalls, 80_000.0, TickScope::WokenPeer(COUNTERPARTY_HEX)).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            assert_eq!(top_up_hold_reasons(&events), [serde_json::json!("balance_below_backing")]);
+            ticks_at(&mut mgr, &fake, 80_000.0, 1).await;
+            assert_eq!(top_up_sats_sent(&fake), [12_500, 12_500], "held again");
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "nothing is cut");
+        }
+
+        /// One wake pass at $80k with the cooldown cleared, and the top-up holds it recorded.
+        async fn wake_pass_holds(mgr: &mut StableChannelManager, fake: &FakeLdkServer) -> Vec<serde_json::Value> {
+            stable_channels::audit::enable_test_capture();
+            mgr.stable_channels[0].last_stability_payment = 0;
+            mgr.run_tick_plan(fake as &dyn LdkServerCalls, 80_000.0, TickScope::WokenPeer(COUNTERPARTY_HEX)).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            top_up_hold_reasons(&events)
+        }
+
+        #[tokio::test]
+        async fn a_kept_gap_allows_only_the_shortfall_the_operator_saw() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // $40 on 40,000 sats of backing, with 10,000 spare: the books hold 50,000 sats for the user.
+            let (mut mgr, fake, _inbox) = fixture(40.0).await;
+            anchor(&mut mgr, &fake).await;
+            // 30,000 sats leave unbooked, so the books stand 30,000 above the balance but the backing only 20,000.
+            user_holds(&fake, 20_000_000);
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+            assert!(resolve(&mut mgr, &fake, GapChoice::Keep, true).await.ok);
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.check.accepted_gap_msat, books.check.accepted_backing_gap_msat, books.accepted_shortfall_msat), (30_000_000, 0, 20_000_000));
+
+            // At $80k the target calls for 10,000 sats, which the shortfall kept allows.
+            assert!(wake_pass_holds(&mut mgr, &fake).await.is_empty());
+            assert_eq!(top_up_sats_sent(&fake), [10_000]);
+            outcome(&mut mgr, &fake, "fake-payment-id", Some(10_000_000), false).await;
+
+            // Another 10,000 sats leave unbooked: the books gap kept would still cover them, the shortfall kept does not.
+            user_holds(&fake, 10_000_000);
+            assert_eq!(wake_pass_holds(&mut mgr, &fake).await, [serde_json::json!("balance_below_backing")]);
+            assert_eq!(top_up_sats_sent(&fake), [10_000], "no top-up past the shortfall the operator saw");
+            assert_eq!(money(&mgr), ((40.0, 40_000, 10_000), (40.0, 40_000, 10_000)), "nothing is cut");
+        }
+
+        #[tokio::test]
+        async fn a_spend_resolution_after_keeping_the_books_clears_the_kept_shortfall() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            paused_on_a_gap(&mut mgr, &fake).await;
+            assert!(resolve(&mut mgr, &fake, GapChoice::Keep, true).await.ok);
+            assert_eq!(booked(&mgr).unwrap().accepted_shortfall_msat, 20_000_000);
+            // The gap grows by 1,000 sats, the channel pauses again, and the operator resolves it as the user's spend.
+            user_holds(&fake, 29_000_000);
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+            assert!(resolve(&mut mgr, &fake, GapChoice::Spend, true).await.ok);
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.check.accepted_gap_msat, books.check.accepted_backing_gap_msat, books.accepted_shortfall_msat), (29_000_000, 0, 0, 0));
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_RESOLVED").last().unwrap()["after"]["accepted_shortfall_msat"], 0);
+            assert_eq!(mgr.stable_channels[0].backing_sats, 29_000);
+
+            // A later 1,000-sat drop is held at once: nothing of the earlier shortfall is still allowed.
+            user_holds(&fake, 28_000_000);
+            assert_eq!(wake_pass_holds(&mut mgr, &fake).await, [serde_json::json!("balance_below_backing")]);
+            assert!(top_up_sats_sent(&fake).is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_kept_gap_stops_counting_once_the_books_clear_it() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            paused_on_a_gap(&mut mgr, &fake).await;
+            assert!(resolve(&mut mgr, &fake, GapChoice::Keep, true).await.ok);
+            assert_eq!(booked(&mgr).unwrap().accepted_shortfall_msat, 20_000_000);
+            // The 20,000 sats come back with nothing booked, and the next tick's check clears the gap it kept.
+            user_holds(&fake, 50_000_000);
+            ticks(&mut mgr, &fake, 1).await;
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.check.state, books.check.accepted_gap_msat, books.check.accepted_backing_gap_msat), (CheckState::Ok, 0, 0));
+            assert_eq!(books.accepted_shortfall_msat, 20_000_000, "only a resolution rewrites the stored figure");
+
+            // 10,000 sats then leave unbooked, within the old kept shortfall: the wake pass before the next tick holds the top-up.
+            user_holds(&fake, 40_000_000);
+            assert_eq!(wake_pass_holds(&mut mgr, &fake).await, [serde_json::json!("balance_below_backing")]);
+            assert!(top_up_sats_sent(&fake).is_empty());
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "nothing is cut");
+        }
+
+        #[tokio::test]
+        async fn a_spend_after_keeping_the_books_is_weighed_without_the_kept_gap() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // $40 at $100k on 40,000 sats of backing, with 10,000 spare: the books hold the user's 50,000 sats.
+            let (mut mgr, fake, _inbox) = fixture(40.0).await;
+            anchor(&mut mgr, &fake).await;
+            // 10,000 sats leave unbooked, down to the backing, and the operator keeps the books.
+            user_holds(&fake, 40_000_000);
+            ticks(&mut mgr, &fake, 2).await;
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+            assert!(resolve(&mut mgr, &fake, GapChoice::Keep, true).await.ok);
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.check.state, books.check.accepted_gap_msat, books.accepted_shortfall_msat), (CheckState::Ok, 10_000_000, 0));
+            // The pause is lifted: at $80k the target calls for 10,000 sats and the wake pass sends them.
+            assert!(wake_pass_holds(&mut mgr, &fake).await.is_empty());
+            assert_eq!(top_up_sats_sent(&fake), [10_000]);
+            outcome(&mut mgr, &fake, "fake-payment-id", Some(10_000_000), false).await;
+            assert_eq!(money(&mgr), ((40.0, 40_000, 10_000), (40.0, 40_000, 10_000)));
+
+            // A 7,500-sat spend: the 10,000 spare the books show are the gap kept, so all of it comes out of the stable part.
+            *fake.forwarding_stats.lock().unwrap() = totals_after_spending(7_500_000);
+            user_holds(&fake, 32_500_000);
+            stable_channels::audit::enable_test_capture();
+            spend_out_of_the_user(&mut mgr, &fake, 7_500_000).await;
+            ticks(&mut mgr, &fake, 2).await;
+            let events = stable_channels::audit::drain_test_capture();
+            stable_channels::audit::disable_test_capture();
+            let cut_sats: Vec<_> = spend_cuts(&events).iter().map(|cut| cut["stable_sats_spent"].clone()).collect();
+            assert_eq!(cut_sats, [serde_json::json!(7_500)], "cut once");
+            let ((target_usd, backing_sats, native_sats), (saved_usd, saved_backing, saved_native)) = money(&mgr);
+            assert!((target_usd - 32.5).abs() < 1e-9 && (saved_usd - 32.5).abs() < 1e-9, "{target_usd} {saved_usd}");
+            assert_eq!((backing_sats, native_sats, saved_backing, saved_native), (32_500, 10_000, 32_500, 10_000));
+            let spend = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").into_iter().find(|row| row["reason"] == "forward_out").unwrap();
+            assert_eq!((&spend["overflow_msat"], &spend["overflow_balance_before_msat"]), (&serde_json::json!(7_500_000), &serde_json::json!(40_000_000)));
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.uncut, books.check.state, books.check.accepted_gap_msat), (42_500_000, None, CheckState::Ok, 10_000_000));
+        }
+
+        #[tokio::test]
+        async fn a_second_resolution_finds_nothing_to_resolve() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            let unpaused = resolve(&mut mgr, &fake, GapChoice::Spend, false).await;
+            assert_eq!((unpaused.ok, unpaused.status.as_str()), (false, "Nothing to resolve on this channel."), "no books yet");
+            paused_on_a_gap(&mut mgr, &fake).await;
+            assert!(resolve(&mut mgr, &fake, GapChoice::Spend, true).await.ok);
+            for choice in [GapChoice::Spend, GapChoice::PaymentToLsp, GapChoice::Keep] {
+                for acknowledged in [false, true] {
+                    let again = resolve(&mut mgr, &fake, choice, acknowledged).await;
+                    assert_eq!((again.ok, again.needs_acknowledgement, again.status.as_str()), (false, false, "Nothing to resolve on this channel."));
+                }
+            }
+            assert_eq!(money(&mgr), ((30.0, 30_000, 0), (30.0, 30_000, 0)), "cut once");
+            assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_RESOLVED").len(), 1);
+            assert_eq!(fake.sends.lock().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_resolution_that_cannot_be_saved_changes_nothing() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            paused_on_a_gap(&mut mgr, &fake).await;
+            let paused = booked(&mgr).unwrap();
+            let conn = save_test_connection(&mgr);
+            conn.execute_batch("CREATE TRIGGER refuse_resolutions BEFORE INSERT ON ledger_events WHEN NEW.event_type = 'BOOKED_BALANCE_RESOLVED' BEGIN SELECT RAISE(ABORT, 'refused'); END;").unwrap();
+            for choice in [GapChoice::Spend, GapChoice::PaymentToLsp, GapChoice::Keep] {
+                let failed = resolve(&mut mgr, &fake, choice, true).await;
+                assert!(!failed.ok && failed.status.starts_with("DB write failed"), "{}", failed.status);
+                assert_eq!(booked(&mgr).unwrap(), paused);
+                assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            }
+            assert!(fake.sends.lock().unwrap().is_empty());
+            conn.execute_batch("DROP TRIGGER refuse_resolutions;").unwrap();
+            assert!(resolve(&mut mgr, &fake, GapChoice::Spend, true).await.ok);
+            assert_eq!(money(&mgr), ((30.0, 30_000, 0), (30.0, 30_000, 0)));
+        }
+
+        #[tokio::test]
+        async fn a_gap_is_not_resolved_while_the_balance_report_leaves_its_channel_out() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            paused_on_a_gap(&mut mgr, &fake).await;
+            let paused = booked(&mgr).unwrap();
+            // The node's balance report says nothing about the channel, so what it holds in flight is unknown.
+            fake.lightning_balances.lock().unwrap().clear();
+            fake.balances_incomplete.store(true, Ordering::SeqCst);
+            for choice in [GapChoice::Spend, GapChoice::PaymentToLsp, GapChoice::Keep] {
+                for acknowledged in [false, true] {
+                    let refused = resolve_with(&mut mgr, &fake, choice, acknowledged, Some((30_000, 20_000)), (Some(30.0), Some(30_000))).await;
+                    assert_eq!((refused.ok, refused.needs_acknowledgement, refused.status.as_str()), (false, false, "The node's balance report leaves this channel out. Try again shortly."));
+                }
+            }
+            assert_eq!(booked(&mgr).unwrap(), paused, "nothing changed");
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            assert!(fake.sends.lock().unwrap().is_empty());
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_RESOLVED").is_empty());
+            // Once the report lists it again, the resolution goes through.
+            fake.balances_incomplete.store(false, Ordering::SeqCst);
+            assert!(resolve(&mut mgr, &fake, GapChoice::Spend, true).await.ok);
+            assert_eq!(money(&mgr), ((30.0, 30_000, 0), (30.0, 30_000, 0)));
+        }
+
+        #[tokio::test]
+        async fn a_gap_is_not_resolved_while_its_channel_still_has_something_to_book() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, inbox) = fixture(50.0).await;
+            paused_on_a_gap(&mut mgr, &fake).await;
+            inbox.save(&[(unrelated_event(), 0)]).unwrap();
+            let refused = resolve(&mut mgr, &fake, GapChoice::Spend, false).await;
+            assert!(!refused.ok && !refused.needs_acknowledgement && refused.status.contains("events are still waiting"), "{}", refused.status);
+            let id = inbox.oldest().unwrap().unwrap().id;
+            inbox.finish(id).unwrap();
+            // An older daemon's top-up raised backing and is still on the way.
+            book_top_up_the_old_way(&mut mgr, 50_000, 51_500);
+            for choice in [GapChoice::Spend, GapChoice::PaymentToLsp] {
+                let refused = resolve(&mut mgr, &fake, choice, true).await;
+                assert!(!refused.ok && !refused.needs_acknowledgement && refused.status == TOP_UP_ON_ITS_WAY, "{}", refused.status);
+            }
+            assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_RESOLVED").is_empty());
+            assert!(resolve(&mut mgr, &fake, GapChoice::Keep, true).await.ok, "keeping goes through");
+        }
+
+        /// $50 at $100k backed by all of the user's 50,000 sats, paused on a 10,000-sat spend with no event while a 1,546-sat top-up is still on its way to them.
+        async fn paused_while_a_top_up_is_on_its_way(mgr: &mut StableChannelManager, fake: &FakeLdkServer) {
+            anchor(mgr, fake).await;
+            ticks_at(mgr, fake, 97_000.0, 1).await;
+            assert_eq!(top_up_sats_sent(fake), [1_546]);
+            user_holds(fake, 40_000_000);
+            sent_to_the_user(fake, 1_546_000);
+            ticks_at(mgr, fake, 97_000.0, 2).await;
+            assert_eq!(booked(mgr).unwrap().check.state, CheckState::Paused);
+        }
+
+        #[tokio::test]
+        async fn keeping_the_books_goes_through_while_a_top_up_is_on_its_way() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            paused_while_a_top_up_is_on_its_way(&mut mgr, &fake).await;
+            let kept = resolve(&mut mgr, &fake, GapChoice::Keep, true).await;
+            assert!(kept.ok, "{}", kept.status);
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.check.state, books.check.accepted_gap_msat), (50_000_000, CheckState::Ok, 10_000_000));
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "keeping changes neither the books nor the backing");
+            // The top-up lands and is booked once, and the gap stays the one kept.
+            user_holds(&fake, 41_546_000);
+            outcome(&mut mgr, &fake, "fake-payment-id", Some(1_546_000), true).await;
+            ticks_at(&mut mgr, &fake, 97_000.0, 2).await;
+            let books = booked(&mgr).unwrap();
+            assert_eq!((books.booked_user_msat, books.check.state, books.check.accepted_gap_msat), (51_546_000, CheckState::Ok, 10_000_000));
+            assert_eq!(money(&mgr), ((50.0, 51_546, 0), (50.0, 51_546, 0)));
+            assert_eq!(top_up_sats_sent(&fake), [1_546]);
+        }
+
+        #[tokio::test]
+        async fn a_spend_waits_while_a_top_up_is_on_its_way() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            paused_while_a_top_up_is_on_its_way(&mut mgr, &fake).await;
+            let paused = booked(&mgr).unwrap();
+            for choice in [GapChoice::Spend, GapChoice::PaymentToLsp] {
+                for acknowledged in [false, true] {
+                    let refused = resolve(&mut mgr, &fake, choice, acknowledged).await;
+                    assert!(!refused.ok && !refused.needs_acknowledgement && refused.status == TOP_UP_ON_ITS_WAY, "{}", refused.status);
+                }
+            }
+            assert_eq!(booked(&mgr).unwrap(), paused);
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_RESOLVED").is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_spend_waits_for_a_pay_back_still_to_apply_however_old() {
+            let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut mgr, fake, _inbox) = fixture(50.0).await;
+            paused_on_a_gap(&mut mgr, &fake).await;
+            let paused = booked(&mgr).unwrap();
+            // A signed pay-back registered two hours ago, past the books check's wait, can still be applied by a retry.
+            let settlement_id = "787ca9667d7ee073b6fd0f8da63081d5bae618a42f51dca152c8e2dda17ad187";
+            let payment_id = "71d0cbfac6f794a8df1a26589453ffe9e6add2c1c35c47ddd449b655280dec81";
+            mgr.db.register_inbound_stability_settlement(settlement_id, payment_id, CHANNEL_ID_HEX, 1_250_000, "user_to_lsp", "{}").unwrap();
+            save_test_connection(&mgr)
+                .execute("UPDATE inbound_stability_settlements SET created_at = ?1", [StableChannelManager::unix_time_secs() - 7_200])
+                .unwrap();
+            for choice in [GapChoice::Spend, GapChoice::PaymentToLsp] {
+                for acknowledged in [false, true] {
+                    let refused = resolve(&mut mgr, &fake, choice, acknowledged).await;
+                    assert!(!refused.ok && !refused.needs_acknowledgement && refused.status == PAY_BACK_TO_APPLY, "{}", refused.status);
+                }
+            }
+            assert_eq!(booked(&mgr).unwrap(), paused);
+            assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            assert!(ledger_rows(&mgr, "BOOKED_BALANCE_RESOLVED").is_empty());
+            let kept = resolve(&mut mgr, &fake, GapChoice::Keep, true).await;
+            assert!(kept.ok, "keeping goes through: {}", kept.status);
+        }
+
+        /// The spend and receive situations the books decide, each from start to finish.
+        mod books_scenarios {
+            use super::*;
+
+            /// LDK's totals once it has counted these forwards out of the user and into them through the routing channel, with no fees.
+            fn totals_after(spends: &[u64], receives: &[u64]) -> Vec<ChannelForwardingStats> {
+                let (spent, spent_count) = (spends.iter().sum::<u64>(), spends.len() as u64);
+                let (received, received_count) = (receives.iter().sum::<u64>(), receives.len() as u64);
+                vec![
+                    totals(CHANNEL_ID_HEX, 7_350_000 + spent, 3 + spent_count, 4_125_500 + received, 2 + received_count),
+                    totals(ROUTING_CHANNEL_HEX, 4_127_100 + received, 2 + received_count, 7_342_650 + spent, 3 + spent_count),
+                ]
+            }
+
+            /// A forward of `msat` into the user from the routing channel, with no fee, as the event inbox saves it.
+            fn forward_into_the_user(msat: u64) -> Entry {
+                use ldk_server_client::ldk_server_grpc::events::{event_envelope::Event, EventEnvelope, PaymentForwarded};
+                let locator = |channel_id: &str| vec![HtlcLocator { channel_id: channel_id.to_owned(), ..Default::default() }];
+                Entry::Event(EventEnvelope {
+                    event: Some(Event::PaymentForwarded(PaymentForwarded {
+                        prev_htlcs: locator(ROUTING_CHANNEL_HEX),
+                        next_htlcs: locator(CHANNEL_ID_HEX),
+                        outbound_amount_forwarded_msat: msat,
+                        total_fee_earned_msat: Some(0),
+                        ..Default::default()
+                    })),
+                })
+            }
+
+            /// The event of a forward of `msat` into the user from the routing channel, handled.
+            async fn receive(mgr: &mut StableChannelManager, fake: &FakeLdkServer, msat: u64) {
+                forwarded(mgr, fake, OTHER_USER_CHANNEL_ID_DECIMAL, ROUTING_CHANNEL_HEX, Some(USER_CHANNEL_ID_DECIMAL), CHANNEL_ID_HEX, msat, 0).await;
+            }
+
+            /// Takes the oldest event off the inbox, as the event loop does once it is handled.
+            fn finish_oldest(inbox: &Inbox) {
+                let id = inbox.oldest().unwrap().unwrap().id;
+                inbox.finish(id).unwrap();
+            }
+
+            /// The target and backing in memory and as saved.
+            fn target_and_backing(mgr: &StableChannelManager) -> ((f64, u64), (f64, u64)) {
+                let ((usd, backing, _), (saved_usd, saved_backing, _)) = money(mgr);
+                ((usd, backing), (saved_usd, saved_backing))
+            }
+
+            /// The target and backing of every SYNC sent, in order.
+            fn syncs_sent(fake: &FakeLdkServer) -> Vec<(f64, u64)> {
+                let sends = fake.sends.lock().unwrap();
+                sends
+                    .iter()
+                    .filter_map(|send| {
+                        let raw = std::str::from_utf8(send.custom_tlvs.first()?.value.as_ref()).ok()?;
+                        let payload: serde_json::Value = serde_json::from_str(&crate::messages::parse_envelope(raw)?.payload).ok()?;
+                        (payload["type"] == "SYNC_V1").then(|| (payload["expected_usd"].as_f64().unwrap(), payload["backing_sats"].as_u64().unwrap()))
+                    })
+                    .collect()
+            }
+
+            /// The user's side of the 100k channel holds `user_msat`, and a payment of `in_flight_msat` from them is still held by the node, in neither side.
+            fn user_holds_with_a_payment_in_flight(fake: &FakeLdkServer, user_msat: u64, in_flight_msat: u64) {
+                user_holds(fake, user_msat);
+                let lsp_msat = {
+                    let mut channels = fake.channels.lock().unwrap();
+                    channels[0].outbound_capacity_msat -= in_flight_msat;
+                    channels[0].next_outbound_htlc_limit_msat = channels[0].outbound_capacity_msat;
+                    channels[0].outbound_capacity_msat
+                };
+                *fake.lightning_balances.lock().unwrap() = monitor_balances(CHANNEL_ID_HEX, lsp_msat / 1000, &[in_flight_msat], &[]);
+            }
+
+            /// A $50 position on 50,000 sats of backing with `native_sats` spare, its books anchored on the user's whole balance by two regular ticks.
+            async fn anchored_with_spare(native_sats: u64) -> (StableChannelManager, FakeLdkServer) {
+                let user_sats = 50_000 + native_sats;
+                let (mut mgr, fake) = settled_forwards_fixture(native_sats, user_sats);
+                mgr.db.save_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, 50.0, 50_000, native_sats, None).unwrap();
+                mgr.attach_event_inbox(std::sync::Arc::new(Inbox::in_memory()));
+                regular_ticks(&mut mgr, &fake, 2).await;
+                assert_eq!(books_state(&mgr), (user_sats * 1000, CheckState::Ok, 0), "anchored on the second matching reading");
+                (mgr, fake)
+            }
+
+            /// The channel once the user's splice-out locked it at `value_sats`, the user holding `user_msat` with no reserve and the payments in `in_flight_msat` from them still held.
+            fn spliced_out_with_payments_in_flight(fake: &FakeLdkServer, value_sats: u64, user_msat: u64, in_flight_msat: &[u64]) {
+                spliced_out_with_payments_both_ways(fake, value_sats, user_msat, in_flight_msat, &[]);
+            }
+
+            /// The same, with the payments in `to_user_msat` to the user still held too.
+            fn spliced_out_with_payments_both_ways(fake: &FakeLdkServer, value_sats: u64, user_msat: u64, from_user_msat: &[u64], to_user_msat: &[u64]) {
+                let lsp_msat = value_sats * 1000 - user_msat - from_user_msat.iter().chain(to_user_msat).sum::<u64>();
+                let mut channel = make_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, COUNTERPARTY_HEX, value_sats, lsp_msat, true);
+                channel.inbound_capacity_msat = user_msat;
+                channel.funding_txo = Some(ldk_server_client::ldk_server_grpc::types::OutPoint { txid: SPLICE_OUT_TXID.to_owned(), vout: 1 });
+                *fake.channels.lock().unwrap() = vec![channel];
+                *fake.lightning_balances.lock().unwrap() = monitor_balances(CHANNEL_ID_HEX, lsp_msat / 1000, from_user_msat, to_user_msat);
+            }
+
+            #[tokio::test]
+            async fn a_spend_and_a_receive_before_any_tick_are_each_booked() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // $50 at $100k backed by all of the user's 50,000 sats, which the books hold.
+                let (mut mgr, fake, inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                // The user spends 10,000 sats and its event never arrives, and a 15,000-sat receive follows before the next tick.
+                *fake.forwarding_stats.lock().unwrap() = totals_after(&[10_000_000], &[15_000_000]);
+                inbox.save(&[(forward_into_the_user(15_000_000), 0)]).unwrap();
+                user_holds(&fake, 55_000_000);
+                let cuts = tick_cuts(&mut mgr, &fake).await;
+                assert_eq!((cuts.len(), &cuts[0]["source"], &cuts[0]["stable_sats_spent"]), (1, &serde_json::json!("forward_catch_up"), &serde_json::json!(10_000)));
+                assert_eq!(target_and_backing(&mgr), ((40.0, 40_000), (40.0, 40_000)), "the spend comes off the target");
+                assert_eq!(booked(&mgr).unwrap().booked_user_msat, 40_000_000, "the receive is left to its own event");
+                // The receive's event books its sats as spare BTC.
+                receive(&mut mgr, &fake, 15_000_000).await;
+                finish_oldest(&inbox);
+                ticks(&mut mgr, &fake, 2).await;
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.check.state), (55_000_000, CheckState::Ok));
+                assert_eq!(target_and_backing(&mgr), ((40.0, 40_000), (40.0, 40_000)));
+                assert_eq!(syncs_sent(&fake), [(40.0, 40_000)]);
+                assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+            }
+
+            /// One reconcile pass as the event loop runs it after a reconnect.
+            async fn reconnect(mgr: StableChannelManager, fake: &FakeLdkServer) -> StableChannelManager {
+                let db = mgr.db.clone();
+                let shared = tokio::sync::Mutex::new(mgr);
+                crate::event_loop::reconcile_after_reconnect(&shared, &db, fake).await;
+                shared.into_inner()
+            }
+
+            #[tokio::test]
+            async fn a_receive_lost_in_an_event_gap_is_booked_before_the_next_spend() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // $50 at $100k backed by all of the user's 50,000 sats, which the books hold.
+                let (mut mgr, fake, _inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                // A 15,000-sat receive lands while the event stream is down, and its event is lost.
+                *fake.forwarding_stats.lock().unwrap() = totals_after(&[], &[15_000_000]);
+                user_holds(&fake, 65_000_000);
+                let mut mgr = reconnect(mgr, &fake).await;
+                assert_eq!(booked(&mgr).unwrap().booked_user_msat, 65_000_000, "the reconnect books it from LDK's totals");
+                // A 10,000-sat spend is handled live before the next tick: the receive's spare BTC covers it.
+                *fake.forwarding_stats.lock().unwrap() = totals_after(&[10_000_000], &[15_000_000]);
+                user_holds(&fake, 55_000_000);
+                stable_channels::audit::enable_test_capture();
+                spend_out_of_the_user(&mut mgr, &fake, 10_000_000).await;
+                ticks(&mut mgr, &fake, 2).await;
+                let events = stable_channels::audit::drain_test_capture();
+                stable_channels::audit::disable_test_capture();
+                assert!(spend_cuts(&events).is_empty(), "nothing comes off the target");
+                assert_eq!(money(&mgr), ((50.0, 50_000, 5_000), (50.0, 50_000, 5_000)));
+                let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+                let reasons: Vec<_> = changes.iter().map(|row| (row["reason"].clone(), row["delta_msat"].clone())).collect();
+                assert_eq!(reasons, [(serde_json::json!("forward_catch_up"), serde_json::json!(15_000_000)), (serde_json::json!("forward_out"), serde_json::json!(-10_000_000))]);
+                assert_eq!((&changes[1]["overflow_msat"], &changes[1]["overflow_balance_before_msat"]), (&serde_json::json!(0), &serde_json::json!(65_000_000)));
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.check.state, books.uncut), (55_000_000, CheckState::Ok, None));
+            }
+
+            #[tokio::test]
+            async fn the_catch_up_after_a_reconnect_neither_anchors_nor_checks_the_books() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let (mgr, fake, _inbox) = fixture(50.0).await;
+                // Reconnects never anchor the books, however often their reading repeats.
+                let mgr = reconnect(mgr, &fake).await;
+                let mut mgr = reconnect(mgr, &fake).await;
+                assert!(booked(&mgr).is_none());
+                // The SYNC the first reconnect republished arrives, so nothing on its way holds the anchor.
+                assert_eq!(fake.sends.lock().unwrap().len(), 1);
+                outcome(&mut mgr, &fake, "fake-payment-id", Some(1), true).await;
+                anchor(&mut mgr, &fake).await;
+                // 20,000 sats leave unbooked and one check watches the gap.
+                user_holds(&fake, 30_000_000);
+                ticks(&mut mgr, &fake, 1).await;
+                let watching = booked(&mgr).unwrap().check;
+                assert_eq!((watching.state, watching.sightings), (CheckState::Watching, 1));
+                // A 5,000-sat receive's event is lost in a gap: the reconnects book it once and leave the check as it was.
+                *fake.forwarding_stats.lock().unwrap() = totals_after(&[], &[5_000_000]);
+                user_holds(&fake, 35_000_000);
+                let mgr = reconnect(mgr, &fake).await;
+                let mut mgr = reconnect(mgr, &fake).await;
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.check), (55_000_000, watching), "no sighting and no pause");
+                assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").len(), 1);
+                assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+                // The next tick checks the gap again and pauses.
+                ticks(&mut mgr, &fake, 1).await;
+                assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+            }
+
+            #[tokio::test]
+            async fn a_late_forward_event_after_a_receive_is_still_charged() {
+                // $50 at $100k backed by all of the user's 50,000 sats.
+                let (mut mgr, fake, inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                // A 10,000-sat spend, then a 15,000-sat receive, both counted by LDK, while their events wait behind a tick.
+                *fake.forwarding_stats.lock().unwrap() = totals_after(&[10_000_000], &[15_000_000]);
+                inbox.save(&[(forward_out_of_the_user(10_000_000, 0), 0), (forward_into_the_user(15_000_000), 0)]).unwrap();
+                user_holds(&fake, 55_000_000);
+                ticks(&mut mgr, &fake, 1).await;
+                assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "both are left to their events");
+                assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+                // The spend's event arrives with the receive already in the balance, and is charged from books that do not hold the receive yet.
+                spend_out_of_the_user(&mut mgr, &fake, 10_000_000).await;
+                finish_oldest(&inbox);
+                assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)));
+                assert_eq!(syncs_sent(&fake), [(40.0, 40_000)]);
+                // The receive's event then books its sats as spare BTC.
+                receive(&mut mgr, &fake, 15_000_000).await;
+                finish_oldest(&inbox);
+                ticks(&mut mgr, &fake, 2).await;
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.check.state), (55_000_000, CheckState::Ok));
+                assert_eq!(target_and_backing(&mgr), ((40.0, 40_000), (40.0, 40_000)));
+                assert_eq!(syncs_sent(&fake), [(40.0, 40_000)]);
+                assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+            }
+
+            #[tokio::test]
+            async fn a_splice_in_after_a_spend_with_no_event_is_charged_correctly() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // $50 at $100k backed by all of the user's 50,000 sats.
+                let (mut mgr, fake, _inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                // Neither event reaches the daemon: the user spends 10,000 sats, then splices 5,000 in and the channel grows to 105,000.
+                *fake.forwarding_stats.lock().unwrap() = totals_after_spending(10_000_000);
+                spliced(&fake, 105_000, 45_000_000, SPLICE_IN_TXID);
+                stable_channels::audit::enable_test_capture();
+                ticks(&mut mgr, &fake, 1).await;
+                assert_eq!(target_and_backing(&mgr), ((40.0, 40_000), (40.0, 40_000)), "the tick books the spend before the splice");
+                // The lock's event arrives after the tick and books nothing more.
+                splice_locked(&mut mgr, &fake, &format!("{SPLICE_IN_TXID}:1")).await;
+                ticks(&mut mgr, &fake, 2).await;
+                let events = stable_channels::audit::drain_test_capture();
+                stable_channels::audit::disable_test_capture();
+                let cuts = spend_cuts(&events);
+                assert_eq!((cuts.len(), &cuts[0]["source"], &cuts[0]["stable_sats_spent"]), (1, &serde_json::json!("forward_catch_up"), &serde_json::json!(10_000)));
+                assert_eq!(count_events(&events, "SPLICE_OUT_STABLE_DEDUCTED"), 0);
+                assert_eq!(money(&mgr), ((40.0, 40_000, 5_000), (40.0, 40_000, 5_000)), "the 5,000 sats spliced in are spare BTC");
+                let changes = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED");
+                let booked_as: Vec<_> = changes.iter().map(|change| (change["reason"].clone(), change["delta_msat"].clone())).collect();
+                let expected = [("forward_catch_up", -10_000_000), ("splice", 5_000_000)].map(|(reason, delta)| (serde_json::json!(reason), serde_json::json!(delta)));
+                assert_eq!(booked_as, expected);
+                assert_eq!(changes[1]["made_by"], "user");
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.channel_value_sats, books.check.state), (45_000_000, 105_000, CheckState::Ok));
+                assert_eq!(syncs_sent(&fake), [(40.0, 40_000)]);
+            }
+
+            #[tokio::test]
+            async fn no_top_up_is_sent_before_a_spend_with_no_event_is_booked() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // $50 at $100k backed by all of the user's 50,000 sats.
+                let (mut mgr, fake, _inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                // A 10,000-sat spend leaves the balance with no event and LDK has not counted it yet; at $80k the $50 would call for a 12,500-sat top-up.
+                user_holds(&fake, 40_000_000);
+                // The peer wakes before any tick has checked the books.
+                assert_eq!(wake_pass_holds(&mut mgr, &fake).await, [serde_json::json!("balance_below_backing")]);
+                // The regular ticks watch the gap, then pause the channel.
+                stable_channels::audit::enable_test_capture();
+                ticks_at(&mut mgr, &fake, 80_000.0, 1).await;
+                assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Watching);
+                ticks_at(&mut mgr, &fake, 80_000.0, 1).await;
+                let events = stable_channels::audit::drain_test_capture();
+                stable_channels::audit::disable_test_capture();
+                assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+                assert_eq!(top_up_hold_reasons(&events), [serde_json::json!("gap_below"), serde_json::json!("paused")]);
+                assert!(top_up_sats_sent(&fake).is_empty(), "no top-up on a backing the user may have spent");
+                assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+                // LDK counts it: the tick books and cuts it at $80k, and the pause lifts.
+                *fake.forwarding_stats.lock().unwrap() = totals_after_spending(10_000_000);
+                ticks_at(&mut mgr, &fake, 80_000.0, 1).await;
+                assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+                assert_eq!(money(&mgr), ((42.0, 40_000, 0), (42.0, 40_000, 0)));
+                assert!(top_up_sats_sent(&fake).is_empty(), "the cut starts its own cooldown");
+                // Only then is the $42 left topped up to par.
+                ticks_at(&mut mgr, &fake, 80_000.0, 1).await;
+                assert_eq!(top_up_sats_sent(&fake), [12_500]);
+            }
+
+            #[tokio::test]
+            async fn a_trade_on_a_paused_channel_is_checked_against_the_smaller_balance() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // $10 at $100k on 10,000 sats of backing, so 40,000 of the user's 50,000 sats are spare BTC.
+                let (mut mgr, fake, _inbox) = fixture(10.0).await;
+                anchor(&mut mgr, &fake).await;
+                // 30,000 sats leave with nothing to explain them, so the books still hold sats the user no longer has.
+                user_holds(&fake, 20_000_000);
+                ticks(&mut mgr, &fake, 2).await;
+                assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Paused);
+                // A trade to $30 fits the books but not the 19,798 sats the user holds once its fee is paid, so it is refused.
+                let refused_id = "6d3a9f1c4e7b2a5d8c0f3e6b9a2d5c8f1e4b7a0d3c6f9e2b5a8d1c4f7e0b3a6d";
+                let fee = expected_trade_fee_msat(10.0, 30.0, 100_000.0).unwrap();
+                let mut user_msat = 20_000_000 - fee;
+                user_holds(&fake, user_msat);
+                let request = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &"a7".repeat(32), 30.0, 100_000.0);
+                assert_eq!(mgr.handle_trade_payment(&request, Some(refused_id), Some(fee), &fake, 100_000.0).await, Handled::Done);
+                assert_eq!(mgr.db.trade_decision_summary(refused_id).unwrap().unwrap().outcome, "rejected");
+                assert_eq!(target_and_backing(&mgr), ((10.0, 10_000), (10.0, 10_000)));
+                // A trade to $15 fits what the user holds, and its spare BTC is that balance less the new backing, not what the books say.
+                let accepted_id = "c4f7a0d3e6b9c2f5a8d1e4b7c0f3a6d9e2b5c8f1a4d7e0b3c6f9a2d5e8b1c4f7";
+                let fee = expected_trade_fee_msat(10.0, 15.0, 100_000.0).unwrap();
+                user_msat -= fee;
+                user_holds(&fake, user_msat);
+                let request = correlated_trade_envelope(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, &"b8".repeat(32), 15.0, 100_000.0);
+                assert_eq!(mgr.handle_trade_payment(&request, Some(accepted_id), Some(fee), &fake, 100_000.0).await, Handled::Done);
+                assert_eq!(mgr.db.trade_decision_summary(accepted_id).unwrap().unwrap().outcome, "accepted");
+                assert_eq!(user_msat, 19_748_000);
+                assert_eq!(money(&mgr), ((15.0, 14_999, 4_749), (15.0, 14_999, 4_749)));
+            }
+
+            #[tokio::test]
+            async fn the_lsps_own_payments_to_the_user_are_booked_as_receipts() {
+                // $10 at $100k on 10,000 sats of backing, with 40,000 spare.
+                let (mut mgr, fake, _inbox) = fixture(10.0).await;
+                anchor(&mut mgr, &fake).await;
+                // The LSP sends a SYNC and refunds a 2,150-sat trade fee paid before the books started, and both reach the user.
+                assert!(mgr.send_sync_message(&fake, UID, CHANNEL_ID_HEX, 10.0, 10_000, COUNTERPARTY_HEX).await);
+                let sync_id = latest_send_id(&fake);
+                let refund_id = refund_a_rejected_trade_fee(&mgr, &fake, 2_150_000).await;
+                user_holds(&fake, 50_000_000 + 1 + 2_150_000);
+                outcome(&mut mgr, &fake, &sync_id, Some(1), true).await;
+                outcome(&mut mgr, &fake, &refund_id, Some(2_150_000), true).await;
+                assert_eq!(booked_as(&mgr), vec![
+                    (serde_json::json!("lsp_payment"), serde_json::json!(sync_id), serde_json::json!(1)),
+                    (serde_json::json!("lsp_payment"), serde_json::json!(refund_id), serde_json::json!(2_150_000)),
+                ]);
+                assert_eq!(money(&mgr), ((10.0, 10_000, 42_150), (10.0, 10_000, 42_150)), "spare BTC as soon as each is booked");
+                // The ticks find nothing left to book or to watch.
+                ticks(&mut mgr, &fake, 3).await;
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.check.state, books.check.direction), (52_150_001, CheckState::Ok, None));
+                assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").len(), 2, "nothing is booked again as a surplus");
+                assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+                assert_eq!(money(&mgr), ((10.0, 10_000, 42_150), (10.0, 10_000, 42_150)));
+            }
+
+            #[tokio::test]
+            async fn a_spend_booked_in_parts_is_charged_once() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // $50 at $100k backed by all of the user's 50,000 sats.
+                let (mut mgr, fake, _inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                // One 10,000-sat payment leaves in two parts, 6,000 and 4,000, both counted by LDK.
+                *fake.forwarding_stats.lock().unwrap() = totals_after_spends(&[6_000_000, 4_000_000]);
+                user_holds(&fake, 40_000_000);
+                stable_channels::audit::enable_test_capture();
+                // The first part's event books and cuts it.
+                spend_out_of_the_user(&mut mgr, &fake, 6_000_000).await;
+                assert_eq!(money(&mgr), ((44.0, 44_000, 0), (44.0, 44_000, 0)));
+                assert!(syncs_sent(&fake).is_empty(), "the balance, which the second part has left too, does not hold the backing");
+                // The second part's event is late, so the tick books it from LDK's totals and cuts it.
+                ticks(&mut mgr, &fake, 1).await;
+                assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)));
+                // The late event then finds it booked.
+                spend_out_of_the_user(&mut mgr, &fake, 4_000_000).await;
+                ticks(&mut mgr, &fake, 2).await;
+                let events = stable_channels::audit::drain_test_capture();
+                stable_channels::audit::disable_test_capture();
+                let parts: Vec<_> = spend_cuts(&events).iter().map(|cut| (cut["source"].clone(), cut["stable_sats_spent"].clone())).collect();
+                let expected = [("forward", 6_000), ("forward_catch_up", 4_000)].map(|(source, sats)| (serde_json::json!(source), serde_json::json!(sats)));
+                assert_eq!(parts, expected);
+                assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)), "$10 in all for the 10,000 sats");
+                let booked_as: Vec<_> = ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").iter().map(|change| (change["reason"].clone(), change["delta_msat"].clone())).collect();
+                let expected = [("forward_out", -6_000_000), ("forward_catch_up", -4_000_000)].map(|(reason, delta)| (serde_json::json!(reason), serde_json::json!(delta)));
+                assert_eq!(booked_as, expected);
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.uncut, books.check.state), (40_000_000, None, CheckState::Ok));
+                assert_eq!(syncs_sent(&fake), [(40.0, 40_000)]);
+            }
+
+            #[tokio::test]
+            async fn a_payment_still_in_flight_is_not_charged() {
+                // $50 at $100k on 50,000 sats of backing, with 10,000 spare.
+                let (mut mgr, fake) = anchored_with_spare(10_000).await;
+                // An 8,000-sat payment from the user is still in flight when a 5,000-sat one settles and its event is handled.
+                channel_reports(&fake, 47_000_000, &[8_000_000], &[]);
+                forwards_counted(&fake, 5_000_000, 1);
+                forward_out(&mut mgr, &fake, 5_000).await;
+                assert_eq!(money(&mgr), ((50.0, 50_000, 5_000), (50.0, 50_000, 5_000)), "spare BTC covers the settled payment");
+                regular_ticks(&mut mgr, &fake, 2).await;
+                assert_eq!(books_state(&mgr), (55_000_000, CheckState::Ok, 0), "sats that can still come back are no gap");
+                // It fails and its sats come back: nothing was charged for it, so nothing is undone.
+                channel_reports(&fake, 55_000_000, &[], &[]);
+                regular_ticks(&mut mgr, &fake, 2).await;
+                assert_eq!(books_state(&mgr), (55_000_000, CheckState::Ok, 0));
+                assert_eq!(money(&mgr), ((50.0, 50_000, 5_000), (50.0, 50_000, 5_000)));
+                assert!(fake.sends.lock().unwrap().is_empty(), "the target never moved");
+            }
+
+            #[tokio::test]
+            async fn an_operator_target_above_the_balance_is_not_cut_later() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // The operator sets $65 at $100k on a user holding 50,000 sats, so backing stands 15,000 above the balance.
+                let (mut mgr, fake, _inbox) = fixture(65.0).await;
+                assert_eq!(money(&mgr), ((65.0, 65_000, 0), (65.0, 65_000, 0)));
+                anchor(&mut mgr, &fake).await;
+                ticks(&mut mgr, &fake, 4).await;
+                let check = booked(&mgr).unwrap().check;
+                assert_eq!((check.state, check.gap_kind, check.gap_msat), (CheckState::Paused, Some(stable_channels::db::GapKind::Backing), 15_000_000), "left to the operator");
+                assert_eq!(money(&mgr), ((65.0, 65_000, 0), (65.0, 65_000, 0)), "never cut on its own");
+                // A later 5,000-sat spend comes off the target by its own amount only.
+                *fake.forwarding_stats.lock().unwrap() = totals_after_spending(5_000_000);
+                user_holds(&fake, 45_000_000);
+                spend_out_of_the_user(&mut mgr, &fake, 5_000_000).await;
+                ticks(&mut mgr, &fake, 3).await;
+                assert_eq!(money(&mgr), ((60.0, 60_000, 0), (60.0, 60_000, 0)));
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.check.state, books.check.gap_msat), (45_000_000, CheckState::Paused, 15_000_000));
+                assert!(fake.sends.lock().unwrap().is_empty(), "no SYNC while backing stands above the balance");
+            }
+
+            #[tokio::test]
+            async fn a_claimed_top_up_is_never_read_as_a_spend() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // $50 at $100k backed by all of the user's 50,000 sats; the price falls to $80k and the tick tops the user up.
+                let (mut mgr, fake, _inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                ticks_at(&mut mgr, &fake, 80_000.0, 1).await;
+                assert_eq!(top_up_sats_sent(&fake), [12_500]);
+                // The wallet claims it, and the channel update that credits the user's side lags behind.
+                sent_to_the_user(&fake, 12_500_000);
+                outcome(&mut mgr, &fake, "fake-payment-id", Some(12_500_000), true).await;
+                assert_eq!(booked(&mgr).unwrap().booked_user_msat, 62_500_000);
+                stable_channels::audit::enable_test_capture();
+                ticks_at(&mut mgr, &fake, 80_000.0, 2).await;
+                assert_eq!(money(&mgr), ((50.0, 62_500, 0), (50.0, 62_500, 0)), "the claim is no spend");
+                // The user spends 5,000 sats while the update still lags, and only that spend is charged.
+                *fake.forwarding_stats.lock().unwrap() = totals_after_spending(5_000_000);
+                user_holds(&fake, 45_000_000);
+                sent_to_the_user(&fake, 12_500_000);
+                spend_out_of_the_user_at(&mut mgr, &fake, 5_000_000, 80_000.0).await;
+                assert_eq!(money(&mgr), ((46.0, 57_500, 0), (46.0, 57_500, 0)));
+                assert!(syncs_sent(&fake).is_empty(), "the balance without the lagging update does not hold the backing");
+                // The update lands, the books and the balance agree, and the SYNC retry publishes the cut.
+                user_holds(&fake, 57_500_000);
+                ticks_at(&mut mgr, &fake, 80_000.0, 2).await;
+                mgr.reconcile_unless_hydrated(&fake as &dyn LdkServerCalls, 80_000.0).await;
+                let events = stable_channels::audit::drain_test_capture();
+                stable_channels::audit::disable_test_capture();
+                let cuts = spend_cuts(&events);
+                assert_eq!((cuts.len(), &cuts[0]["stable_sats_spent"]), (1, &serde_json::json!(5_000)));
+                assert_eq!(money(&mgr), ((46.0, 57_500, 0), (46.0, 57_500, 0)));
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.check.state), (57_500_000, CheckState::Ok));
+                assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+                assert_eq!(top_up_sats_sent(&fake), [12_500], "the claim covered the drift");
+                assert_eq!(syncs_sent(&fake), [(46.0, 57_500)]);
+            }
+
+            #[tokio::test]
+            async fn a_redelivered_forward_is_not_charged_again() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // $50 at $100k backed by all of the user's 50,000 sats.
+                let (mut mgr, fake, inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                stable_channels::audit::enable_test_capture();
+                // A 10,000-sat spend's event is saved and handled, and the daemon stops before taking it off the inbox.
+                *fake.forwarding_stats.lock().unwrap() = totals_after_spending(10_000_000);
+                user_holds(&fake, 40_000_000);
+                inbox.save(&[(forward_out_of_the_user(10_000_000, 0), 0)]).unwrap();
+                spend_out_of_the_user(&mut mgr, &fake, 10_000_000).await;
+                assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)));
+                // Meanwhile a 5,000-sat payment from the user is in flight.
+                user_holds_with_a_payment_in_flight(&fake, 35_000_000, 5_000_000);
+                // After the restart the inbox hands the same event over again.
+                let mut mgr = restarted(&mgr);
+                mgr.reconcile_unless_hydrated(&fake as &dyn LdkServerCalls, 100_000.0).await;
+                mgr.attach_event_inbox(inbox.clone());
+                spend_out_of_the_user(&mut mgr, &fake, 10_000_000).await;
+                finish_oldest(&inbox);
+                assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)), "the books already hold it");
+                ticks(&mut mgr, &fake, 2).await;
+                // The payment in flight fails and its sats come back.
+                fake.lightning_balances.lock().unwrap().clear();
+                user_holds(&fake, 40_000_000);
+                ticks(&mut mgr, &fake, 2).await;
+                let events = stable_channels::audit::drain_test_capture();
+                stable_channels::audit::disable_test_capture();
+                assert_eq!(spend_cuts(&events).len(), 1);
+                assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)));
+                assert_eq!(ledger_rows(&mgr, "BOOKED_BALANCE_CHANGED").len(), 1, "booked once");
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.uncut, books.check.state), (40_000_000, None, CheckState::Ok));
+                assert_eq!(syncs_sent(&fake), [(40.0, 40_000)]);
+            }
+
+            #[tokio::test]
+            async fn a_late_forward_event_beside_a_payment_in_flight_is_charged_once() {
+                // $50 at $100k backed by all of the user's 50,000 sats.
+                let (mut mgr, fake) = anchored_forwards_fixture().await;
+                // 10,000 sats are spent and counted by LDK while their event is late, and 5,000 more are in flight.
+                channel_reports(&fake, 35_000_000, &[5_000_000], &[]);
+                forwards_counted(&fake, 10_000_000, 1);
+                regular_ticks(&mut mgr, &fake, 1).await;
+                assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)), "the tick books and cuts the spend");
+                assert!(syncs_sent(&fake).is_empty(), "the wallet's balance without the payment in flight does not hold the backing yet");
+                // The late event finds the spend already booked.
+                forward_out(&mut mgr, &fake, 10_000).await;
+                regular_ticks(&mut mgr, &fake, 2).await;
+                assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)));
+                assert!(syncs_sent(&fake).is_empty(), "nothing is published while the payment is in flight");
+                // The payment in flight fails and its sats come back.
+                channel_reports(&fake, 40_000_000, &[], &[]);
+                regular_ticks(&mut mgr, &fake, 2).await;
+                assert_eq!(books_state(&mgr), (40_000_000, CheckState::Ok, 0));
+                assert_eq!(money(&mgr), ((40.0, 40_000, 0), (40.0, 40_000, 0)));
+                assert_book_sync(&fake, 40.0, 40_000);
+            }
+
+            #[tokio::test]
+            async fn a_splice_out_beside_a_payment_in_flight_comes_out_of_spare_btc() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // $50 at $100k on 50,000 sats of backing, with 10,000 spare.
+                let (mut mgr, fake) = anchored_with_spare(10_000).await;
+                // An 8,000-sat payment from the user is in flight when their 10,000-sat splice-out locks and the channel shrinks to 90,000.
+                spliced_out_with_payments_in_flight(&fake, 90_000, 42_000_000, &[8_000_000]);
+                splice_locked(&mut mgr, &fake, &format!("{SPLICE_OUT_TXID}:1")).await;
+                assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "spare BTC covers the splice-out");
+                regular_ticks(&mut mgr, &fake, 2).await;
+                assert_eq!(books_state(&mgr), (50_000_000, CheckState::Ok, 0));
+                // The payment fails and its sats come back.
+                spliced_out_with_payments_in_flight(&fake, 90_000, 50_000_000, &[]);
+                regular_ticks(&mut mgr, &fake, 2).await;
+                assert_eq!(books_state(&mgr), (50_000_000, CheckState::Ok, 0));
+                assert_eq!(booked(&mgr).unwrap().channel_value_sats, 90_000);
+                assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+                assert!(fake.sends.lock().unwrap().is_empty(), "the target never moved");
+            }
+
+            fn splices(mgr: &StableChannelManager) -> Vec<serde_json::Value> {
+                ledger_rows(mgr, "BOOKED_BALANCE_CHANGED").into_iter().filter(|row| row["reason"] == "splice").collect()
+            }
+
+            #[tokio::test]
+            async fn a_user_splice_out_with_a_payment_to_them_in_flight_is_weighed_at_the_lock() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // $50 at $100k backed by all of the user's 50,000 sats; the price falls 3% and a 1,546-sat top-up goes out.
+                let (mut mgr, fake, _inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                ticks_at(&mut mgr, &fake, 97_000.0, 1).await;
+                assert_eq!(top_up_sats_sent(&fake), [1_546]);
+                // While it is still in flight the user takes 20,000 sats out on chain; even with it counted as theirs, their side fell by about as much.
+                spliced_out_with_payments_both_ways(&fake, 80_000, 30_000_000, &[], &[1_546_000]);
+                stable_channels::audit::enable_test_capture();
+                mgr.handle_channel_ready(CHANNEL_ID_HEX.into(), USER_CHANNEL_ID_DECIMAL.into(), Some(format!("{SPLICE_OUT_TXID}:1")), &fake as &dyn LdkServerCalls, 97_000.0).await;
+                let mut events = stable_channels::audit::drain_test_capture();
+                let booked_splices = splices(&mgr);
+                assert_eq!(booked_splices.len(), 1, "weighed at the lock");
+                assert_eq!((&booked_splices[0]["made_by"], &booked_splices[0]["delta_msat"]), (&serde_json::json!("user"), &serde_json::json!(-20_000_000)));
+                // Cut once, at the lock's price: 20,000 sats at $97k are $19.40.
+                let cut_to = |mgr: &StableChannelManager| (mgr.stable_channels[0].expected_usd.0, mgr.stable_channels[0].backing_sats);
+                let (target, backing) = cut_to(&mgr);
+                assert!((target - 30.6).abs() < 1e-6 && backing == 30_000, "{target} {backing}");
+                // The price falls further, and the splice-out's cut stays as it was.
+                ticks_at(&mut mgr, &fake, 80_000.0, 2).await;
+                events.extend(stable_channels::audit::drain_test_capture());
+                stable_channels::audit::disable_test_capture();
+                assert_eq!(splices(&mgr).len(), 1);
+                assert_eq!(count_events(&events, "SPLICE_OUT_STABLE_DEDUCTED"), 1);
+                assert!((cut_to(&mgr).0 - 30.6).abs() < 1e-6, "{:?}", cut_to(&mgr));
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.channel_value_sats, books.check.state), (30_000_000, 80_000, CheckState::Ok));
+            }
+
+            #[tokio::test]
+            async fn a_user_splice_out_beside_a_large_pending_credit_goes_to_the_operator() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // $50 at $100k backed by all of the user's 50,000 sats.
+                let (mut mgr, fake, _inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                // The user takes 20,000 sats out on chain while a 10,000-sat payment to them is in flight; with it counted as theirs, their side fell by only 10,000.
+                spliced_out_with_payments_both_ways(&fake, 80_000, 30_000_000, &[], &[10_000_000]);
+                stable_channels::audit::enable_test_capture();
+                splice_locked(&mut mgr, &fake, &format!("{SPLICE_OUT_TXID}:1")).await;
+                let booked_splices = splices(&mgr);
+                assert_eq!(booked_splices.len(), 1);
+                assert_eq!((&booked_splices[0]["made_by"], &booked_splices[0]["delta_msat"]), (&serde_json::json!("lsp"), &serde_json::json!(0)));
+                assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "nothing is cut");
+                // The gap it leaves on the books holds the top-up a price drop asks for, and pauses the channel for the operator.
+                ticks_at(&mut mgr, &fake, 80_000.0, 2).await;
+                let events = stable_channels::audit::drain_test_capture();
+                stable_channels::audit::disable_test_capture();
+                assert_eq!(count_events(&events, "SPLICE_OUT_STABLE_DEDUCTED"), 0);
+                assert!(top_up_sats_sent(&fake).is_empty(), "no top-up while the gap holds them");
+                assert!(!top_ups_held(&events).is_empty());
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.channel_value_sats), (50_000_000, 80_000));
+                assert_eq!((books.check.state, books.check.gap_msat), (CheckState::Paused, 20_000_000));
+                assert_eq!(splices(&mgr).len(), 1);
+                assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            }
+
+            #[tokio::test]
+            async fn a_channel_listed_with_no_capacity_keeps_its_target() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // $50 at $100k backed by all of the user's 50,000 sats.
+                let (mut mgr, fake, _inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                // For a while the node lists the open channel with no capacity on either side, only the user's reserve.
+                {
+                    let mut channels = fake.channels.lock().unwrap();
+                    channels[0].inbound_capacity_msat = 0;
+                    channels[0].outbound_capacity_msat = 0;
+                    channels[0].next_outbound_htlc_limit_msat = 0;
+                }
+                ticks(&mut mgr, &fake, 3).await;
+                assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "never cut from the listing");
+                // The price falls meanwhile, and nothing is paid on a backing the listing cannot show.
+                stable_channels::audit::enable_test_capture();
+                ticks_at(&mut mgr, &fake, 80_000.0, 2).await;
+                let events = stable_channels::audit::drain_test_capture();
+                stable_channels::audit::disable_test_capture();
+                assert!(top_up_sats_sent(&fake).is_empty());
+                assert_eq!(top_up_hold_reasons(&events), [serde_json::json!("balance_below_backing")]);
+                // The listing is back to normal: the books never moved, and the drift is topped up on the $50 kept.
+                user_holds(&fake, 50_000_000);
+                ticks_at(&mut mgr, &fake, 80_000.0, 1).await;
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.check.state), (50_000_000, CheckState::Ok));
+                assert!(ledger_rows(&mgr, "BOOKED_BALANCE_MISMATCH").is_empty());
+                assert_eq!(top_up_sats_sent(&fake), [12_500]);
+                assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+                assert!(syncs_sent(&fake).is_empty());
+            }
+
+            #[tokio::test]
+            async fn a_pay_back_the_lsp_cannot_match_after_a_top_up_claim_is_not_cut() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // $50 at $100k backed by all of the user's 50,000 sats; at $80k the tick tops the user up and the wallet claims it.
+                let (mut mgr, fake, _inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                ticks_at(&mut mgr, &fake, 80_000.0, 1).await;
+                assert_eq!(top_up_sats_sent(&fake), [12_500]);
+                user_holds(&fake, 62_500_000);
+                outcome(&mut mgr, &fake, "fake-payment-id", Some(12_500_000), true).await;
+                assert_eq!(money(&mgr), ((50.0, 62_500, 0), (50.0, 62_500, 0)));
+                // Back at $100k before the next tick, an older wallet pays the 12,500 sats back with the unsigned marker, which matches no channel.
+                user_holds(&fake, 50_000_000);
+                let pay_back_id = "5b8e1d4a7c0f3b6e9d2a5c8f1b4e7a0d3c6f9b2e5a8d1c4f7b0e3a6d9c2f5b8e";
+                stable_channels::audit::enable_test_capture();
+                mgr.handle_payment_received(vec![stability_marker()], Some(pay_back_id.to_owned()), Some(12_500_000), &fake, 100_000.0).await;
+                let events = stable_channels::audit::drain_test_capture();
+                stable_channels::audit::disable_test_capture();
+                assert!(events.iter().any(|(name, data)| name == "STABILITY_RECEIVE_UNATTRIBUTED" && data["payment_id"] == pay_back_id));
+                // The books still hold the top-up the channel no longer does, so the channel pauses and nothing is cut.
+                ticks(&mut mgr, &fake, 3).await;
+                let check = booked(&mgr).unwrap().check;
+                assert_eq!((check.state, check.gap_msat), (CheckState::Paused, 12_500_000));
+                assert_eq!(money(&mgr), ((50.0, 62_500, 0), (50.0, 62_500, 0)));
+                assert!(syncs_sent(&fake).is_empty());
+                // The operator resolves it as a payment to the LSP: backing comes down to the balance and the target stays.
+                let done = resolve(&mut mgr, &fake, GapChoice::PaymentToLsp, true).await;
+                assert!(done.ok, "{}", done.status);
+                assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+                assert_eq!(booked(&mgr).unwrap().booked_user_msat, 50_000_000);
+                assert_eq!(syncs_sent(&fake), [(50.0, 50_000)]);
+            }
+
+            #[tokio::test]
+            async fn a_payment_a_tick_saw_leave_that_then_failed_is_never_charged() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // $50 at $100k backed by all of the user's 50,000 sats.
+                let (mut mgr, fake, _inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                // A tick sees 10,000 sats leave for a payment the node does not list yet.
+                user_holds(&fake, 40_000_000);
+                ticks(&mut mgr, &fake, 1).await;
+                assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Watching);
+                // Within the minute it fails, and 10,000 sats arrive for the user and 10,000 leave with no event or total.
+                *fake.forwarding_stats.lock().unwrap() = totals_after(&[], &[10_000_000]);
+                receive(&mut mgr, &fake, 10_000_000).await;
+                user_holds(&fake, 50_000_000);
+                ticks(&mut mgr, &fake, 3).await;
+                let check = booked(&mgr).unwrap().check;
+                assert_eq!((check.state, check.gap_msat), (CheckState::Paused, 10_000_000), "a gap with no record is the operator's to resolve");
+                assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)), "the failed payment is never charged");
+                // Resolved as the user's spend, it comes out of the sats received and the target stays.
+                let done = resolve(&mut mgr, &fake, GapChoice::Spend, true).await;
+                assert!(done.ok, "{}", done.status);
+                assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.check.state), (50_000_000, CheckState::Ok));
+                assert!(fake.sends.lock().unwrap().is_empty(), "the target and backing never moved");
+            }
+
+            #[tokio::test]
+            async fn a_resolution_waits_to_publish_while_a_payment_is_in_flight() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // $50 at $100k backed by all of the user's 50,000 sats, paused with 30,000 left on the user's side.
+                let (mut mgr, fake, _inbox) = fixture(50.0).await;
+                paused_on_a_gap(&mut mgr, &fake).await;
+                // 5,000 of those 30,000 sats are in a payment from the user still in flight when the operator resolves the gap as the user's spend.
+                user_holds_with_a_payment_in_flight(&fake, 25_000_000, 5_000_000);
+                let done = resolve(&mut mgr, &fake, GapChoice::Spend, true).await;
+                assert!(done.ok, "{}", done.status);
+                assert_eq!(money(&mgr), ((30.0, 30_000, 0), (30.0, 30_000, 0)));
+                assert!(syncs_sent(&fake).is_empty(), "the wallet's balance without the payment in flight does not hold the backing yet");
+                regular_ticks(&mut mgr, &fake, 2).await;
+                assert!(syncs_sent(&fake).is_empty(), "nothing is published while the payment is in flight");
+                // The payment settles, LDK counts it and its event is handled.
+                *fake.forwarding_stats.lock().unwrap() = totals_after(&[5_000_000], &[]);
+                fake.lightning_balances.lock().unwrap().clear();
+                user_holds(&fake, 25_000_000);
+                spend_out_of_the_user(&mut mgr, &fake, 5_000_000).await;
+                regular_ticks(&mut mgr, &fake, 2).await;
+                assert_eq!(money(&mgr), ((25.0, 25_000, 0), (25.0, 25_000, 0)));
+                let books = booked(&mgr).unwrap();
+                assert_eq!((books.booked_user_msat, books.check.state), (25_000_000, CheckState::Ok));
+                assert_eq!(syncs_sent(&fake), [(25.0, 25_000)], "one SYNC, with the figures the wallet's balance holds");
+            }
+
+            /// $50 on 50,000 sats of backing with 10,000 spare, 2,000 of them in a payment from the user still in flight, which the books count as the user's and the listing does not; then a 5,000-sat spend is booked and cut from the spare BTC.
+            async fn cut_beside_a_payment_in_flight() -> (StableChannelManager, FakeLdkServer) {
+                let (mut mgr, fake, _inbox) = fixture(50.0).await;
+                mgr.stable_channels[0].native_sats = 10_000;
+                mgr.db.save_channel(CHANNEL_ID_HEX, USER_CHANNEL_ID_DECIMAL, 50.0, 50_000, 10_000, None).unwrap();
+                user_holds(&fake, 60_000_000);
+                anchor(&mut mgr, &fake).await;
+                user_holds_with_a_payment_in_flight(&fake, 58_000_000, 2_000_000);
+                ticks(&mut mgr, &fake, 1).await;
+                *fake.forwarding_stats.lock().unwrap() = totals_after(&[5_000_000], &[]);
+                user_holds_with_a_payment_in_flight(&fake, 53_000_000, 2_000_000);
+                spend_out_of_the_user(&mut mgr, &fake, 5_000_000).await;
+                assert_eq!(booked(&mgr).unwrap().booked_user_msat, 55_000_000);
+                assert_eq!(money(&mgr), ((50.0, 50_000, 5_000), (50.0, 50_000, 5_000)));
+                (mgr, fake)
+            }
+
+            /// At $110k an older wallet pays the 4,545 sats above its $50 back with the unsigned marker; the records it writes.
+            async fn unsigned_pay_back_at_110k(mgr: &mut StableChannelManager, fake: &FakeLdkServer, pay_back_id: &str) -> Vec<(String, serde_json::Value)> {
+                stable_channels::audit::enable_test_capture();
+                mgr.handle_payment_received(vec![stability_marker()], Some(pay_back_id.to_owned()), Some(4_545_000), fake, 110_000.0).await;
+                let events = stable_channels::audit::drain_test_capture();
+                stable_channels::audit::disable_test_capture();
+                events
+            }
+
+            fn inferred(events: &[(String, serde_json::Value)], pay_back_id: &str) -> bool {
+                events.iter().any(|(name, data)| name == "STABILITY_RECEIVED_RECONCILED" && data["payment_id"] == pay_back_id)
+            }
+
+            #[tokio::test]
+            async fn an_unsigned_pay_back_after_a_cut_is_matched_once_the_channel_is_listed_again() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let (mut mgr, fake) = cut_beside_a_payment_in_flight().await;
+                // The next tick lists the channel, which the pay-back is then matched against.
+                ticks(&mut mgr, &fake, 1).await;
+                assert_eq!(mgr.listed_user_sats.get(&UID), Some(&53_000));
+                let pay_back_id = "e1b4d7a0c3f6e9b2d5a8c1f4e7b0d3a6c9f2e5b8d1a4c7f0e3b6d9a2c5f8e1b4";
+                user_holds_with_a_payment_in_flight(&fake, 53_000_000 - 4_545_000, 2_000_000);
+                let events = unsigned_pay_back_at_110k(&mut mgr, &fake, pay_back_id).await;
+                assert!(inferred(&events, pay_back_id), "matched to the channel");
+                assert_eq!(money(&mgr), ((50.0, 45_455, 5_000), (50.0, 45_455, 5_000)));
+                assert_eq!(booked(&mgr).unwrap().booked_user_msat, 55_000_000 - 4_545_000);
+                ticks_at(&mut mgr, &fake, 110_000.0, 2).await;
+                assert_eq!(booked(&mgr).unwrap().check.state, CheckState::Ok);
+            }
+
+            #[tokio::test]
+            async fn an_unsigned_pay_back_after_a_booked_spend_is_not_inferred_before_the_channel_is_listed_again() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let (mut mgr, fake) = cut_beside_a_payment_in_flight().await;
+                assert_eq!(mgr.listed_user_sats.get(&UID), None, "the booked spend left no listed side");
+                let pay_back_id = "4c7f0a3d6b9e2c5f8a1d4b7e0c3f6a9d2b5e8c1f4a7d0b3e6c9f2a5d8b1e4c7f";
+                user_holds_with_a_payment_in_flight(&fake, 53_000_000 - 4_545_000, 2_000_000);
+                let events = unsigned_pay_back_at_110k(&mut mgr, &fake, pay_back_id).await;
+                assert!(!inferred(&events, pay_back_id));
+                assert!(events.iter().any(|(name, data)| name == "STABILITY_RECEIVE_UNATTRIBUTED" && data["payment_id"] == pay_back_id && data["candidates"] == 0));
+                assert_eq!(money(&mgr), ((50.0, 50_000, 5_000), (50.0, 50_000, 5_000)), "nothing is settled on the channel");
+                assert_eq!(booked(&mgr).unwrap().booked_user_msat, 55_000_000, "and nothing is booked");
+            }
+
+            #[tokio::test]
+            async fn an_unsigned_pay_back_right_after_a_cut_that_read_the_listing_is_matched() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // $50 at $100k backed by all of the user's 50,000 sats; a 5,000-sat spend is cut from the target, and the SYNC that follows reads the listing.
+                let (mut mgr, fake, _inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                *fake.forwarding_stats.lock().unwrap() = totals_after(&[5_000_000], &[]);
+                user_holds(&fake, 45_000_000);
+                spend_out_of_the_user(&mut mgr, &fake, 5_000_000).await;
+                assert_eq!(money(&mgr), ((45.0, 45_000, 0), (45.0, 45_000, 0)));
+                assert_eq!(syncs_sent(&fake), [(45.0, 45_000)]);
+                assert_eq!(mgr.listed_user_sats.get(&UID), Some(&45_000), "the listing the SYNC read");
+                // At $110k an older wallet pays the 4,091 sats above its $45 back with the unsigned marker, before any tick.
+                let pay_back_id = "2d5a8c1f4b7e0d3a6c9f2b5e8d1a4c7f0b3e6d9a2c5f8b1e4d7a0c3f6b9e2d5a";
+                user_holds(&fake, 45_000_000 - 4_091_000);
+                stable_channels::audit::enable_test_capture();
+                mgr.handle_payment_received(vec![stability_marker()], Some(pay_back_id.to_owned()), Some(4_091_000), &fake, 110_000.0).await;
+                let events = stable_channels::audit::drain_test_capture();
+                stable_channels::audit::disable_test_capture();
+                assert!(inferred(&events, pay_back_id), "matched to the channel");
+                assert_eq!(booked(&mgr).unwrap().booked_user_msat, 45_000_000 - 4_091_000);
+                let ((_, backing_sats, _), _) = money(&mgr);
+                assert_eq!(backing_sats, 40_909, "the backing gives up what was paid");
+            }
+
+            #[tokio::test]
+            async fn an_inbox_that_cannot_be_read_clears_the_listed_side() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let (mut mgr, fake, inbox) = fixture(50.0).await;
+                anchor(&mut mgr, &fake).await;
+                assert_eq!(mgr.listed_user_sats.get(&UID), Some(&50_000));
+                inbox.lock_for_test().execute_batch("DROP TABLE events;").unwrap();
+                ticks(&mut mgr, &fake, 1).await;
+                assert_eq!(mgr.listed_user_sats.get(&UID), None);
+                let pay_back_id = "9b2e5d8a1c4f7b0e3d6a9c2f5b8e1d4a7c0f3b6e9d2a5c8f1b4e7d0a3c6f9b2e";
+                user_holds(&fake, 50_000_000 - 4_545_000);
+                let events = unsigned_pay_back_at_110k(&mut mgr, &fake, pay_back_id).await;
+                assert!(!inferred(&events, pay_back_id));
+                assert_eq!(money(&mgr), ((50.0, 50_000, 0), (50.0, 50_000, 0)));
+            }
+
+            /// The target to the cent, backing and native, in memory and as saved.
+            fn money_to_the_cent(mgr: &StableChannelManager) -> ((String, u64, u64), (String, u64, u64)) {
+                let ((usd, backing, native), (saved_usd, saved_backing, saved_native)) = money(mgr);
+                ((format!("{usd:.2}"), backing, native), (format!("{saved_usd:.2}"), saved_backing, saved_native))
+            }
+
+            fn at(usd: &str, backing_sats: u64, native_sats: u64) -> ((String, u64, u64), (String, u64, u64)) {
+                ((usd.to_owned(), backing_sats, native_sats), (usd.to_owned(), backing_sats, native_sats))
+            }
+
+            /// $25 at $100k on 25,000 sats of backing with 25,000 spare, then a 30,000-sat spend while the price is cold: 5,000 sats of it are beyond the spare BTC, and its cut waits.
+            async fn a_spend_beyond_spare_waits() -> (StableChannelManager, FakeLdkServer) {
+                let (mut mgr, fake, _inbox) = fixture(25.0).await;
+                anchor(&mut mgr, &fake).await;
+                *fake.forwarding_stats.lock().unwrap() = totals_after(&[30_000_000], &[]);
+                user_holds(&fake, 20_000_000);
+                spend_out_of_the_user_at(&mut mgr, &fake, 30_000_000, 0.0).await;
+                assert_eq!(target_and_backing(&mgr), ((25.0, 25_000), (25.0, 25_000)), "nothing is cut without a price");
+                (mgr, fake)
+            }
+
+            /// Ticks once at `btc_price` with the audit capture on, and the cuts it made.
+            async fn cuts_at(mgr: &mut StableChannelManager, fake: &FakeLdkServer, btc_price: f64) -> Vec<serde_json::Value> {
+                stable_channels::audit::enable_test_capture();
+                ticks_at(mgr, fake, btc_price, 1).await;
+                let events = stable_channels::audit::drain_test_capture();
+                stable_channels::audit::disable_test_capture();
+                spend_cuts(&events)
+            }
+
+            #[tokio::test]
+            async fn a_waiting_cut_keeps_its_overflow_after_a_top_up_is_claimed() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                // $25 at $100k on 25,000 sats of backing with 25,000 spare; at $80k the tick sends a 6,250-sat top-up.
+                let (mut mgr, fake, _inbox) = fixture(25.0).await;
+                anchor(&mut mgr, &fake).await;
+                ticks_at(&mut mgr, &fake, 80_000.0, 1).await;
+                assert_eq!(top_up_sats_sent(&fake), [6_250]);
+                // A 30,000-sat spend while the price is cold: 5,000 sats of it are beyond the spare BTC.
+                *fake.forwarding_stats.lock().unwrap() = totals_after(&[30_000_000], &[]);
+                user_holds(&fake, 20_000_000);
+                spend_out_of_the_user_at(&mut mgr, &fake, 30_000_000, 0.0).await;
+                // The top-up is claimed before the cut lands, raising backing to 31,250 and the books to 26,250.
+                user_holds(&fake, 26_250_000);
+                outcome(&mut mgr, &fake, "fake-payment-id", Some(6_250_000), true).await;
+                assert_eq!(target_and_backing(&mgr), ((25.0, 31_250), (25.0, 31_250)));
+                assert_eq!(booked(&mgr).unwrap().booked_user_msat, 26_250_000);
+                // The cut takes the 5,000 sats the booking found, at the tick's $80k, and nothing the top-up added.
+                let cuts = cuts_at(&mut mgr, &fake, 80_000.0).await;
+                assert_eq!(cuts.len(), 1);
+                assert_eq!((&cuts[0]["total_sats_spent"], &cuts[0]["stable_sats_spent"]), (&serde_json::json!(30_000), &serde_json::json!(5_000)));
+                assert_eq!(format!("{:.2}", cuts[0]["usd_deducted"].as_f64().unwrap()), "4.00");
+                assert_eq!(money_to_the_cent(&mgr), at("21.00", 26_250, 0));
+                assert_eq!(booked(&mgr).unwrap().uncut, None);
+                assert!(cuts_at(&mut mgr, &fake, 80_000.0).await.is_empty(), "the next tick cuts nothing");
+                assert_eq!(money_to_the_cent(&mgr), at("21.00", 26_250, 0));
+            }
+
+            #[tokio::test]
+            async fn a_waiting_cut_keeps_its_overflow_after_a_pay_back() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let (mut mgr, fake) = a_spend_beyond_spare_waits().await;
+                // Before the cut lands the price is $110k, and the wallet pays back the 2,273 sats above its $25, so backing falls to 22,727.
+                user_holds(&fake, 20_000_000 - 2_273_000);
+                let record = signed_stability_record(&fresh_hex_id(), CHANNEL_ID_HEX, 2_273_000, stable_channels::stable::StabilityPaymentDirection::UserToLsp, 25.0);
+                mgr.handle_payment_received(vec![record], Some(fresh_hex_id()), Some(2_273_000), &fake, 110_000.0).await;
+                assert_eq!(target_and_backing(&mgr), ((25.0, 22_727), (25.0, 22_727)));
+                assert_eq!(booked(&mgr).unwrap().booked_user_msat, 17_727_000);
+                // The cut still takes the 5,000 sats the booking found, at $110k.
+                let cuts = cuts_at(&mut mgr, &fake, 110_000.0).await;
+                assert_eq!(cuts.len(), 1);
+                assert_eq!(cuts[0]["stable_sats_spent"], 5_000);
+                assert_eq!(format!("{:.2}", cuts[0]["usd_deducted"].as_f64().unwrap()), "5.50");
+                assert_eq!(money_to_the_cent(&mgr), at("19.50", 17_727, 0));
+                assert_eq!(booked(&mgr).unwrap().uncut, None);
+            }
+
+            #[tokio::test]
+            async fn spends_waiting_together_are_cut_by_their_own_overflows() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let (mut mgr, fake) = a_spend_beyond_spare_waits().await;
+                // Still cold: 20,000 sats arrive, then a 15,000-sat spend that they cover.
+                *fake.forwarding_stats.lock().unwrap() = totals_after(&[30_000_000], &[20_000_000]);
+                user_holds(&fake, 40_000_000);
+                receive(&mut mgr, &fake, 20_000_000).await;
+                *fake.forwarding_stats.lock().unwrap() = totals_after(&[30_000_000, 15_000_000], &[20_000_000]);
+                user_holds(&fake, 25_000_000);
+                spend_out_of_the_user_at(&mut mgr, &fake, 15_000_000, 0.0).await;
+                assert_eq!(booked(&mgr).unwrap().booked_user_msat, 25_000_000);
+                assert_eq!(target_and_backing(&mgr), ((25.0, 25_000), (25.0, 25_000)));
+                // One cut for both: the first spend's 5,000 sats and none of the second, so 5,000 of the receipt stay spare.
+                let cuts = cuts_at(&mut mgr, &fake, 100_000.0).await;
+                assert_eq!(cuts.len(), 1);
+                assert_eq!((&cuts[0]["total_sats_spent"], &cuts[0]["stable_sats_spent"]), (&serde_json::json!(45_000), &serde_json::json!(5_000)));
+                assert_eq!(money_to_the_cent(&mgr), at("20.00", 20_000, 5_000));
+                assert_eq!(booked(&mgr).unwrap().uncut, None);
+            }
+
+            /// $25 at $100k with 25,000 spare, then a spend of 30,000,400 msat handled at `btc_price`, and a tick at $100k: the cut either made, and the money after it.
+            async fn the_cut_of_a_spend_handled_at(btc_price: f64) -> (serde_json::Value, ((String, u64, u64), (String, u64, u64))) {
+                let (mut mgr, fake, _inbox) = fixture(25.0).await;
+                anchor(&mut mgr, &fake).await;
+                *fake.forwarding_stats.lock().unwrap() = totals_after(&[30_000_400], &[]);
+                user_holds(&fake, 19_999_600);
+                stable_channels::audit::enable_test_capture();
+                spend_out_of_the_user_at(&mut mgr, &fake, 30_000_400, btc_price).await;
+                ticks_at(&mut mgr, &fake, 100_000.0, 1).await;
+                let events = stable_channels::audit::drain_test_capture();
+                stable_channels::audit::disable_test_capture();
+                let cuts = spend_cuts(&events);
+                assert_eq!(cuts.len(), 1, "cut once, at ${btc_price}");
+                assert_eq!(booked(&mgr).unwrap().uncut, None);
+                let mut cut = cuts[0].clone();
+                cut.as_object_mut().unwrap().remove("source");
+                (cut, money_to_the_cent(&mgr))
+            }
+
+            #[tokio::test]
+            async fn an_immediate_cut_and_a_deferred_cut_of_the_same_spend_agree() {
+                let _guard = AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let (immediate, after_immediate) = the_cut_of_a_spend_handled_at(100_000.0).await;
+                let (deferred, after_deferred) = the_cut_of_a_spend_handled_at(0.0).await;
+                assert_eq!(immediate, deferred);
+                assert_eq!(after_immediate, after_deferred);
+                // 30,001 sats spent, 5,001 of them beyond the spare BTC.
+                assert_eq!((&immediate["total_sats_spent"], &immediate["stable_sats_spent"]), (&serde_json::json!(30_001), &serde_json::json!(5_001)));
+                assert_eq!(after_immediate, at("20.00", 19_999, 0));
+            }
         }
     }
 }

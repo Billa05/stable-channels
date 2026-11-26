@@ -640,6 +640,7 @@ pub enum RefundError {
     AlreadyRefunded,
     RefundPending,
     OutcomeUnknown,
+    Paused,
     Send(String),
     Db(String),
 }
@@ -651,6 +652,7 @@ impl RefundError {
             RefundError::AlreadyRefunded => "This trade fee was already refunded".into(),
             RefundError::RefundPending => "A refund for this trade fee is still in flight".into(),
             RefundError::OutcomeUnknown => "A refund was started but its outcome is unknown; check Payments before retrying".into(),
+            RefundError::Paused => "Payments to this user are paused until the gap on their channel is resolved.".into(),
             RefundError::Send(error) => format!("Refund keysend failed: {error}"),
             RefundError::Db(error) => format!("Refund bookkeeping failed: {error}"),
         }
@@ -669,6 +671,9 @@ pub async fn refund_trade_fee(
     let Some(decision) = decision.filter(|d| d.outcome == "rejected") else {
         return Err(RefundError::NotRejectedTradeFee);
     };
+    // A refund is money going to the user, so none is sent while the books of their channel are paused; what an earlier attempt did is still reported first.
+    let paused_now = || crate::stable_manager::parse_user_channel_id(&decision.user_channel_id).is_some_and(|uid| crate::stable_manager::books_paused(db, uid));
+    let paused = paused_now();
     let details = |payment_id: String| ldk.get_payment_details(GetPaymentDetailsRequest { payment_id });
     let received = details(trade_payment_id.to_owned()).await.map_err(|e| RefundError::Send(e.to_string()))?.payment;
     let amount_msat = received
@@ -677,9 +682,12 @@ pub async fn refund_trade_fee(
         .filter(|amount| *amount > 0)
         .ok_or(RefundError::NotRejectedTradeFee)?;
     let (preimage, expected_payment_id) = stable_channels::trade::trade_fee_refund_preimage(trade_payment_id);
+    // Whether this call holds the claim it would take back: one it wrote, or a failed one it took over.
+    let mut claimed_here = true;
     if let Some(existing) =
         db.claim_trade_fee_refund(trade_payment_id, amount_msat, &decision.counterparty, now, Some(&expected_payment_id)).map_err(db_error)?
     {
+        claimed_here = false;
         let Some(previous) = existing.refund_payment_id else {
             // A claim written before refunds carried a deterministic id: nothing can say whether it left.
             return Err(RefundError::OutcomeUnknown);
@@ -687,17 +695,33 @@ pub async fn refund_trade_fee(
         let status = details(previous.clone()).await.map_err(|e| RefundError::Send(e.to_string()))?.payment.map(|p| p.status);
         match status {
             Some(s) if s == PaymentStatus::Failed as i32 => {
+                if paused {
+                    return Err(RefundError::Paused);
+                }
                 if !db.retake_failed_trade_fee_refund(trade_payment_id, &previous, now).map_err(db_error)? {
                     return Err(RefundError::RefundPending);
                 }
+                claimed_here = true;
             },
             Some(s) if s == PaymentStatus::Succeeded as i32 => return Err(RefundError::AlreadyRefunded),
             Some(_) => return Err(RefundError::RefundPending),
             // LDK holds no payment under the id this refund always uses: the earlier attempt never
             // left. Sending the same preimage again can only produce that same payment, never a second refund.
+            None if previous == expected_payment_id && paused => return Err(RefundError::Paused),
             None if previous == expected_payment_id => {},
             None => return Err(RefundError::RefundPending),
         }
+    } else if paused {
+        // Nothing was sent, so the claim just written is taken back.
+        let _ = db.release_trade_fee_refund(trade_payment_id, Some(&expected_payment_id));
+        return Err(RefundError::Paused);
+    }
+    // A pause saved while the node was asked above holds the refund too; a claim this call made is taken back, and one a concurrent refund holds is left to it.
+    if paused_now() {
+        if claimed_here {
+            let _ = db.release_trade_fee_refund(trade_payment_id, Some(&expected_payment_id));
+        }
+        return Err(RefundError::Paused);
     }
     let request = SpontaneousSendRequest {
         amount_msat,

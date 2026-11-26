@@ -41,7 +41,7 @@ use sc_protos::stable::{
     AUDIT_LOG_PATH, CANCEL_QUEUED_SPLICE_PATH, EDIT_STABLE_CHANNEL_PATH, GET_PRICE_PATH,
     LDK_LOG_PATH, LIST_CHANNEL_LEDGER_EVENTS_PATH, LIST_QUEUED_SPLICES_PATH,
     LIST_SETTLEMENT_PAYMENTS_PATH, LIST_STABLE_CHANNELS_PATH, QUEUE_SPLICE_IN_PATH,
-    REGISTER_PUSH_PATH, RELEASE_STABILITY_PAYMENT_PATH,
+    REGISTER_PUSH_PATH, RELEASE_STABILITY_PAYMENT_PATH, RESOLVE_BOOKS_GAP_PATH,
 };
 use ldk_server_client::ldk_server_grpc::endpoints::{
     BOLT11_RECEIVE_PATH, BOLT11_SEND_PATH, BOLT12_RECEIVE_PATH, BOLT12_SEND_PATH,
@@ -280,6 +280,10 @@ fn build_router(state: AppState) -> Router {
         .route(
             &format!("/{}", EDIT_STABLE_CHANNEL_PATH),
             post(handlers::stable_channels::edit_stable_channel),
+        )
+        .route(
+            &format!("/{}", RESOLVE_BOOKS_GAP_PATH),
+            post(handlers::stable_channels::resolve_books_gap),
         )
         .route(
             &format!("/{}", RELEASE_STABILITY_PAYMENT_PATH),
@@ -631,6 +635,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn resolve_books_gap_answers_only_behind_auth() {
+        use axum::http::{Request, StatusCode};
+        use prost::Message;
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let router = build_router(offline_state(dir.path()));
+        let path = format!("/{}", RESOLVE_BOOKS_GAP_PATH);
+        let body = sc_protos::stable::ResolveBooksGapRequest { channel_id: "7c3e9a".into(), choice: 1, ..Default::default() }.encode_to_vec();
+        let unauthenticated = router
+            .clone()
+            .oneshot(Request::post(&path).body(axum::body::Body::from(body.clone())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        let signed = Request::post(&path)
+            .header("x-auth", auth::build_auth_header(&[0x42; API_KEY_LEN], &body))
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let answered = router.oneshot(signed).await.unwrap();
+        assert_eq!(answered.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(answered.into_body(), usize::MAX).await.unwrap();
+        let response = sc_protos::stable::ResolveBooksGapResponse::decode(bytes).unwrap();
+        // The manager has not loaded its channels, so it answers without asking the node.
+        assert!(!response.ok && response.status.contains("still loading"), "{}", response.status);
     }
 
     #[test]

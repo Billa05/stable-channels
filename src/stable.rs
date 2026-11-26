@@ -191,35 +191,59 @@ pub fn reconcile_forwarded(
     total_forwarded_sats: u64,
     price: f64,
 ) -> Option<f64> {
-    if (sc.expected_usd.0 <= 0.0 && sc.backing_sats == 0) || price <= 0.0 {
+    let usd_deducted = cut_forwarded(sc, user_sats, total_forwarded_sats, price)?;
+    set_forwarded_cooldown(sc);
+    Some(usd_deducted)
+}
+
+/// The cut `reconcile_forwarded` makes to the target and backing, with no cooldown and no log line, so a caller can preview it.
+pub fn cut_forwarded(
+    sc: &mut StableChannel,
+    user_sats: u64,
+    total_forwarded_sats: u64,
+    price: f64,
+) -> Option<f64> {
+    let overflow_sats = stable_overflow_sats(user_sats, total_forwarded_sats, sc.backing_sats);
+    let usd_deducted = cut_overflow(sc, overflow_sats, price)?;
+    // An overflow used up native, so the balance left is all stable: this forward explains its own overflow plus a sat of msat rounding, and a lower balance is another spend left in backing for its own event.
+    let remaining_user_sats = user_sats.saturating_sub(total_forwarded_sats);
+    if sc.backing_sats <= remaining_user_sats.saturating_add(1) {
+        sc.backing_sats = remaining_user_sats;
+        recompute_native(sc);
+    }
+    Some(usd_deducted)
+}
+
+/// The sats of a spend of `spent_sats` from `user_sats` that the spare BTC above `backing_sats` cannot cover, so they come out of the stable part.
+pub fn stable_overflow_sats(user_sats: u64, spent_sats: u64, backing_sats: u64) -> u64 {
+    spent_sats.saturating_sub(user_sats.saturating_sub(backing_sats))
+}
+
+/// Takes `overflow_sats` out of the stable part: backing by the overflow and the target by its value at `price`, neither below zero; the target's drop, or None when nothing is cut.
+pub fn cut_overflow(sc: &mut StableChannel, overflow_sats: u64, price: f64) -> Option<f64> {
+    if (sc.expected_usd.0 <= 0.0 && sc.backing_sats == 0) || price <= 0.0 || overflow_sats == 0 {
         return None;
     }
-
-    let native_sats = user_sats.saturating_sub(sc.backing_sats);
-    let overflow_sats = total_forwarded_sats.saturating_sub(native_sats);
-
-    if overflow_sats == 0 {
-        return None; // Fully covered by native BTC
-    }
-
     let usd_to_deduct = overflow_sats as f64 / SATS_IN_BTC as f64 * price;
     let old_expected = sc.expected_usd.0;
     let new_expected = (old_expected - usd_to_deduct).max(0.0);
-
     sc.expected_usd = USD::from_f64(new_expected);
-    // An overflow means native was fully consumed, so the remaining balance is all stable. This
-    // forward explains its own overflow plus one sat of msat rounding. A lower balance is another
-    // spend, which stays in backing until its own event deducts it.
-    let remaining_user_sats = user_sats.saturating_sub(total_forwarded_sats);
-    let after_own_overflow = sc.backing_sats.saturating_sub(overflow_sats);
-    sc.backing_sats = if after_own_overflow > remaining_user_sats.saturating_add(1) {
-        after_own_overflow
-    } else {
-        remaining_user_sats
-    };
+    sc.backing_sats = sc.backing_sats.saturating_sub(overflow_sats);
     sc.native_sats = 0;
     recompute_native(sc);
+    // Report the target drop only: past the zero boundary the rest of the overflow is surplus.
+    Some(old_expected - new_expected)
+}
 
+/// `cut_overflow` with the cooldown and log line `reconcile_forwarded` sets with a cut.
+pub fn reconcile_overflow(sc: &mut StableChannel, overflow_sats: u64, price: f64) -> Option<f64> {
+    let usd_deducted = cut_overflow(sc, overflow_sats, price)?;
+    set_forwarded_cooldown(sc);
+    Some(usd_deducted)
+}
+
+/// The cooldown and log line that go with a cut `cut_forwarded` made, once it is applied.
+pub fn set_forwarded_cooldown(sc: &mut StableChannel) {
     // Set cooldown so stability check doesn't immediately re-fire on a price micro-tick
     let cooldown_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -237,9 +261,6 @@ pub fn reconcile_forwarded(
             "new_native_sats": sc.native_sats,
         }),
     );
-
-    // Report the target drop only: past the zero boundary the rest of the overflow is surplus.
-    Some(old_expected - new_expected)
 }
 
 /// Pre-deduct stable balance for a known outgoing amount (e.g. splice-out).

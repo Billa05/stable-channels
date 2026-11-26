@@ -347,6 +347,7 @@ fn Dialogs() -> Element {
 		Some(Dialog::ConfirmSend(kind)) => rsx! { confirm::ConfirmSendDialog { kind } },
 		Some(Dialog::RefundTradeFee) => rsx! { revenue::RefundTradeFeeDialog {} },
 		Some(Dialog::ReleaseStabilityPayment) => rsx! { channel_ledger::ReleaseStabilityPaymentDialog {} },
+		Some(Dialog::ResolveBooksGap) => rsx! { stable_channels::ResolveBooksGapDialog {} },
 		None => rsx! {},
 	}
 }
@@ -1053,5 +1054,236 @@ mod tests {
 		let html = dioxus_ssr::render(&dom);
 		assert!(html.contains("Send 2,000 sats back to"));
 		assert!(html.contains("Send refund"));
+	}
+
+	const PAUSED_SINCE_MS: i64 = 1_764_200_000_000;
+
+	/// A stable user on the Stable tab whose books are in `state`.
+	fn books_channel(uid: &str, state: Option<&str>, gap_sats: u64, kind: Option<&str>, accepted_sats: u64) -> sc_rest_client::sc_protos::stable::StableChannelInfo {
+		sc_rest_client::sc_protos::stable::StableChannelInfo {
+			channel_id: format!("7c3e9a{uid}"),
+			user_channel_id: uid.into(),
+			counterparty: format!("02{uid}"),
+			expected_usd: 50.0,
+			expected_msats: 50_000_000,
+			booked_sats: state.map(|_| 50_000),
+			books_state: state.map(str::to_owned),
+			books_gap_sats: state.map(|_| gap_sats),
+			books_gap_since_ms: (gap_sats > 0).then_some(PAUSED_SINCE_MS),
+			books_accepted_gap_sats: state.map(|_| accepted_sats),
+			books_gap_kind: kind.map(str::to_owned),
+			..Default::default()
+		}
+	}
+
+	#[component]
+	fn BooksHarness(channels: Vec<sc_rest_client::sc_protos::stable::StableChannelInfo>) -> Element {
+		let ctx = use_context_provider(|| {
+			let mut conn = Connection::new();
+			conn.status = ConnectionStatus::Connected;
+			AppCtx::new(conn, Forms::default(), Nav { active_tab: ActiveTab::StableChannels, ..Default::default() }, Prefs::default(), false)
+		});
+		use_hook(move || {
+			let mut data = ctx.data;
+			data.write().stable_channels = Some(sc_rest_client::sc_protos::stable::ListStableChannelsResponse { channels: channels.clone() });
+		});
+		rsx! { CurrentTab {} }
+	}
+
+	fn render_books(channels: Vec<sc_rest_client::sc_protos::stable::StableChannelInfo>) -> String {
+		let mut dom = VirtualDom::new_with_props(BooksHarness, BooksHarnessProps { channels });
+		dom.rebuild_in_place();
+		dioxus_ssr::render(&dom)
+	}
+
+	#[test]
+	fn a_paused_channel_shows_its_gap_and_a_resolve_button() {
+		let since = crate::format::local_datetime((PAUSED_SINCE_MS / 1000) as u64);
+		let html = render_books(vec![
+			books_channel("41", Some("paused"), 20_000, Some("balance"), 500),
+			books_channel("42", Some("paused"), 12_000, Some("backing"), 0),
+			books_channel("43", Some("paused"), 7_000, None, 0),
+		]);
+		assert!(html.contains(">Paused</span>"));
+		assert!(html.contains(&format!("Paused since {since}: the user holds 20,000 sats less than the books")));
+		assert!(html.contains(&format!("Paused since {since}: the stable part is 12,000 sats above the books")));
+		assert!(html.contains(&format!("Paused since {since}: the user holds 7,000 sats less than the books")), "a gap of unknown kind reads as the balance's");
+		assert_eq!(html.matches("Resolve</button>").count(), 3, "every paused row offers Resolve");
+		assert!(!html.contains("Accepted gap"), "a paused row shows its gap, not what was accepted before");
+	}
+
+	#[test]
+	fn healthy_channels_show_no_resolve_button() {
+		let html = render_books(vec![
+			books_channel("51", Some("ok"), 0, None, 1_200),
+			books_channel("52", Some("watching"), 9_000, Some("balance"), 0),
+			books_channel("53", None, 0, None, 0),
+		]);
+		assert!(html.contains(">Books OK</span>") && html.contains(">Checking</span>"));
+		assert!(html.contains("Accepted gap: 1,200 sats"));
+		assert_eq!(html.matches("Accepted gap").count(), 1, "only a gap that was kept is shown");
+		assert!(!html.contains(">Paused</span>") && !html.contains("Paused since"));
+		assert!(!html.contains("Resolve</button>"));
+	}
+
+	#[component]
+	fn ResolveDialogHarness(form: crate::state::ResolveBooksGapForm) -> Element {
+		let ctx = use_context_provider(|| AppCtx::new(Connection::new(), Forms::default(), Nav::default(), Prefs::default(), false));
+		use_hook(move || {
+			let mut forms = ctx.forms;
+			forms.write().resolve_books_gap = form.clone();
+		});
+		rsx! { crate::ui::stable_channels::ResolveBooksGapDialog {} }
+	}
+
+	fn render_resolve(form: crate::state::ResolveBooksGapForm) -> String {
+		let mut dom = VirtualDom::new_with_props(ResolveDialogHarness, ResolveDialogHarnessProps { form });
+		dom.rebuild_in_place();
+		dioxus_ssr::render(&dom)
+	}
+
+	fn paused_form() -> crate::state::ResolveBooksGapForm {
+		crate::state::ResolveBooksGapForm {
+			channel_id: "7c3e9a41".into(),
+			user: "02ab41".into(),
+			booked_sats: 50_000,
+			gap_sats: 20_000,
+			since_ms: Some(PAUSED_SINCE_MS),
+			..Default::default()
+		}
+	}
+
+	fn previewed(choice: i32) -> crate::state::BooksPreview {
+		use sc_rest_client::sc_protos::stable::ResolveBooksGapResponse;
+		let figures = ResolveBooksGapResponse {
+			ok: false,
+			status: "The books hold 50200 sats for the user and the channel 30100 sats, with 50000 sats of backing: a gap of 20100 sats. Confirm to apply".into(),
+			needs_acknowledgement: true,
+			booked_sats: 50_200,
+			actual_sats: 30_100,
+			gap_sats: 20_100,
+			new_expected_usd: Some(50.0),
+			new_backing_sats: Some(29_900),
+		};
+		crate::state::BooksPreview { choice, figures }
+	}
+
+	#[test]
+	fn the_resolve_dialog_offers_the_three_choices() {
+		let html = render_resolve(paused_form());
+		assert!(html.contains("Resolve the gap on this channel"));
+		let since = crate::format::local_datetime((PAUSED_SINCE_MS / 1000) as u64);
+		assert!(html.contains(&format!("Paused since {since}: the user holds 20,000 sats less than the books")));
+		for text in [
+			"The user spent it",
+			"Set the books to the balance; the target is cut if the books fall below the stable part.",
+			"The user paid the LSP",
+			"Set the books to the balance and lower the stable part; the target is kept.",
+			"Keep the books",
+			"Keep the books and the gap; payments resume, and the alarm returns only if the gap grows.",
+		] {
+			assert!(html.contains(text), "missing {text}");
+		}
+		assert!(html.contains(">Preview</button>"));
+		assert!(!html.contains("Confirm</button>"), "nothing to confirm before a preview");
+	}
+
+	#[test]
+	fn the_resolve_dialog_shows_the_preview_figures_before_confirming() {
+		let mut form = paused_form();
+		form.choice = Some(2);
+		form.preview = Some(previewed(2));
+		form.latest_price = Some(100_000.0);
+		let html = render_resolve(form.clone());
+		for text in ["Books now", "50,200 sats", "Balance now", "30,100 sats", "Gap now", "20,100 sats", "Target after", "$50.00", "Stable part after", "29,900 sats", "a gap of 20100 sats. Confirm to apply"] {
+			assert!(html.contains(text), "missing {text}");
+		}
+		assert!(html.contains("The next stability check tops the stable part back up to the target at the current price."));
+		assert!(html.contains(">Preview</button>") && html.contains("Confirm</button>"));
+
+		// Picking another choice drops figures that were for the old one.
+		form.choose(1);
+		assert!(form.preview.is_none());
+		let html = render_resolve(form.clone());
+		assert!(!html.contains("Confirm</button>") && !html.contains("Confirm to apply") && !html.contains("30,100 sats"));
+		assert!(!html.contains("tops the stable part back up"));
+
+		// Figures for the spend choice carry no top-up line.
+		form.preview = Some(previewed(1));
+		let html = render_resolve(form);
+		assert!(html.contains("Confirm</button>") && !html.contains("tops the stable part back up"));
+	}
+
+	#[test]
+	fn the_resolve_dialog_mentions_the_next_top_up_only_when_one_is_due() {
+		let shows_top_up = |new_backing_sats: u64, latest_price: Option<f64>| {
+			let mut form = paused_form();
+			form.choice = Some(2);
+			let mut preview = previewed(2);
+			preview.figures.new_backing_sats = Some(new_backing_sats);
+			form.preview = Some(preview);
+			form.latest_price = latest_price;
+			render_resolve(form).contains("The next stability check tops the stable part back up to the target at the current price.")
+		};
+		// A $50 target on 29,900 sats at $100k is $20.10 short: the next check tops it up.
+		assert!(shows_top_up(29_900, Some(100_000.0)));
+		// At par, or short by less than the $0.25 a stability payment needs, nothing is topped up.
+		assert!(!shows_top_up(50_000, Some(100_000.0)));
+		assert!(!shows_top_up(49_800, Some(100_000.0)));
+		// At $170k the same 29,900 sats hold the target.
+		assert!(!shows_top_up(29_900, Some(170_000.0)));
+		// Without a price nothing can be said.
+		assert!(!shows_top_up(29_900, None));
+	}
+
+	#[test]
+	fn a_resolve_confirm_echoes_the_figures_its_preview_showed() {
+		let mut form = paused_form();
+		assert!(crate::actions::books_resolution_request(&form, false).is_none(), "no choice, no request");
+		form.choose(2);
+		form.reason = "  paid the LSP's invoice  ".into();
+		let preview = crate::actions::books_resolution_request(&form, false).unwrap();
+		assert_eq!((preview.channel_id.as_str(), preview.choice, preview.acknowledged), ("7c3e9a41", 2, false));
+		assert_eq!((preview.expected_actual_sats, preview.expected_gap_sats, preview.reason.as_deref()), (None, None, Some("paid the LSP's invoice")));
+		assert_eq!((preview.expected_new_expected_usd, preview.expected_new_backing_sats), (None, None));
+		assert!(!crate::actions::books_resolution_request(&form, true).unwrap().acknowledged, "a confirm with nothing previewed only asks for the figures");
+
+		let figures = previewed(2).figures;
+		assert!(crate::actions::preview_books_resolution(&mut form, "7c3e9a41", 2, figures));
+		let confirm = crate::actions::books_resolution_request(&form, true).unwrap();
+		assert_eq!((confirm.choice, confirm.acknowledged, confirm.expected_actual_sats, confirm.expected_gap_sats), (2, true, Some(30_100), Some(20_100)));
+		assert_eq!((confirm.expected_new_expected_usd, confirm.expected_new_backing_sats), (Some(50.0), Some(29_900)), "the target and stable part previewed");
+		assert_eq!(confirm.reason.as_deref(), Some("paid the LSP's invoice"));
+
+		// The daemon found other figures at the confirm: they become the preview, and the next confirm echoes them.
+		let moved = sc_rest_client::sc_protos::stable::ResolveBooksGapResponse { actual_sats: 29_000, gap_sats: 21_000, new_backing_sats: Some(29_000), ..previewed(2).figures };
+		assert!(crate::actions::preview_books_resolution(&mut form, "7c3e9a41", 2, moved));
+		let again = crate::actions::books_resolution_request(&form, true).unwrap();
+		assert_eq!((again.expected_actual_sats, again.expected_gap_sats), (Some(29_000), Some(21_000)));
+		assert_eq!((again.expected_new_expected_usd, again.expected_new_backing_sats), (Some(50.0), Some(29_000)));
+
+		// Another choice needs its own preview.
+		form.choose(3);
+		let other = crate::actions::books_resolution_request(&form, true).unwrap();
+		assert_eq!((other.choice, other.acknowledged, other.expected_actual_sats), (3, false, None));
+		form.reason = "   ".into();
+		assert_eq!(crate::actions::books_resolution_request(&form, false).unwrap().reason, None, "a blank reason is left out");
+	}
+
+	#[test]
+	fn resolve_figures_for_one_channel_or_choice_never_reach_another() {
+		let mut form = paused_form();
+		form.choose(1);
+		// The operator moved on to another channel, or another choice, while the figures were loading.
+		assert!(!crate::actions::preview_books_resolution(&mut form, "7c3e9a99", 1, previewed(1).figures));
+		assert!(!crate::actions::preview_books_resolution(&mut form, "7c3e9a41", 2, previewed(2).figures));
+		assert!(form.preview.is_none());
+		assert!(crate::actions::preview_books_resolution(&mut form, "7c3e9a41", 1, previewed(1).figures));
+
+		// A resolution of another channel finishing must not close or clear this dialog.
+		assert!(!crate::actions::finish_books_resolution(&mut form, "7c3e9a99"));
+		assert_eq!((form.channel_id.as_str(), form.choice), ("7c3e9a41", Some(1)));
+		assert!(crate::actions::finish_books_resolution(&mut form, "7c3e9a41"));
+		assert!(form.channel_id.is_empty() && form.choice.is_none() && form.preview.is_none());
 	}
 }

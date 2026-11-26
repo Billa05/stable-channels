@@ -52,23 +52,26 @@ pub async fn splice_in(State(state): State<AppState>, body: Bytes) -> Response {
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    splice_in_noted(&state.db, state.ldk_server.as_ref(), req, crate::revenue::now_secs()).await
+}
+
+/// The operator's splice-in, noted as one before it is made.
+pub(crate) async fn splice_in_noted(
+    db: &stable_channels::db::Database,
+    ldk: &dyn crate::stable_manager::LdkServerCalls,
+    req: SpliceInRequest,
+    now: i64,
+) -> Response {
     // A queued splice-in the job is working on, or whose last call may still be pending on the node, owns the channel: a manual one now would splice twice, or be taken for the queued one's lock. Otherwise the call is noted before it is made, in the same transaction as that check, so a queued request waits until the channel shows this splice through, locked or gone.
     let user_channel_id = req.user_channel_id.clone();
-    let replaced_a_note = match crate::queued_splice::before_manual_splice(
-        &state.db,
-        state.ldk_server.as_ref() as &dyn crate::stable_manager::LdkServerCalls,
-        &user_channel_id,
-        crate::revenue::now_secs(),
-    )
-    .await
-    {
+    let replaced_a_note = match crate::queued_splice::before_manual_splice(db, ldk, &user_channel_id, stable_channels::db::SpliceDirection::In, now).await {
         Ok(replaced_a_note) => replaced_a_note,
         Err(message) => return error_response(ErrorCode::InvalidRequestError, format!("the splice-in was not made: {message}")),
     };
-    match state.ldk_server.splice_in(req).await {
+    match ldk.splice_in(req).await {
         Ok(resp) => ok_response(resp),
         Err(e) => {
-            crate::queued_splice::after_manual_splice_failed(&state.db, &user_channel_id, replaced_a_note, &e);
+            crate::queued_splice::after_manual_splice_failed(db, &user_channel_id, replaced_a_note, &e);
             map_grpc_error(e)
         }
     }
@@ -79,9 +82,27 @@ pub async fn splice_out(State(state): State<AppState>, body: Bytes) -> Response 
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    match state.ldk_server.splice_out(req).await {
+    splice_out_noted(&state.db, state.ldk_server.as_ref(), req, crate::revenue::now_secs()).await
+}
+
+/// The operator's splice-out, noted before it is made as a splice-in by hand is, so its lock is taken for the LSP's whatever events reach the daemon; a queued splice-in that holds the channel refuses it.
+pub(crate) async fn splice_out_noted(
+    db: &stable_channels::db::Database,
+    ldk: &dyn crate::stable_manager::LdkServerCalls,
+    req: SpliceOutRequest,
+    now: i64,
+) -> Response {
+    let user_channel_id = req.user_channel_id.clone();
+    let replaced_a_note = match crate::queued_splice::before_manual_splice(db, ldk, &user_channel_id, stable_channels::db::SpliceDirection::Out, now).await {
+        Ok(replaced_a_note) => replaced_a_note,
+        Err(message) => return error_response(ErrorCode::InvalidRequestError, format!("the splice-out was not made: {message}")),
+    };
+    match ldk.splice_out(req).await {
         Ok(resp) => ok_response(resp),
-        Err(e) => map_grpc_error(e),
+        Err(e) => {
+            crate::queued_splice::after_manual_splice_failed(db, &user_channel_id, replaced_a_note, &e);
+            map_grpc_error(e)
+        }
     }
 }
 

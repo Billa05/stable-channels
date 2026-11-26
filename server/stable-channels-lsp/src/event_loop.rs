@@ -859,6 +859,10 @@ async fn handle(
             },
             DispatchOutcome::Retry => {
                 warn!("[event_loop] LDK Server didn't answer for an event within {:?}; moving on", MAX_EVENT_RETRY);
+                // A trade request given up on can never be decided, so its fee is refused for good.
+                if let Some(payment_id) = payment_of(&envelope) {
+                    StableChannelManager::lock_for_event(manager, ldk).await.give_up_trade(payment_id);
+                }
                 stable_channels::audit::audit_event(
                     "EVENT_RETRY_ABANDONED",
                     serde_json::json!({ "payment_id": payment_of(&envelope), "waited_secs": started.elapsed().as_secs() }),
@@ -908,6 +912,17 @@ async fn reconcile_in_place(
     reconcile_until_safe(manager, db, ldk, health, trigger).await;
 }
 
+/// One reconcile pass over a gap opened now, as a reconnect runs it.
+#[cfg(test)]
+pub(crate) async fn reconcile_after_reconnect(
+    manager: &tokio::sync::Mutex<StableChannelManager>,
+    db: &stable_channels::db::Database,
+    ldk: &dyn LdkServerCalls,
+) -> bool {
+    let mut health = StreamHealth::new(begin_gap_with_retry(db).await);
+    reconcile(manager, db, ldk, &mut health, "stream_connected").await
+}
+
 /// Reconcile until every terminal settlement outcome is applied, waiting up to a minute between passes; the subscription keeps reading meanwhile.
 async fn reconcile_until_safe(
     manager: &tokio::sync::Mutex<StableChannelManager>,
@@ -948,6 +963,8 @@ async fn reconcile(
     // The books need no price, so the list is reloaded whatever the price cache holds.
     let btc_price = stable_channels::price_feeds::get_fresh_cached_price_no_fetch();
     mgr.reconcile_from_grpc(ldk, btc_price).await;
+    // A forward whose event the gap lost is booked from LDK's totals before the events after it are handled.
+    mgr.catch_up_forwards_after_reconnect(ldk, btc_price).await;
     drop(mgr);
     let counts = crate::backfill::reconcile_event_history(ldk, db, health.gap.as_ref().map(|gap| gap.0)).await;
     let reconciliation_complete = reconciliation_allows_health(&counts);
@@ -1094,7 +1111,7 @@ pub(crate) async fn dispatch_event(
                 prev.and_then(|h| h.node_id.clone()).unwrap_or_default(),
                 next.and_then(|h| h.node_id.clone()).unwrap_or_default(),
                 e.outbound_amount_forwarded_msat,
-                e.total_fee_earned_msat.unwrap_or(0),
+                e.total_fee_earned_msat,
                 e.skimmed_fee_msat,
                 e.prev_htlcs.len() == 1 && e.next_htlcs.len() == 1 && e.total_fee_earned_msat.is_some(),
                 ldk,
@@ -2484,6 +2501,85 @@ mod tests {
         assert_eq!(abandoned.len(), 1);
         assert_eq!(abandoned[0].1["payment_id"], payment_id.as_str());
         assert!(db.trade_decision_by_payment(&payment_id).unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_trade_given_up_after_its_retries_has_its_fee_refused_once() {
+        use crate::stable_manager::tests::USER_CHANNEL_ID_DECIMAL;
+        use crate::stable_manager::TickScope;
+        use ldk_server_client::ldk_server_grpc::types::{Payment, PaymentDirection, PaymentStatus};
+        let _guard = crate::stable_manager::tests::AUDIT_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (manager, db) = serving_fixture();
+        let (ldk, request, fee) = crate::stable_manager::tests::trade_request(&mut *manager.lock().await);
+        // $50 on 50,000 sats of backing with 50,000 spare, the books anchored on the user's 100,000 sats by two regular ticks.
+        {
+            let mut channels = ldk.channels.lock().unwrap();
+            (channels[0].outbound_capacity_msat, channels[0].inbound_capacity_msat) = (200_000_000, 100_000_000);
+            channels[0].next_outbound_htlc_limit_msat = channels[0].outbound_capacity_msat;
+        }
+        let inbox = Arc::new(Inbox::in_memory());
+        manager.lock().await.attach_event_inbox(Arc::clone(&inbox));
+        let tick = || async { manager.lock().await.run_tick_plan(&ldk, 100_000.0, TickScope::All).await };
+        for _ in 0..2 {
+            tick().await;
+        }
+        let uid: u128 = USER_CHANNEL_ID_DECIMAL.parse().unwrap();
+        assert_eq!(db.booked_balance(uid).unwrap().map(|books| books.booked_user_msat), Some(100_000_000));
+        // The trade's fee arrives, and every signature its decision needs goes unanswered until the event loop gives it up.
+        let payment_id = "7c0f3b6e9d2a5c8f1b4e7a0d3c6f9b2e5a8d1c4f7b0e3a6d9c2f5b8e1a4d7c0f";
+        ldk.payments.lock().unwrap().push(Payment {
+            payment_id: payment_id.to_owned(),
+            amount_msat: Some(fee),
+            direction: PaymentDirection::Inbound as i32,
+            status: PaymentStatus::Succeeded as i32,
+            ..Default::default()
+        });
+        {
+            let mut channels = ldk.channels.lock().unwrap();
+            channels[0].inbound_capacity_msat -= fee;
+            channels[0].outbound_capacity_msat += fee;
+            channels[0].next_outbound_htlc_limit_msat = channels[0].outbound_capacity_msat;
+        }
+        ldk.sign_failures.store(usize::MAX, Ordering::SeqCst);
+        let mut health = StreamHealth::new(db.begin_event_stream_gap(1_000).unwrap());
+        let envelope = paid_request(payment_id, &request, fee);
+        let id = save_only(&inbox, &envelope);
+        tokio::time::timeout(Duration::from_secs(3_600), handle(id, envelope, &inbox, &manager, &db, &ldk, &mut health))
+            .await
+            .expect("handling gives up");
+        inbox.finish(id).unwrap();
+        ldk.sign_failures.store(0, Ordering::SeqCst);
+
+        // Given up, the request is refused for good, and its fee is booked once, marked for the tick to cut.
+        assert_eq!(db.trade_decision_summary(payment_id).unwrap().map(|decision| decision.outcome).as_deref(), Some("rejected"));
+        let books = db.booked_balance(uid).unwrap().unwrap();
+        assert_eq!((books.booked_user_msat, books.uncut.map(|uncut| uncut.spent_msat)), (100_000_000 - fee, Some(fee)));
+        let path = manager.lock().await.data_dir().join(stable_channels::db::DB_FILENAME);
+        let fee_bookings = || {
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM ledger_events WHERE event_type = 'BOOKED_BALANCE_CHANGED' AND json_extract(detail_json, '$.reason') = 'trade_fee'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(fee_bookings(), 1);
+        // The next tick cuts it from the spare BTC once, and the ticks after it cut nothing more.
+        let saved = || db.load_channel(USER_CHANNEL_ID_DECIMAL).unwrap().map(|row| (row.expected_usd, row.backing_sats, row.native_sats));
+        tick().await;
+        let cut = Some((50.0, 50_000, (100_000_000 - fee) / 1000 - 50_000));
+        assert_eq!(saved(), cut);
+        assert_eq!(db.booked_balance(uid).unwrap().unwrap().uncut, None);
+        for _ in 0..2 {
+            tick().await;
+        }
+        assert_eq!(saved(), cut);
+        assert_eq!(fee_bookings(), 1);
+        // The refused fee is a rejected trade's fee the operator can refund.
+        let refunded = crate::revenue::refund_trade_fee(&Arc::new(db.clone()), &ldk, payment_id, crate::revenue::now_secs()).await;
+        assert_eq!(refunded.map(|(_, amount_msat)| amount_msat).ok(), Some(fee));
     }
 
     #[tokio::test(start_paused = true)]

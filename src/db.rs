@@ -22,7 +22,8 @@ mod onchain_audit;
 mod stream_checkpoint;
 
 pub use booked_balance::{
-    BookChange, BookOutcome, BookReason, BookedBalance, BooksCheck, CheckState, ForwardCursor, GapDirection,
+    BookChange, BookOutcome, BookReason, BookedBalance, BooksCheck, CheckState, ForwardCursor, GapChoice, GapDirection, GapKind,
+    GapResolution, UncutSpends,
 };
 pub use forward_history::fingerprint as forward_detail_fingerprint;
 
@@ -459,15 +460,50 @@ impl QueuedSplice {
     }
 }
 
-/// A splice-in the operator made by hand, noted so that a queued request for the channel waits until the channel has moved past the funding it was made on.
+/// A splice in or out the operator made by hand, noted so that a queued request for the channel waits until the channel has moved past the funding it was made on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManualSplice {
     pub user_channel_id: String,
     pub channel_funding_txo: String,
     pub made_at: i64,
+    /// Which way the splice moves the channel's value; None on a note saved before notes kept it.
+    pub direction: Option<SpliceDirection>,
 }
 
-/// What noting a splice-in made by hand did.
+/// Which way a splice moves a channel's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpliceDirection {
+    In,
+    Out,
+}
+
+impl SpliceDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::In => "in",
+            Self::Out => "out",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "in" => Some(Self::In),
+            "out" => Some(Self::Out),
+            _ => None,
+        }
+    }
+
+    /// The way a change of channel value from `before_sats` to `after_sats` went; None when it did not change.
+    pub fn of_change(before_sats: u64, after_sats: u64) -> Option<Self> {
+        match after_sats.cmp(&before_sats) {
+            std::cmp::Ordering::Greater => Some(Self::In),
+            std::cmp::Ordering::Less => Some(Self::Out),
+            std::cmp::Ordering::Equal => None,
+        }
+    }
+}
+
+/// What noting a splice made by hand did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManualNoteOutcome {
     /// The note is in, replacing an earlier one if `existed`.
@@ -486,7 +522,7 @@ pub enum QueueSpliceOutcome {
     PendingOnNode(QueuedSplice),
     /// The node's failure event released the channel's last call inside the backoff, and a signing can still revive it; nothing changed.
     Revivable(QueuedSplice),
-    /// A splice-in made by hand is noted on the funding the channel is on now; nothing changed.
+    /// A splice made by hand is noted on the funding the channel is on now; nothing changed.
     ManualPending(ManualSplice),
 }
 
@@ -513,6 +549,29 @@ fn queued_splice_row(row: &rusqlite::Row<'_>) -> SqliteResult<QueuedSplice> {
         updated_at: row.get(16)?,
         negotiated_at: row.get(17)?,
     })
+}
+
+/// Records a payment as refused, with no response to send, under its own trade id so a refusal never takes one a request may still use; the rows inserted.
+#[allow(clippy::too_many_arguments)]
+fn insert_refusal(
+    conn: &Connection,
+    payment_id: &str,
+    request_hash: &str,
+    channel_id: &str,
+    user_channel_id: &str,
+    counterparty: &str,
+    reason_code: &str,
+    decided_at: i64,
+) -> SqliteResult<usize> {
+    conn.execute(
+        "INSERT OR IGNORE INTO trade_decisions (
+            inbound_payment_id, trade_id, request_hash, channel_id, user_channel_id,
+            counterparty, outcome, reason_code, decided_at, response_status,
+            next_response_attempt_at, delivery_deadline
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'rejected', ?7, ?8, 'abandoned', ?8, ?8)",
+        params![payment_id, format!("refused:{payment_id}"), request_hash, channel_id, user_channel_id,
+            counterparty, reason_code, decided_at],
+    )
 }
 
 /// Thread-safe database handle
@@ -1055,7 +1114,7 @@ impl Database {
             );",
         )?;
 
-        // A splice-in the operator made by hand, with the funding the channel was on: a queued request
+        // A splice the operator made by hand, with the funding the channel was on: a queued request
         // for the channel waits until the channel has moved past it, so the hand-made splice is not
         // taken for the request's lock. One note per channel.
         conn.execute_batch(
@@ -1065,9 +1124,13 @@ impl Database {
                 made_at INTEGER NOT NULL
             );",
         )?;
+        // The way the noted splice moves the value; a note saved before this column has none.
+        let _ = conn.execute("ALTER TABLE manual_splices ADD COLUMN direction TEXT", []);
 
         // Append-only operator history. There is intentionally no pruning path.
         ledger::init_schema(&conn)?;
+        booked_balance::add_later_columns(&conn)?;
+        booked_balance::reset_log_only_pauses(&conn)?;
 
         Ok(())
     }
@@ -1332,7 +1395,7 @@ impl Database {
     /// call's signing can still revive the row. The check runs inside the transaction, so an event that lands while the
     /// caller is away from the table cannot slip a replacement past it.
     ///
-    /// With `channel_funding_txo`, the funding the caller saw the channel on, a splice-in made by hand and noted on that
+    /// With `channel_funding_txo`, the funding the caller saw the channel on, a splice made by hand and noted on that
     /// funding refuses the request too, inside the same transaction, so a note made while the caller was away is seen.
     pub fn queue_splice_in(
         &self,
@@ -1411,13 +1474,14 @@ impl Database {
         rows.collect()
     }
 
-    /// Notes a splice-in the operator made by hand on the channel, with the funding it was on, unless the channel's
+    /// Notes a splice the operator made by hand on the channel, with the funding it was on, unless the channel's
     /// queued row `holds_channel`; the check and the note are one transaction, so a request saved meanwhile is seen.
     /// A later note replaces an earlier one, and says so.
     pub fn note_manual_splice_unless(
         &self,
         user_channel_id: &str,
         channel_funding_txo: &str,
+        direction: SpliceDirection,
         now: i64,
         holds_channel: impl Fn(&QueuedSplice) -> bool,
     ) -> SqliteResult<ManualNoteOutcome> {
@@ -1429,8 +1493,8 @@ impl Database {
         }
         let existed = Self::manual_splice_on(&tx, user_channel_id)?.is_some();
         tx.execute(
-            "INSERT OR REPLACE INTO manual_splices (user_channel_id, channel_funding_txo, made_at) VALUES (?1, ?2, ?3)",
-            params![user_channel_id, channel_funding_txo, now],
+            "INSERT OR REPLACE INTO manual_splices (user_channel_id, channel_funding_txo, made_at, direction) VALUES (?1, ?2, ?3, ?4)",
+            params![user_channel_id, channel_funding_txo, now, direction.as_str()],
         )?;
         tx.commit()?;
         Ok(ManualNoteOutcome::Noted { existed })
@@ -1438,14 +1502,22 @@ impl Database {
 
     fn manual_splice_on(conn: &Connection, user_channel_id: &str) -> SqliteResult<Option<ManualSplice>> {
         conn.query_row(
-            "SELECT user_channel_id, channel_funding_txo, made_at FROM manual_splices WHERE user_channel_id = ?1",
+            "SELECT user_channel_id, channel_funding_txo, made_at, direction FROM manual_splices WHERE user_channel_id = ?1",
             params![user_channel_id],
-            |row| Ok(ManualSplice { user_channel_id: row.get(0)?, channel_funding_txo: row.get(1)?, made_at: row.get(2)? }),
+            |row| {
+                let direction: Option<String> = row.get(3)?;
+                Ok(ManualSplice {
+                    user_channel_id: row.get(0)?,
+                    channel_funding_txo: row.get(1)?,
+                    made_at: row.get(2)?,
+                    direction: direction.as_deref().and_then(SpliceDirection::parse),
+                })
+            },
         )
         .optional()
     }
 
-    /// The splice-in made by hand on the channel that the queue has not yet seen through, if any.
+    /// The splice made by hand on the channel that the queue has not yet seen through, if any.
     pub fn load_manual_splice(&self, user_channel_id: &str) -> SqliteResult<Option<ManualSplice>> {
         let conn = self.conn.lock().unwrap();
         Self::manual_splice_on(&conn, user_channel_id)
@@ -1457,7 +1529,7 @@ impl Database {
         Ok(conn.execute("DELETE FROM manual_splices WHERE user_channel_id = ?1", params![user_channel_id])? > 0)
     }
 
-    /// Whether the LSP made the splice that moved the channel from `value_before_sats` onto `funding_txo`: the node reported negotiating it, the channel's queued splice-in names that funding, or a splice-in made by hand is newer than the channel's books and their last splice.
+    /// Whether the LSP made the splice that moved the channel from `value_before_sats` onto `funding_txo`: the node reported negotiating it, the channel's queued splice-in names that funding, or a splice made by hand the same way is newer than the channel's books and their last splice.
     pub fn lsp_made_splice(&self, uid: u128, funding_txo: &str, value_before_sats: u64, value_after_sats: u64) -> SqliteResult<bool> {
         let conn = self.conn.lock().unwrap();
         let key = uid.to_string();
@@ -1479,8 +1551,10 @@ impl Database {
             }
         }
         // A note outlives its lock until a later request, a close or a cancel clears it, so one the books have moved past is spent.
+        let change = SpliceDirection::of_change(value_before_sats, value_after_sats);
         match Self::manual_splice_on(&conn, &key)? {
-            Some(manual) if value_after_sats > value_before_sats && manual.channel_funding_txo != funding_txo => {
+            // A note names the way its splice moves the value, so a change the other way is not it; one saved before notes kept the way was a splice-in.
+            Some(manual) if manual.channel_funding_txo != funding_txo && Some(manual.direction.unwrap_or(SpliceDirection::In)) == change => {
                 booked_balance::noted_since_books(&conn, &key, manual.made_at)
             }
             _ => Ok(false),
@@ -1750,13 +1824,13 @@ impl Database {
         native_sats: u64,
         note: Option<&str>,
     ) -> SqliteResult<()> {
-        self.save_channel_inner(channel_id, user_channel_id, expected_usd, backing_sats, native_sats, note, false, false)
+        self.save_channel_inner(channel_id, user_channel_id, expected_usd, backing_sats, native_sats, note, false, false, None)
             .map(|_| ())
     }
 
     /// Record a newly seen channel at a $0 target with all its sats native, unless it already has a row, open or closed, under either notation of its id or under its channel id. True if it was recorded.
     pub fn insert_channel_if_absent(&self, channel_id: &str, user_channel_id: &str, native_sats: u64) -> SqliteResult<bool> {
-        self.save_channel_inner(channel_id, user_channel_id, 0.0, 0, native_sats, None, false, true)
+        self.save_channel_inner(channel_id, user_channel_id, 0.0, 0, native_sats, None, false, true, None)
     }
 
     /// A channel's row, open or closed, keyed under either notation of its id; None when it has none or more than one.
@@ -1783,7 +1857,24 @@ impl Database {
         native_sats: u64,
         note: Option<&str>,
     ) -> SqliteResult<()> {
-        self.save_channel_inner(channel_id, user_channel_id, expected_usd, backing_sats, native_sats, note, true, false)
+        self.save_channel_inner(channel_id, user_channel_id, expected_usd, backing_sats, native_sats, note, true, false, None)
+            .map(|_| ())
+    }
+
+    /// `save_channel_after_spend` for a cut taken from the books, taking `cleared` of the spends the books mark uncut off in the same transaction.
+    pub fn save_channel_after_booked_spend(
+        &self,
+        channel_id: &str,
+        user_channel_id: &str,
+        expected_usd: f64,
+        backing_sats: u64,
+        native_sats: u64,
+        note: Option<&str>,
+        cleared: UncutSpends,
+    ) -> SqliteResult<()> {
+        let clear = |conn: &Connection| booked_balance::clear_uncut(conn, user_channel_id, cleared);
+        let extra: Option<&dyn Fn(&Connection) -> SqliteResult<()>> = (cleared.spent_msat > 0 || cleared.overflow_msat > 0).then_some(&clear);
+        self.save_channel_inner(channel_id, user_channel_id, expected_usd, backing_sats, native_sats, note, true, false, extra)
             .map(|_| ())
     }
 
@@ -1797,11 +1888,16 @@ impl Database {
         note: Option<&str>,
         keep_pending_rollback: bool,
         only_if_absent: bool,
+        also: Option<&dyn Fn(&Connection) -> SqliteResult<()>>,
     ) -> SqliteResult<bool> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let mut mirror = None;
         let result = (|| {
+            // A write that must commit with this save, whether or not the row changes.
+            if let Some(also) = also {
+                also(&conn)?;
+            }
             if only_if_absent {
                 let wanted = user_channel_id_value(user_channel_id);
                 let mut stmt = conn.prepare("SELECT user_channel_id, channel_id FROM channels")?;
@@ -2203,11 +2299,30 @@ impl Database {
         decided_at: i64,
         response_envelope: &str,
     ) -> SqliteResult<bool> {
+        self.persist_trade_rejection_with_fee(inbound_payment_id, trade_id, request_hash, channel_id, user_channel_id, counterparty, reason_code, decided_at, response_envelope, None)
+    }
+
+    /// Records a rejection and books its trade's fee in one transaction, marking one booked unmarked before; a payment another decision already holds books nothing more.
+    #[allow(clippy::too_many_arguments)]
+    pub fn persist_trade_rejection_with_fee(
+        &self,
+        inbound_payment_id: &str,
+        trade_id: &str,
+        request_hash: &str,
+        channel_id: &str,
+        user_channel_id: &str,
+        counterparty: &str,
+        reason_code: &str,
+        decided_at: i64,
+        response_envelope: &str,
+        fee: Option<&booked_balance::BookChange>,
+    ) -> SqliteResult<bool> {
         let deadline = decided_at.saturating_add(
             crate::constants::TRADE_RESPONSE_RETRY_WINDOW_SECS.min(i64::MAX as u64) as i64,
         );
-        let conn = self.conn.lock().unwrap();
-        let inserted = conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let inserted = tx.execute(
             "INSERT OR IGNORE INTO trade_decisions (
                 inbound_payment_id, trade_id, request_hash, channel_id, user_channel_id,
                 counterparty, outcome, reason_code, decided_at, response_envelope,
@@ -2216,7 +2331,59 @@ impl Database {
             params![inbound_payment_id, trade_id, request_hash, channel_id, user_channel_id,
                 counterparty, reason_code, decided_at, response_envelope, deadline],
         )?;
+        let decided_before = inserted == 0 && tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM trade_decisions WHERE inbound_payment_id = ?1)",
+            params![inbound_payment_id], |row| row.get::<_, bool>(0),
+        )?;
+        // A trade id another payment holds leaves this payment undecided, so a fee booked here is refused under its own trade id, as any refused fee is.
+        if inserted == 0 && !decided_before && fee.is_some() {
+            insert_refusal(&tx, inbound_payment_id, request_hash, channel_id, user_channel_id, counterparty, reason_code, decided_at)?;
+        }
+        let booked = match fee {
+            Some(change) if !decided_before => booked_balance::book_refused_fee_and_capture(&tx, change, chrono::Utc::now().timestamp_millis())?.1,
+            _ => None,
+        };
+        tx.commit()?;
+        booked_balance::mirror(booked);
         Ok(inserted == 1)
+    }
+
+    /// Refuses a trade fee no decision takes: records a rejection with no response to send, so the payment is never decided again, books the fee, marking one booked unmarked before, and appends `record`, in one transaction; a payment already decided books nothing more.
+    #[allow(clippy::too_many_arguments)]
+    pub fn refuse_trade_fee(
+        &self,
+        fee: &booked_balance::BookChange,
+        channel_id: &str,
+        user_channel_id: &str,
+        counterparty: &str,
+        request_hash: &str,
+        reason_code: &str,
+        decided_at: i64,
+        record: Option<&crate::ledger::LedgerEventDraft>,
+    ) -> SqliteResult<booked_balance::BookOutcome> {
+        let payment_id = fee.evidence.as_str();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let inserted = insert_refusal(&tx, payment_id, request_hash, channel_id, user_channel_id, counterparty, reason_code, decided_at)?;
+        let decided_before = inserted == 0 && tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM trade_decisions WHERE inbound_payment_id = ?1)",
+            params![payment_id], |row| row.get::<_, bool>(0),
+        )?;
+        let (outcome, booked) = if decided_before {
+            (booked_balance::BookOutcome::AlreadyBooked, None)
+        } else {
+            booked_balance::book_refused_fee_and_capture(&tx, fee, chrono::Utc::now().timestamp_millis())?
+        };
+        let appended = match record {
+            Some(record) => Some((record, crate::ledger::append_on_connection(&tx, record)?)),
+            None => None,
+        };
+        tx.commit()?;
+        booked_balance::mirror(booked);
+        if let Some((record, appended)) = appended.filter(|(_, appended)| appended.inserted) {
+            crate::audit::mirror_committed_ledger_event(record, appended.event_id);
+        }
+        Ok(outcome)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2234,6 +2401,7 @@ impl Database {
         sync_version: u64,
         decided_at: i64,
         response_envelope: &str,
+        fee: Option<&booked_balance::BookChange>,
     ) -> SqliteResult<bool> {
         if !expected_usd.is_finite() || expected_usd < 0.0
             || backing_sats > i64::MAX as u64 || native_sats > i64::MAX as u64
@@ -2270,7 +2438,13 @@ impl Database {
                 counterparty, expected_usd, backing_sats as i64, sync_version as i64,
                 decided_at, response_envelope, deadline],
         )?;
+        // The fee is booked with the acceptance, unmarked: the new allocation already accounts for it.
+        let booked = match fee {
+            Some(change) => booked_balance::book_and_capture(&tx, &booked_balance::BookChange { marks_uncut: false, ..change.clone() }, chrono::Utc::now().timestamp_millis())?.1,
+            None => None,
+        };
         tx.commit()?;
+        booked_balance::mirror(booked);
         Ok(true)
     }
 
@@ -4919,6 +5093,16 @@ impl Database {
             .transpose()
     }
 
+    /// Lowercased channel ids of pending inbound stability settlements registered at or after `since` (unix seconds).
+    pub fn channels_with_inbound_stability_settlements_since(&self, since: i64) -> SqliteResult<HashSet<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT channel_id FROM inbound_stability_settlements WHERE state = 'pending' AND created_at >= ?1",
+        )?;
+        let rows = statement.query_map(params![since], |row| row.get::<_, String>(0))?;
+        rows.map(|row| row.map(|channel_id| channel_id.to_ascii_lowercase())).collect()
+    }
+
     pub fn pending_inbound_stability_settlements(
         &self,
         limit: usize,
@@ -5169,6 +5353,8 @@ impl Database {
                     cursor: None,
                     channel_value_sats: None,
                     detail: serde_json::json!({ "top_up_sats": top_up_sats, "amount_msat": amount_msat }),
+                    marks_uncut: false,
+                    listed_after_msat: None,
                 };
                 booked_balance::book_and_capture(&tx, &change, Utc::now().timestamp_millis())?.1
             }
@@ -5758,6 +5944,7 @@ impl Database {
     /// Channels with a payment from the LSP whose outcome is not known yet: a SYNC, a top-up sent the old way, a fee refund claimed or sent, or a trade response; rows from before `since` (unix seconds) do not count, as a failed refund's row is never marked.
     pub fn channels_awaiting_lsp_payment(&self, since: i64) -> SqliteResult<HashSet<u128>> {
         let conn = self.conn.lock().unwrap();
+        // A trade response's next attempt is set when it is sent, to that time plus its backoff, so it dates the send.
         let mut stmt = conn.prepare(
             "SELECT user_channel_id FROM settlement_payments
              WHERE outcome = 'pending' AND user_channel_id IS NOT NULL AND recorded_at >= ?1
@@ -5767,7 +5954,7 @@ impl Database {
              WHERE r.created_at >= ?1
                AND (r.refund_payment_id IS NULL OR NOT EXISTS (SELECT 1 FROM settlement_payments s WHERE s.payment_id = r.refund_payment_id))
              UNION
-             SELECT user_channel_id FROM trade_decisions WHERE response_status = 'in_flight'",
+             SELECT user_channel_id FROM trade_decisions WHERE response_status = 'in_flight' AND next_response_attempt_at >= ?1",
         )?;
         let rows = stmt.query_map(params![since], |row| row.get::<_, String>(0))?;
         let mut channels = HashSet::new();
@@ -6934,6 +7121,7 @@ mod tests {
                 1,
                 100,
                 "signed-sync",
+                None,
             )
             .is_err());
         let unchanged = db.load_channel("user-channel-1").unwrap().unwrap();
@@ -6960,6 +7148,7 @@ mod tests {
                 1,
                 100,
                 "signed-sync",
+                None,
             )
             .unwrap());
         let accepted = db.load_channel("user-channel-1").unwrap().unwrap();
@@ -6980,6 +7169,7 @@ mod tests {
                 2,
                 101,
                 "different-sync",
+                None,
             )
             .unwrap());
         assert_eq!(
@@ -6989,6 +7179,158 @@ mod tests {
                 .expected_usd,
             20.0
         );
+    }
+
+    #[test]
+    fn a_trade_fee_is_booked_with_its_decision_or_not_at_all() {
+        let db = Database::open_in_memory().unwrap();
+        let channel_id = "11".repeat(32);
+        let (accepted, rejected) = ("44".repeat(32), "55".repeat(32));
+        db.save_channel(&channel_id, "7", 10.0, 10_000, 5_000, None).unwrap();
+        db.anchor_booked_balance(7, &channel_id, 15_000_000, 100_000, ForwardCursor::default(), serde_json::json!({})).unwrap();
+        let fee = |payment_id: &str| BookChange {
+            user_channel_id: 7,
+            delta_msat: -100_000,
+            reason: BookReason::TradeFee,
+            evidence: payment_id.to_owned(),
+            cursor: None,
+            channel_value_sats: None,
+            detail: serde_json::json!({}),
+            marks_uncut: true,
+            listed_after_msat: None,
+        };
+        let accept = |db: &Database| db.persist_trade_acceptance(&accepted, &"22".repeat(32), "hash", &channel_id, "7", "counterparty", 20.0, 20_000, 4_900, 1, 100, "signed-sync", Some(&fee(&accepted)));
+        // A fee booking that fails takes the acceptance down with it.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TRIGGER fail_fee BEFORE UPDATE ON booked_balances BEGIN SELECT RAISE(ABORT, 'injected booking failure'); END;")
+            .unwrap();
+        assert!(accept(&db).is_err());
+        assert!(db.trade_decision_by_payment(&accepted).unwrap().is_none());
+        assert_eq!(db.load_channel("7").unwrap().unwrap().expected_usd, 10.0);
+        assert!(!db.has_booking(7, BookReason::TradeFee, &accepted).unwrap());
+        assert_eq!(db.booked_balance(7).unwrap().unwrap().booked_user_msat, 15_000_000);
+        db.conn.lock().unwrap().execute_batch("DROP TRIGGER fail_fee").unwrap();
+
+        // Saved, an acceptance books its fee unmarked and a rejection books its own marked for the tick.
+        assert!(accept(&db).unwrap());
+        let books = db.booked_balance(7).unwrap().unwrap();
+        assert_eq!((books.booked_user_msat, books.uncut), (14_900_000, None));
+        let reject = |db: &Database, payment_id: &str, trade_id: &str| {
+            db.persist_trade_rejection_with_fee(payment_id, trade_id, "hash", &channel_id, "7", "counterparty", "invalid_fee", 101, "signed-rejection", Some(&fee(payment_id)))
+        };
+        assert!(reject(&db, &rejected, &"33".repeat(32)).unwrap());
+        let books = db.booked_balance(7).unwrap().unwrap();
+        // The accepted $20 backs more than the books hold, so none of the fee is spare BTC.
+        assert_eq!((books.booked_user_msat, books.uncut), (14_800_000, Some(UncutSpends { spent_msat: 100_000, overflow_msat: 100_000 })));
+        // A payment already decided books nothing more.
+        assert!(!reject(&db, &rejected, &"33".repeat(32)).unwrap());
+        assert!(!reject(&db, &accepted, &"66".repeat(32)).unwrap());
+        let books = db.booked_balance(7).unwrap().unwrap();
+        assert_eq!((books.booked_user_msat, books.uncut), (14_800_000, Some(UncutSpends { spent_msat: 100_000, overflow_msat: 100_000 })));
+        // A payment whose trade id another payment holds is refused for good with its fee, so no acceptance can take it later.
+        let other = "88".repeat(32);
+        assert!(!reject(&db, &other, &"22".repeat(32)).unwrap());
+        assert_eq!(db.trade_decision_summary(&other).unwrap().unwrap().outcome, "rejected");
+        assert_eq!(db.booked_balance(7).unwrap().unwrap().booked_user_msat, 14_700_000);
+        assert!(!db.persist_trade_acceptance(&other, &"99".repeat(32), "hash", &channel_id, "7", "counterparty", 30.0, 30_000, 0, 2, 102, "signed-sync", Some(&fee(&other))).unwrap());
+        assert_eq!(db.booked_balance(7).unwrap().unwrap().booked_user_msat, 14_700_000);
+    }
+
+    #[test]
+    fn a_refused_trade_fee_is_booked_with_a_decision_no_acceptance_can_take() {
+        let db = Database::open_in_memory().unwrap();
+        let channel_id = "11".repeat(32);
+        let payment_id = "77".repeat(32);
+        let trade_id = "22".repeat(32);
+        db.save_channel(&channel_id, "7", 10.0, 10_000, 5_000, None).unwrap();
+        db.anchor_booked_balance(7, &channel_id, 15_000_000, 100_000, ForwardCursor::default(), serde_json::json!({})).unwrap();
+        let fee = BookChange {
+            user_channel_id: 7,
+            delta_msat: -100_000,
+            reason: BookReason::TradeFee,
+            evidence: payment_id.clone(),
+            cursor: None,
+            channel_value_sats: None,
+            detail: serde_json::json!({}),
+            marks_uncut: true,
+            listed_after_msat: None,
+        };
+        let record = crate::ledger::LedgerEventDraft::from_audit_event("TRADE_LEGACY_REFUSED", serde_json::json!({ "payment_id": payment_id, "dedup_key": format!("refused:{payment_id}") }));
+        let refuse = |db: &Database| db.refuse_trade_fee(&fee, &channel_id, "7", "counterparty", "hash", "legacy_format", 100, Some(&record));
+        let records = |db: &Database| db.conn.lock().unwrap().query_row("SELECT COUNT(*) FROM ledger_events WHERE event_type = 'TRADE_LEGACY_REFUSED'", [], |row| row.get::<_, i64>(0)).unwrap();
+        // A record that cannot be written leaves the decision and the booking unwritten too.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TRIGGER fail_record BEFORE INSERT ON ledger_events WHEN NEW.event_type = 'TRADE_LEGACY_REFUSED' BEGIN SELECT RAISE(ABORT, 'injected'); END;")
+            .unwrap();
+        assert!(refuse(&db).is_err());
+        assert!(db.trade_decision_by_payment(&payment_id).unwrap().is_none());
+        assert!(!db.has_booking(7, BookReason::TradeFee, &payment_id).unwrap());
+        db.conn.lock().unwrap().execute_batch("DROP TRIGGER fail_record").unwrap();
+
+        assert_eq!(refuse(&db).unwrap(), BookOutcome::Applied { before_msat: 15_000_000, after_msat: 14_900_000 });
+        assert_eq!(db.trade_decision_summary(&payment_id).unwrap().unwrap().outcome, "rejected");
+        assert!(db.due_trade_responses(i64::MAX / 2, 10).unwrap().is_empty(), "no response to send");
+        assert_eq!(db.booked_balance(7).unwrap().unwrap().uncut, Some(UncutSpends { spent_msat: 100_000, overflow_msat: 0 }));
+        assert_eq!(records(&db), 1);
+        // Refused again it books nothing more, and no acceptance can take the payment.
+        assert_eq!(refuse(&db).unwrap(), BookOutcome::AlreadyBooked);
+        assert!(!db.persist_trade_acceptance(&payment_id, &trade_id, "hash", &channel_id, "7", "counterparty", 20.0, 20_000, 4_900, 1, 100, "signed-sync", Some(&fee)).unwrap());
+        let books = db.booked_balance(7).unwrap().unwrap();
+        assert_eq!((books.booked_user_msat, books.uncut), (14_900_000, Some(UncutSpends { spent_msat: 100_000, overflow_msat: 0 })));
+        assert_eq!(db.load_channel("7").unwrap().unwrap().expected_usd, 10.0);
+        assert_eq!(records(&db), 1);
+        // The refusal takes no trade id a request may still use.
+        assert!(db.trade_decision_by_trade_id(&trade_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_fee_booked_unmarked_before_the_upgrade_is_marked_once_by_its_rejection_or_refusal_only() {
+        let db = Database::open_in_memory().unwrap();
+        let channel_id = "11".repeat(32);
+        let (accepted, rejected, refused, marked) = ("a4".repeat(32), "b5".repeat(32), "c6".repeat(32), "d7".repeat(32));
+        db.save_channel(&channel_id, "7", 10.0, 10_000, 5_000, None).unwrap();
+        db.anchor_booked_balance(7, &channel_id, 15_000_000, 100_000, ForwardCursor::default(), serde_json::json!({})).unwrap();
+        let fee = |payment_id: &str, marks_uncut: bool| BookChange {
+            user_channel_id: 7,
+            delta_msat: -100_000,
+            reason: BookReason::TradeFee,
+            evidence: payment_id.to_owned(),
+            cursor: None,
+            channel_value_sats: None,
+            detail: serde_json::json!({ "amount_msat": 100_000 }),
+            marks_uncut,
+            listed_after_msat: None,
+        };
+        // The release before booked three fees on arrival, unmarked; this one booked a fourth marked, with no decision yet.
+        for payment_id in [&accepted, &rejected, &refused] {
+            db.book(&fee(payment_id, false)).unwrap();
+        }
+        db.book(&fee(&marked, true)).unwrap();
+        let uncut = |db: &Database| db.booked_balance(7).unwrap().unwrap().uncut;
+        assert_eq!(uncut(&db), Some(UncutSpends { spent_msat: 100_000, overflow_msat: 0 }));
+        // An acceptance never marks its fee: the new allocation takes it.
+        assert!(db.persist_trade_acceptance(&accepted, &"21".repeat(32), "hash", &channel_id, "7", "counterparty", 9.0, 9_000, 5_600, 1, 100, "signed-sync", Some(&fee(&accepted, true))).unwrap());
+        assert_eq!(uncut(&db), Some(UncutSpends { spent_msat: 100_000, overflow_msat: 0 }));
+        // A rejection and a refusal mark their fee once, as if it were spent now.
+        let reject = |db: &Database, payment_id: &str, trade_id: &str| {
+            db.persist_trade_rejection_with_fee(payment_id, trade_id, "hash", &channel_id, "7", "counterparty", "invalid_fee", 101, "signed-rejection", Some(&fee(payment_id, true)))
+        };
+        for _ in 0..2 {
+            reject(&db, &rejected, &"32".repeat(32)).unwrap();
+        }
+        assert_eq!(uncut(&db), Some(UncutSpends { spent_msat: 200_000, overflow_msat: 0 }));
+        for _ in 0..2 {
+            assert_eq!(db.refuse_trade_fee(&fee(&refused, true), &channel_id, "7", "counterparty", "hash", "correlation_invalid", 102, None).unwrap(), BookOutcome::AlreadyBooked);
+        }
+        assert_eq!(uncut(&db), Some(UncutSpends { spent_msat: 300_000, overflow_msat: 0 }));
+        // A fee already marked is left alone.
+        reject(&db, &marked, &"43".repeat(32)).unwrap();
+        let books = db.booked_balance(7).unwrap().unwrap();
+        assert_eq!((books.booked_user_msat, books.uncut), (14_600_000, Some(UncutSpends { spent_msat: 300_000, overflow_msat: 0 })));
     }
 
     #[test]
@@ -8799,6 +9141,33 @@ mod tests {
     }
 
     #[test]
+    fn a_trade_response_in_flight_stops_counting_an_hour_after_it_was_sent() {
+        let db = Database::open_in_memory().unwrap();
+        let (stuck, fresh): (u128, u128) = (
+            118_406_377_952_013_486_620_948_751_330_276_904_115,
+            276_590_134_847_216_903_558_017_462_391_805_726_449,
+        );
+        let now = chrono::Utc::now().timestamp();
+        let waiting = || {
+            let mut found: Vec<u128> = db.channels_awaiting_lsp_payment(now - 3_600).unwrap().into_iter().collect();
+            found.sort_unstable();
+            found
+        };
+        // A response sent two hours ago whose outcome never came.
+        let stuck_trade = "6c9f2b5e8a1d4c7f0b3e6a9d2c5f8b1e4a7d0c3f6b9e2a5d8c1f4b7e0a3d6c9f";
+        assert!(db.persist_trade_rejection(stuck_trade, "trade-4", "hash", "physical", &stuck.to_string(), "02ef", "quote_expired", now - 7_200, "{}").unwrap());
+        assert!(db.reserve_trade_response_attempt(stuck_trade, 0, now - 7_200).unwrap());
+        assert!(db.mark_trade_response_in_flight(stuck_trade, "f0c3a6d9b2e5f8c1a4d7b0e3f6c9a2d5b8e1f4c7a0d3b6e9f2c5a8d1b4e7f0c3").unwrap());
+        assert!(waiting().is_empty(), "no longer a payment that could still land");
+        // One sent now still counts.
+        let fresh_trade = "2a5d8b1e4c7f0a3d6b9e2c5f8a1d4b7e0c3f6a9d2b5e8c1f4a7d0b3e6c9f2a5d";
+        assert!(db.persist_trade_rejection(fresh_trade, "trade-5", "hash", "physical", &fresh.to_string(), "02ef", "quote_expired", now, "{}").unwrap());
+        assert!(db.reserve_trade_response_attempt(fresh_trade, 0, now).unwrap());
+        assert!(db.mark_trade_response_in_flight(fresh_trade, "9d2c5f8b1e4a7d0c3f6b9e2a5d8c1f4b7e0a3d6c9f2b5e8a1d4c7f0b3e6a9d2c").unwrap());
+        assert_eq!(waiting(), vec![fresh]);
+    }
+
+    #[test]
     fn generic_ledger_append_rolls_back_event_when_reference_insert_fails() {
         let db = Database::open_in_memory().unwrap();
         db.conn
@@ -9197,20 +9566,20 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         assert!(db.load_manual_splice("7").unwrap().is_none());
         assert!(!db.clear_manual_splice("7").unwrap(), "nothing to clear");
-        assert_eq!(db.note_manual_splice_unless("7", "aa:0", 100, |_| true).unwrap(), ManualNoteOutcome::Noted { existed: false }, "no row, so nothing holds the channel");
+        assert_eq!(db.note_manual_splice_unless("7", "aa:0", SpliceDirection::In, 100, |_| true).unwrap(), ManualNoteOutcome::Noted { existed: false }, "no row, so nothing holds the channel");
         assert_eq!(
             db.load_manual_splice("7").unwrap(),
-            Some(ManualSplice { user_channel_id: "7".into(), channel_funding_txo: "aa:0".into(), made_at: 100 })
+            Some(ManualSplice { user_channel_id: "7".into(), channel_funding_txo: "aa:0".into(), made_at: 100, direction: Some(SpliceDirection::In) })
         );
         // A request on the funding the note was made on is refused inside the save; one on another funding, or with none seen, goes through.
         assert!(matches!(db.queue_splice_in("7", "peer", 10_000, 101, 0, "", Some("aa:0")).unwrap(), QueueSpliceOutcome::ManualPending(ref note) if note.made_at == 100));
         assert!(db.load_queued_splice("7").unwrap().is_none());
         let QueueSpliceOutcome::Queued(row) = db.queue_splice_in("7", "peer", 10_000, 102, 0, "", Some("bb:0")).unwrap() else { panic!("not queued") };
         // A later splice by hand replaces the note and says so, unless the channel's row holds the channel.
-        assert_eq!(db.note_manual_splice_unless("7", "bb:1", 103, |held| held.request_id == row.request_id).unwrap(), ManualNoteOutcome::Blocked(row.clone()));
+        assert_eq!(db.note_manual_splice_unless("7", "bb:1", SpliceDirection::Out, 103, |held| held.request_id == row.request_id).unwrap(), ManualNoteOutcome::Blocked(row.clone()));
         assert_eq!(db.load_manual_splice("7").unwrap().map(|note| note.made_at), Some(100), "unchanged");
-        assert_eq!(db.note_manual_splice_unless("7", "bb:1", 104, |_| false).unwrap(), ManualNoteOutcome::Noted { existed: true });
-        assert_eq!(db.note_manual_splice_unless("8", "cc:0", 105, |_| false).unwrap(), ManualNoteOutcome::Noted { existed: false });
+        assert_eq!(db.note_manual_splice_unless("7", "bb:1", SpliceDirection::Out, 104, |_| false).unwrap(), ManualNoteOutcome::Noted { existed: true });
+        assert_eq!(db.note_manual_splice_unless("8", "cc:0", SpliceDirection::In, 105, |_| false).unwrap(), ManualNoteOutcome::Noted { existed: false });
         assert_eq!(db.load_manual_splice("7").unwrap().map(|note| (note.channel_funding_txo, note.made_at)), Some(("bb:1".into(), 104)));
         assert!(db.clear_manual_splice("7").unwrap());
         assert!(db.load_manual_splice("7").unwrap().is_none());
@@ -9475,15 +9844,18 @@ mod tests {
         assert!(db.lsp_made_splice(uid, operator_out, 150_000, 130_000).unwrap());
         assert!(!db.lsp_made_splice(uid, users, 150_000, 130_000).unwrap(), "a negotiation of another funding says nothing of this one");
 
-        // A splice-in by hand counts only while the value grows onto new funding and its note is newer than the books and every splice booked on them.
+        // A splice by hand counts only on new funding and while its note is newer than the books and every splice booked on them.
         let now = chrono::Utc::now().timestamp();
         db.anchor_booked_balance(uid, channel_id, 50_000_000, 150_000, ForwardCursor::default(), serde_json::json!({})).unwrap();
         db.conn.lock().unwrap().execute("UPDATE booked_balances SET anchored_at_ms = ?1", params![(now - 7_200) * 1000]).unwrap();
-        db.note_manual_splice_unless(&key, before, now - 10_800, |_| false).unwrap();
+        db.note_manual_splice_unless(&key, before, SpliceDirection::In, now - 10_800, |_| false).unwrap();
         assert!(!db.lsp_made_splice(uid, users, 150_000, 200_000).unwrap(), "a note older than the books is spent");
-        db.note_manual_splice_unless(&key, before, now - 3_600, |_| false).unwrap();
-        assert!(db.lsp_made_splice(uid, users, 150_000, 200_000).unwrap());
-        assert!(!db.lsp_made_splice(uid, users, 150_000, 130_000).unwrap(), "a splice-out inside the note's window is the user's");
+        db.note_manual_splice_unless(&key, before, SpliceDirection::Out, now - 10_800, |_| false).unwrap();
+        assert!(!db.lsp_made_splice(uid, users, 150_000, 130_000).unwrap(), "for a splice-out too");
+        db.note_manual_splice_unless(&key, before, SpliceDirection::Out, now - 3_600, |_| false).unwrap();
+        assert!(db.lsp_made_splice(uid, users, 150_000, 130_000).unwrap(), "a splice-out inside the note's window is the LSP's");
+        db.note_manual_splice_unless(&key, before, SpliceDirection::In, now - 3_600, |_| false).unwrap();
+        assert!(db.lsp_made_splice(uid, users, 150_000, 200_000).unwrap(), "and so is a splice-in");
         assert!(!db.lsp_made_splice(uid, before, 150_000, 200_000).unwrap(), "the note's own funding is no new funding");
         let splice = BookChange {
             user_channel_id: uid,
@@ -9493,8 +9865,36 @@ mod tests {
             cursor: None,
             channel_value_sats: Some(200_000),
             detail: serde_json::json!({}),
+            marks_uncut: false,
+            listed_after_msat: None,
         };
         db.book(&splice).unwrap();
         assert!(!db.lsp_made_splice(uid, users, 200_000, 250_000).unwrap(), "its splice is booked, so a later one is not it");
+        assert!(!db.lsp_made_splice(uid, users, 200_000, 180_000).unwrap(), "nor a later splice-out");
+    }
+
+    #[test]
+    fn a_splice_note_made_by_hand_counts_only_for_a_change_its_way() {
+        let db = Database::open_in_memory().unwrap();
+        let uid: u128 = 274_910_385_662_017_443_908_126_553_190_774_302_615;
+        let key = uid.to_string();
+        let before = "c5b8e1d4a7c0f3b6e9d2a5c8f1b4e7d0a3c6f9b2e5d8a1c4f7b0e3d6a9c2f5b8:0";
+        let next = "0e3b6d9a2c5f8e1b4d7a0c3f6e9b2d5a8c1f4e7b0d3a6c9f2e5b8d1a4c7f0e3b:1";
+        let now = chrono::Utc::now().timestamp();
+        db.anchor_booked_balance(uid, "e7b0d3a6c9f2e5b8d1a4c7f0e3b6d9a2c5f8e1b4d7a0c3f6e9b2d5a8c1f4e7b0", 50_000_000, 150_000, ForwardCursor::default(), serde_json::json!({})).unwrap();
+        db.conn.lock().unwrap().execute("UPDATE booked_balances SET anchored_at_ms = ?1", params![(now - 7_200) * 1000]).unwrap();
+        // A splice-in the operator made by hand is still pending: only a rise in value is it.
+        db.note_manual_splice_unless(&key, before, SpliceDirection::In, now - 60, |_| false).unwrap();
+        assert!(db.lsp_made_splice(uid, next, 150_000, 200_000).unwrap());
+        assert!(!db.lsp_made_splice(uid, next, 150_000, 130_000).unwrap(), "a user's splice-out is not the LSP's splice-in");
+        // And a splice-out by hand only a fall.
+        db.note_manual_splice_unless(&key, before, SpliceDirection::Out, now - 60, |_| false).unwrap();
+        assert!(db.lsp_made_splice(uid, next, 150_000, 130_000).unwrap());
+        assert!(!db.lsp_made_splice(uid, next, 150_000, 200_000).unwrap(), "a user's splice-in is not the LSP's splice-out");
+        // A note saved before notes kept the way was a splice-in by hand, so it stands only for a rise, as it did.
+        db.conn.lock().unwrap().execute("UPDATE manual_splices SET direction = NULL", []).unwrap();
+        assert_eq!(db.load_manual_splice(&key).unwrap().map(|note| note.direction), Some(None));
+        assert!(!db.lsp_made_splice(uid, next, 150_000, 130_000).unwrap(), "a user's splice-out is not the LSP's");
+        assert!(db.lsp_made_splice(uid, next, 150_000, 200_000).unwrap());
     }
 }

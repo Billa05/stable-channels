@@ -52,6 +52,24 @@ pub struct StableChannelInfo {
 	/// Unix seconds when the daemon started tracking the channel; 0 when unknown.
 	#[prost(int64, tag = "10")]
 	pub created_at: i64,
+	/// The user's balance by the LSP's books, in sats; None until the books start.
+	#[prost(uint64, optional, tag = "11")]
+	pub booked_sats: ::core::option::Option<u64>,
+	/// How the books compare with the live balance: ok, watching or paused; None until the books start.
+	#[prost(string, optional, tag = "12")]
+	pub books_state: ::core::option::Option<::prost::alloc::string::String>,
+	/// Sats the books' last check found apart from the live balance; None until the books start.
+	#[prost(uint64, optional, tag = "13")]
+	pub books_gap_sats: ::core::option::Option<u64>,
+	/// Unix milliseconds when the current gap was first seen; None without one.
+	#[prost(int64, optional, tag = "14")]
+	pub books_gap_since_ms: ::core::option::Option<i64>,
+	/// Sats of gap the operator kept, on the books and on the backing together; None until the books start.
+	#[prost(uint64, optional, tag = "15")]
+	pub books_accepted_gap_sats: ::core::option::Option<u64>,
+	/// Which figure the gap is: balance (the user holds less than the books) or backing (the stable part stands above them); None without one, or when the check did not record it.
+	#[prost(string, optional, tag = "16")]
+	pub books_gap_kind: ::core::option::Option<::prost::alloc::string::String>,
 }
 
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -109,6 +127,57 @@ pub struct ReleaseStabilityPaymentResponse {
 	/// True when nothing was done because the answer needs `acknowledged`.
 	#[prost(bool, tag = "3")]
 	pub needs_acknowledgement: bool,
+}
+
+// ResolveBooksGap
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResolveBooksGapRequest {
+	#[prost(string, tag = "1")]
+	pub channel_id: ::prost::alloc::string::String,
+	/// 1 counts the gap as the user's spend, 2 as a payment to the LSP, 3 keeps the books; anything else is refused.
+	#[prost(int32, tag = "2")]
+	pub choice: i32,
+	/// False returns the figures and changes nothing; true applies the choice to the figures the preview showed.
+	#[prost(bool, tag = "3")]
+	pub acknowledged: bool,
+	/// The operator's note on why, kept with the record.
+	#[prost(string, optional, tag = "4")]
+	pub reason: ::core::option::Option<::prost::alloc::string::String>,
+	/// The live balance and gap the preview showed, in sats; a confirm without both, or with either more than 5 sats from the figures now, changes nothing.
+	#[prost(uint64, optional, tag = "5")]
+	pub expected_actual_sats: ::core::option::Option<u64>,
+	#[prost(uint64, optional, tag = "6")]
+	pub expected_gap_sats: ::core::option::Option<u64>,
+	/// The target and backing the preview showed for a choice that changes them; a confirm without both, or with the target more than $0.01 or the backing more than 5 sats from the figures now, changes nothing.
+	#[prost(double, optional, tag = "7")]
+	pub expected_new_expected_usd: ::core::option::Option<f64>,
+	#[prost(uint64, optional, tag = "8")]
+	pub expected_new_backing_sats: ::core::option::Option<u64>,
+}
+
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResolveBooksGapResponse {
+	#[prost(bool, tag = "1")]
+	pub ok: bool,
+	#[prost(string, tag = "2")]
+	pub status: ::prost::alloc::string::String,
+	/// True when nothing was done because the choice needs `acknowledged`.
+	#[prost(bool, tag = "3")]
+	pub needs_acknowledgement: bool,
+	#[prost(uint64, tag = "4")]
+	pub booked_sats: u64,
+	/// The user's live balance, payments still leaving it included.
+	#[prost(uint64, tag = "5")]
+	pub actual_sats: u64,
+	#[prost(uint64, tag = "6")]
+	pub gap_sats: u64,
+	/// The target and backing the choice leaves; None when it leaves them as they are.
+	#[prost(double, optional, tag = "7")]
+	pub new_expected_usd: ::core::option::Option<f64>,
+	#[prost(uint64, optional, tag = "8")]
+	pub new_backing_sats: ::core::option::Option<u64>,
 }
 
 // RegisterPush
@@ -406,6 +475,7 @@ pub const GET_PRICE_PATH: &str = "GetPrice";
 pub const LIST_STABLE_CHANNELS_PATH: &str = "ListStableChannels";
 pub const EDIT_STABLE_CHANNEL_PATH: &str = "EditStableChannel";
 pub const RELEASE_STABILITY_PAYMENT_PATH: &str = "ReleaseStabilityPayment";
+pub const RESOLVE_BOOKS_GAP_PATH: &str = "ResolveBooksGap";
 pub const REGISTER_PUSH_PATH: &str = "RegisterPush";
 pub const AUDIT_LOG_PATH: &str = "AuditLog";
 pub const LDK_LOG_PATH: &str = "LdkLog";
@@ -426,6 +496,43 @@ mod tests {
 		assert_eq!(ReleaseStabilityPaymentRequest::decode(request.encode_to_vec().as_slice()).unwrap(), request);
 		let response = ReleaseStabilityPaymentResponse { ok: false, status: "confirm".into(), needs_acknowledgement: true };
 		assert_eq!(ReleaseStabilityPaymentResponse::decode(response.encode_to_vec().as_slice()).unwrap(), response);
+	}
+
+	#[test]
+	fn resolve_books_gap_messages_roundtrip() {
+		let request = ResolveBooksGapRequest {
+			channel_id: "7c3e9a".into(),
+			choice: 2,
+			acknowledged: true,
+			reason: Some("paid the LSP's invoice".into()),
+			expected_actual_sats: Some(30_000),
+			expected_gap_sats: Some(20_000),
+			expected_new_expected_usd: Some(50.0),
+			expected_new_backing_sats: Some(29_900),
+		};
+		assert_eq!(ResolveBooksGapRequest::decode(request.encode_to_vec().as_slice()).unwrap(), request);
+		let response = ResolveBooksGapResponse {
+			ok: false,
+			status: "confirm".into(),
+			needs_acknowledgement: true,
+			booked_sats: 50_000,
+			actual_sats: 30_000,
+			gap_sats: 20_000,
+			new_expected_usd: Some(30.0),
+			new_backing_sats: Some(30_000),
+		};
+		assert_eq!(ResolveBooksGapResponse::decode(response.encode_to_vec().as_slice()).unwrap(), response);
+		let info = StableChannelInfo {
+			channel_id: "7c3e9a".into(),
+			booked_sats: Some(50_000),
+			books_state: Some("paused".into()),
+			books_gap_sats: Some(20_000),
+			books_gap_since_ms: Some(1_764_200_000_000),
+			books_accepted_gap_sats: Some(0),
+			books_gap_kind: Some("backing".into()),
+			..Default::default()
+		};
+		assert_eq!(StableChannelInfo::decode(info.encode_to_vec().as_slice()).unwrap(), info);
 	}
 
 	#[test]

@@ -12,6 +12,7 @@ use sc_rest_client::ldk_server_grpc::api::{
 use sc_rest_client::sc_protos::revenue::{GetRevenueResponse, RevenueItem};
 use sc_rest_client::sc_protos::stable::{
 	GetPriceResponse, ListChannelLedgerEventsResponse, ListStableChannelsResponse, LogResponse,
+	ResolveBooksGapResponse,
 };
 
 use crate::config::{ChainSourceConfig, ChainSourceType};
@@ -455,6 +456,43 @@ pub struct ReleaseStabilityPaymentForm {
 	pub notice: String,
 }
 
+/// The paused channel the resolve dialog is about, the operator's choice and reason, and the daemon's figures for a choice.
+#[derive(Default, Clone, PartialEq)]
+pub struct ResolveBooksGapForm {
+	pub channel_id: String,
+	/// The user's node id.
+	pub user: String,
+	pub booked_sats: u64,
+	pub gap_sats: u64,
+	pub since_ms: Option<i64>,
+	/// "backing" when the stable part stands above the books; anything else reads as the balance below them.
+	pub gap_kind: Option<String>,
+	/// 1 the user spent it, 2 the user paid the LSP, 3 keep the books; None until one is picked.
+	pub choice: Option<i32>,
+	pub reason: String,
+	/// The figures the daemon returned for a choice, which a confirm echoes.
+	pub preview: Option<BooksPreview>,
+	/// The channel's latest BTC price, which values the stable part a choice leaves; None when unknown.
+	pub latest_price: Option<f64>,
+}
+
+impl ResolveBooksGapForm {
+	/// Pick a choice; figures previewed for another choice no longer apply.
+	pub fn choose(&mut self, choice: i32) {
+		if self.choice != Some(choice) {
+			self.choice = Some(choice);
+			self.preview = None;
+		}
+	}
+}
+
+/// The daemon's figures for one choice, before anything changed.
+#[derive(Clone, PartialEq)]
+pub struct BooksPreview {
+	pub choice: i32,
+	pub figures: ResolveBooksGapResponse,
+}
+
 /// The rejected trade fee the refund dialog is about to send back.
 #[derive(Default, Clone)]
 pub struct RefundTradeFeeForm {
@@ -488,6 +526,7 @@ pub struct Forms {
 	pub chain_source: ChainSourceForm,
 	pub refund_trade_fee: RefundTradeFeeForm,
 	pub release_stability_payment: ReleaseStabilityPaymentForm,
+	pub resolve_books_gap: ResolveBooksGapForm,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -769,6 +808,7 @@ pub enum Op {
 	ListStableChannels,
 	EditStableChannel,
 	ReleaseStabilityPayment,
+	ResolveBooksGap,
 	ListSettlementPayments,
 	GetRevenue,
 	RefundTradeFee,
@@ -820,6 +860,8 @@ pub enum Dialog {
 	RefundTradeFee,
 	/// Operator's decision about a stability payment the node will not report on.
 	ReleaseStabilityPayment,
+	/// Operator's resolution of a paused channel's books gap; the channel and its figures are in the form.
+	ResolveBooksGap,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

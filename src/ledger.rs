@@ -978,6 +978,12 @@ pub const CHANNEL_STATE_EVENTS: &[&str] = &[
     "BACKSTOP_STABLE_DEDUCTED",
     "OUTGOING_STABLE_DEDUCTED",
     "STABLE_SPEND_DEDUCTED",
+    // A booked spend left marked uncut because no price or an unsaved cut held it; the next tick cuts it.
+    "BOOKED_BALANCE_CUT_DEFERRED",
+    // A channel whose books are paused, once a day while it lasts; payments to its user wait for the operator or for the gap to close.
+    "BOOKED_BALANCE_PAUSED",
+    // A channel whose books have not started after an hour of ticks, once a day, with what keeps them from starting.
+    "BOOKED_BALANCE_NOT_STARTED",
     "OVERBACKED_ALLOCATION_REPAIRED",
     "MAX_STABILIZATION_REJECTED",
     "STABLE_EDITED",
@@ -998,6 +1004,8 @@ pub const CHANNEL_STATE_EVENTS: &[&str] = &[
     "STABILITY_TOP_UP_RELEASED",
     "STABILITY_TOP_UP_RELEASE_CONFLICT",
     "STABILITY_TOP_UP_FAILED_AFTER_BOOKING",
+    // A top-up held because the balance is below the stable part, once a day while it lasts; the operator can set the stable part from the edit route.
+    "STABILITY_TOP_UP_HELD_BELOW_BACKING",
     // SYNC publications and their final outcomes (never each retry).
     "SYNC_MESSAGE_SENT",
     "SYNC_RETRY_EXHAUSTED",
@@ -1118,6 +1126,9 @@ const DIRECT_STATE_EVENTS: &[&str] = &[
     "BOOKED_BALANCE_CLOSED",
     "BOOKED_BALANCE_MISMATCH",
     "BOOKED_BALANCE_MISMATCH_CLEARED",
+    "BOOKED_BALANCE_RESOLVED",
+    // A paused check of the first books release turned back into a gap being watched, once per channel.
+    "BOOKED_BALANCE_CHECK_RESET",
 ];
 
 /// Events that are deliberately JSONL-only: high-volume or transport noise whose durable signal
@@ -1142,6 +1153,8 @@ pub const OPERATIONAL_EVENTS: &[&str] = &[
     "BOOKED_BALANCE_DISAGREES",
     // Native from the books against today's stored native, one line each time the difference changes; it moves no money in PR 1.
     "BOOKED_BALANCE_NATIVE_DIFFERS",
+    // A top-up the books hold back, one line each time what holds it changes; BOOKED_BALANCE_PAUSED and STABILITY_TOP_UP_HELD_BELOW_BACKING are the durable records.
+    "STABILITY_TOP_UP_HELD",
     // Per-tick and per-attempt traces whose outcome is recorded elsewhere, transport, and UI.
     "STABILITY_CHECK", "STABILITY_COOLDOWN", "STABILITY_PAY_COOLDOWN_CHECK", "RECONCILE_FORWARDED_COOLDOWN_SET",
     "TRADE_PROTOCOL_PATH", "CHANNEL_EXISTS_CHECK", "REGISTER_PUSH_OK", "REGISTER_PUSH_LEGACY_OK",

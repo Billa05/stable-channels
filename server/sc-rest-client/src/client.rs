@@ -48,10 +48,10 @@ use sc_protos::stable::{
 	ListSettlementPaymentsRequest, ListSettlementPaymentsResponse, ListStableChannelsRequest,
 	ListStableChannelsResponse, LogRequest, LogResponse, QueueSpliceInRequest,
 	QueueSpliceInResponse, ReleaseStabilityPaymentRequest, ReleaseStabilityPaymentResponse,
-	AUDIT_LOG_PATH, CANCEL_QUEUED_SPLICE_PATH, EDIT_STABLE_CHANNEL_PATH, GET_PRICE_PATH,
-	LDK_LOG_PATH, LIST_CHANNEL_LEDGER_EVENTS_PATH, LIST_QUEUED_SPLICES_PATH,
-	LIST_SETTLEMENT_PAYMENTS_PATH, LIST_STABLE_CHANNELS_PATH, QUEUE_SPLICE_IN_PATH,
-	RELEASE_STABILITY_PAYMENT_PATH,
+	ResolveBooksGapRequest, ResolveBooksGapResponse, AUDIT_LOG_PATH, CANCEL_QUEUED_SPLICE_PATH,
+	EDIT_STABLE_CHANNEL_PATH, GET_PRICE_PATH, LDK_LOG_PATH, LIST_CHANNEL_LEDGER_EVENTS_PATH,
+	LIST_QUEUED_SPLICES_PATH, LIST_SETTLEMENT_PAYMENTS_PATH, LIST_STABLE_CHANNELS_PATH,
+	QUEUE_SPLICE_IN_PATH, RELEASE_STABILITY_PAYMENT_PATH, RESOLVE_BOOKS_GAP_PATH,
 };
 use sc_protos::revenue::{
 	GetRevenueRequest, GetRevenueResponse, RefundTradeFeeRequest, RefundTradeFeeResponse,
@@ -530,6 +530,14 @@ impl LspRestClient {
 		&self, request: ReleaseStabilityPaymentRequest,
 	) -> Result<ReleaseStabilityPaymentResponse, LspRestError> {
 		let url = self.build_url(RELEASE_STABILITY_PAYMENT_PATH);
+		self.post_request(&request, &url).await
+	}
+
+	/// Resolves a paused channel's gap as the user's spend, as a payment to the LSP, or by keeping the books; the first call returns the figures, and the confirm sends them back.
+	pub async fn resolve_books_gap(
+		&self, request: ResolveBooksGapRequest,
+	) -> Result<ResolveBooksGapResponse, LspRestError> {
+		let url = self.build_url(RESOLVE_BOOKS_GAP_PATH);
 		self.post_request(&request, &url).await
 	}
 
